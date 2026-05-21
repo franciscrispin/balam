@@ -14,3 +14,6 @@ apps/*/dist/
 
 # OS / editor
 .DS_Store
+
+# Claude Code local settings (personal; shared config and skills are tracked)
+.claude/settings.local.json
