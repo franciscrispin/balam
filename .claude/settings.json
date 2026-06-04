@@ -1,0 +1,17 @@
+{
+  "env": {
+    "DISPLAY": ":99"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(.claude/skills/browser-use/headed-browser/ensure.sh)",
+      "Bash(.claude/skills/browser-use/headed-browser/start.sh)",
+      "Bash(.claude/skills/browser-use/headed-browser/stop.sh)",
+      "Bash(.claude/skills/browser-use/headed-browser/profile.sh:*)",
+      "Bash(playwright-cli:*)",
+      "Bash(DISPLAY=:99 playwright-cli:*)",
+      "Bash(xdpyinfo:*)",
+      "Bash(DISPLAY=:99 xdpyinfo:*)"
+    ]
+  }
+}

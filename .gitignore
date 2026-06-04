@@ -15,5 +15,8 @@ apps/*/dist/
 # OS / editor
 .DS_Store
 
+# Generated playwright-cli config (browser-use skill; written by headed-browser/ensure.sh)
+.playwright/
+
 # Claude Code local settings (personal; shared config and skills are tracked)
 .claude/settings.local.json
