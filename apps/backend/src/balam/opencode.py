@@ -113,14 +113,21 @@ class OpenCode:
         )
         response.raise_for_status()
 
-    async def events(self) -> AsyncIterator[dict[str, Any]]:
+    async def events(self, *, ready: asyncio.Event | None = None) -> AsyncIterator[dict[str, Any]]:
         """Yield decoded events from the server's global SSE stream.
 
         The stream covers every session, so consumers must filter by
         ``sessionID``. Breaking out of the ``async for`` closes the connection.
+
+        If ``ready`` is given, it is set once the stream is established (after the
+        response headers arrive). Callers prompt only after this fires, so the
+        server's early ``message.updated`` / ``message.part.updated`` events
+        aren't lost to a subscribe-after-prompt race.
         """
         async with self._client.stream("GET", "/event") as response:
             response.raise_for_status()
+            if ready is not None:
+                ready.set()
             async for line in response.aiter_lines():
                 if line.startswith("data:"):
                     payload = line[len("data:") :].strip()

@@ -1,4 +1,6 @@
-from balam.streamer import DraftSession
+import asyncio
+
+from balam.streamer import DraftSession, stream_reply
 
 
 class FakeTransport:
@@ -85,3 +87,114 @@ async def test_finalize_emits_fallback_when_no_text() -> None:
     session = DraftSession(t, draft_id=1, render=_identity)
     await session.finalize("(nothing)")
     assert t.ops == [("message", None, "(nothing)")]
+
+
+# --- stream_reply event-loop regression tests ---------------------------------
+#
+# These reproduce OpenCode's real SSE ordering (captured live): the assistant's
+# message.updated precedes its text parts, and the user's prompt echoes back as
+# a text part that must not be rendered. The original bug was prompting before
+# subscribing, which missed the assistant's message.updated entirely.
+
+SID = "ses_test"
+UID = "msg_user"
+AID = "msg_assistant"
+
+
+def _ev(etype: str, **props: object) -> dict[str, object]:
+    return {"type": etype, "properties": props}
+
+
+def _msg_updated(role: str, mid: str) -> dict[str, object]:
+    return _ev("message.updated", info={"sessionID": SID, "role": role, "id": mid})
+
+
+def _text_part(mid: str, text: str, pid: str = "prt_1") -> dict[str, object]:
+    return _ev(
+        "message.part.updated",
+        part={"type": "text", "sessionID": SID, "messageID": mid, "id": pid, "text": text},
+    )
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def send_chat_action(self, **kwargs: object) -> None:
+        pass
+
+    async def send_message_draft(self, **kwargs: object) -> None:
+        pass
+
+    async def send_message(self, *, text: str, **kwargs: object) -> None:
+        self.messages.append(text)
+
+
+class FakeOpenCode:
+    """Yields a scripted event list; records that prompt() is called."""
+
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        self._events = events
+        self.prompted = False
+
+    async def prompt(self, session_id: str, text: str) -> None:
+        self.prompted = True
+
+    async def events(self, *, ready: asyncio.Event | None = None):
+        if ready is not None:
+            ready.set()
+        for event in self._events:
+            yield event
+
+
+async def _run(events: list[dict[str, object]]) -> FakeBot:
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        opencode=FakeOpenCode(events),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="hello",
+        draft_interval=0.01,  # tiny: finalize waits on the flusher's sleep
+    )
+    return bot
+
+
+async def test_stream_reply_captures_assistant_text_and_skips_user_echo() -> None:
+    bot = await _run(
+        [
+            _msg_updated("user", UID),
+            _text_part(UID, "hello"),  # echoed prompt — skip
+            _msg_updated("assistant", AID),
+            _text_part(AID, "hey"),
+            _text_part(AID, "hey there"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    assert bot.messages == ["hey there"]
+
+
+async def test_stream_reply_subscribes_before_prompting() -> None:
+    # If the stream is never established, we must not prompt into a dead sub.
+    bot = FakeBot()
+
+    class NeverReady(FakeOpenCode):
+        async def events(self, *, ready: asyncio.Event | None = None):
+            raise RuntimeError("stream failed to open")
+            yield  # pragma: no cover  (makes this an async generator)
+
+    oc = NeverReady([])
+    try:
+        await stream_reply(
+            bot=bot,
+            opencode=oc,
+            session_id=SID,
+            chat_id=1,
+            thread_id=99,
+            prompt="hello",
+            draft_interval=0.01,
+        )
+    except RuntimeError:
+        pass
+    assert oc.prompted is False

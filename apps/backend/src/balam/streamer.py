@@ -183,20 +183,15 @@ async def stream_reply(
 
     flush_task = asyncio.create_task(flush_loop())
 
-    try:
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action="typing", **thread_kwargs)
-        except Exception:
-            pass
+    assistant_message_ids: set[str] = set()
+    text_parts: dict[str, tuple[int, str]] = {}
+    order = 0
+    error_text: str | None = None
+    stream_ready = asyncio.Event()
 
-        await opencode.prompt(session_id, prompt)
-
-        assistant_message_ids: set[str] = set()
-        text_parts: dict[str, tuple[int, str]] = {}
-        order = 0
-        error_text: str | None = None
-
-        async for event in opencode.events():
+    async def consume() -> None:
+        nonlocal order, error_text
+        async for event in opencode.events(ready=stream_ready):
             etype = event.get("type")
             props = event.get("properties", {})
 
@@ -209,7 +204,9 @@ async def stream_reply(
                 part = props.get("part", {})
                 if part.get("type") != "text" or part.get("sessionID") != session_id:
                     continue
-                # Skip the echoed user message; only render assistant text.
+                # Render only assistant text. Subscribing before prompting
+                # guarantees we see the assistant's message.updated before its
+                # parts, so this set is populated by the time they arrive.
                 if part.get("messageID") not in assistant_message_ids:
                     continue
                 part_id = part.get("id")
@@ -226,6 +223,24 @@ async def stream_reply(
 
             elif etype == "session.idle" and props.get("sessionID") == session_id:
                 break
+
+    try:
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing", **thread_kwargs)
+        except Exception:
+            pass
+
+        # Subscribe *before* prompting so no early deltas are missed (ADR-0010).
+        consume_task = asyncio.create_task(consume())
+        ready_task = asyncio.create_task(stream_ready.wait())
+        await asyncio.wait({ready_task, consume_task}, return_when=asyncio.FIRST_COMPLETED)
+        if consume_task.done():
+            # Stream failed before opening; re-raise instead of prompting into it.
+            ready_task.cancel()
+            await consume_task
+        else:
+            await opencode.prompt(session_id, prompt)
+            await consume_task
 
         if error_text:
             base = _join_parts(text_parts)
