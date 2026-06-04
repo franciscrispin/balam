@@ -68,8 +68,15 @@ HTTP calls only where the SDK lags the API.
   is missing an endpoint, we call the HTTP API directly against that spec.
 - The SDK's real value is maintenance, not capability: it tracks OpenCode's
   frequent breaking changes for us and gives type-safe access, including the SSE
-  event stream. We re-install it on OpenCode upgrades instead of re-generating
-  and re-testing a hand-written client.
+  event stream. A TypeScript backend would re-install it on OpenCode upgrades
+  instead of re-generating and re-testing a hand-written client.
+- **Update (ADR-0011):** the backend is now Python, so it does **not** use the
+  TypeScript SDK. It calls the HTTP API directly with `httpx` — a thin,
+  hand-maintained client over the endpoints it needs (`/doc`, `/session`,
+  `/session/{id}/prompt_async`, `/event`). The trade-off ADR-0011 accepts is
+  owning that small client and tracking OpenCode changes ourselves, with the
+  OpenAPI spec at `/doc` as the reference. This is consistent with the decision
+  above: the HTTP API is the contract; the SDK was only ever one client of it.
 
 ---
 
@@ -108,8 +115,11 @@ Split the system into three layers:
 ### Consequences
 
 - The frontend stack (TypeScript + a JS build tool) is required regardless of
-  backend language. Since the backend is also TypeScript (ADR-0004), frontend
-  and backend share one language, one toolchain, and one set of shared types.
+  backend language.
+- **Update (ADR-0011):** the backend is Python, so frontend and backend no
+  longer share a language. The Mini App contract is kept in sync by generating
+  the frontend's TypeScript types from the backend's **FastAPI-emitted OpenAPI
+  schema** (single source of truth, no hand-synced duplicate definitions).
 - Some features (git diffs, markdown viewing) are mostly backend + frontend work
   and do not need OpenCode at all.
 
@@ -117,7 +127,14 @@ Split the system into three layers:
 
 ## ADR-0004: Backend language is TypeScript, run on Bun
 
-Status: Accepted Date: 2026-05-20
+Status: **Superseded by [ADR-0011](#adr-0011-backend-language-reversed-to-python)**
+(2026-06-04) Date: 2026-05-20
+
+> This decision was reversed. The backend is now Python (FastAPI +
+> python-telegram-bot), talking to OpenCode over raw HTTP. The reasoning that
+> led here was sound at the time, but two of its load-bearing assumptions
+> changed — see ADR-0011 for the full re-evaluation. The original record is kept
+> below, unedited, as history.
 
 ### Context
 
@@ -382,6 +399,77 @@ Stream agent output with `sendMessageDraft`, falling back to throttled
 
 ---
 
+## ADR-0011: Backend language reversed to Python
+
+Status: Accepted Date: 2026-06-04
+Supersedes [ADR-0004](#adr-0004-backend-language-is-typescript-run-on-bun)
+
+### Context
+
+ADR-0004 chose TypeScript on Bun for the backend, on two load-bearing
+assumptions. Both have since changed:
+
+1. **"OpenCode's only client is the TypeScript SDK, so another language means
+   hand-writing the HTTP + SSE client."** True, but ADR-0002 already establishes
+   that the HTTP API — not the SDK — is the source of truth, and that any
+   language has full access through it. The SSE stream is a handful of lines
+   over `httpx`; the cost of not using the generated SDK is small and bounded.
+2. **"We already need TypeScript for the Mini App, so one language gives us
+   shared types for free."** The Mini App frontend is still fixed TypeScript
+   (ADR-0003), so this is the one real cost of switching. But it is mitigated:
+   FastAPI emits an OpenAPI schema from the backend, and the frontend's types are
+   generated from it — arguably a cleaner contract than hand-shared types.
+
+Two new factors, absent when ADR-0004 was written, tip the balance:
+
+- **Reference reuse.** The build now leans heavily on two existing Python
+  codebases — `~/projects/zog` and `~/projects/open-udang` — as worked examples
+  for the hardest parts: animated draft streaming into forum topics
+  (`send_message_draft`), GFM→Telegram-MarkdownV2 rendering (`mistune`), and the
+  live noVNC Mini App (ADR-0006). In TypeScript each is a *translation* (effort +
+  divergence risk); in Python they are direct references.
+- **Mature Telegram tooling.** `python-telegram-bot` (22.6+) exposes everything
+  this project needs, including `send_message_draft` for native streaming — so
+  the streaming advantage that motivated Telegram (ADR-0010) is fully available
+  in Python.
+
+The OpenCode↔agent bridge (consuming the `/event` SSE stream, filtering by
+session) is custom work in either language — the references drive it through the
+Claude Agent SDK, not OpenCode — so it is *not* a point in favor of either side.
+
+### Decision
+
+Write the backend in **Python**. Concretely:
+
+- **Runtime/tooling:** Python 3.12+, managed with **uv**; **ruff** for lint +
+  format (the role Biome played for TS).
+- **Telegram:** **python-telegram-bot** (long polling for this local,
+  no-public-URL deployment, ADR-0007), using `send_message_draft` for streaming.
+- **OpenCode client:** a thin **httpx** wrapper over the HTTP API (ADR-0002), no
+  generated SDK.
+- **Mini App HTTP/WS:** **FastAPI + uvicorn** (serves the Mini App, exposes the
+  API, will reverse-proxy the noVNC WebSocket, ADR-0006), with its OpenAPI schema
+  as the source for the frontend's generated types (ADR-0003).
+- **Frontend:** unchanged — TypeScript + Vite (ADR-0003), the only fixed layer.
+
+### Consequences
+
+- The repo is now polyglot: a Python backend (`apps/backend`, uv) beside a
+  TypeScript frontend (`apps/frontend`, Bun/Vite). They no longer share a
+  toolchain; the contract between them is the generated OpenAPI client.
+- We own a small hand-written OpenCode HTTP/SSE client and track OpenCode's
+  changes against the `/doc` spec ourselves (ADR-0002), instead of re-installing
+  the SDK.
+- We lose the single-binary `bun build --compile` deploy; the backend ships as a
+  uv-managed app under systemd (ADR-0001) or a container.
+- The earlier TypeScript backend slice is removed. Its design — config
+  validation, topic→session SQLite map, allowlist, draft streaming — carries
+  over unchanged in intent; only the language changes.
+- Revisit only if the Mini App's shared-contract surface grows large enough that
+  a single language across both layers would clearly win.
+
+---
+
 ## Summary
 
 | ADR  | Decision                                                           | Core reason                                                     |
@@ -389,10 +477,11 @@ Stream agent output with `sendMessageDraft`, falling back to throttled
 | 0001 | OpenCode as headless server (systemd), Balam as client             | Keeps sessions/tools warm; bot stays small                      |
 | 0002 | HTTP API is source of truth; use the official TS SDK as client     | Contract-first, but reuse the maintained SDK                    |
 | 0003 | Three layers; frontend is fixed TypeScript                         | Clear responsibilities; Mini App must be web                    |
-| 0004 | Backend in TypeScript on Bun                                       | One language with the frontend; official SDK; single executable |
+| 0004 | Backend in TypeScript on Bun (**superseded by 0011**)              | One language with the frontend; official SDK; single executable |
 | 0005 | Browser-use as an OpenCode skill                                   | Reuse skill; backend language irrelevant to it                  |
 | 0006 | Live Chrome via embedded noVNC iframe                              | Real-time view from a standard stack; least UI code             |
 | 0007 | Local single-user on the VM                                        | Full local access; minimal security surface                     |
 | 0008 | Telegram entry point is the trust boundary; allowlist one user ID  | The bot is internet-facing even when ports are local            |
 | 0009 | One Telegram forum topic = one OpenCode session                    | Native parallel task threads, no custom UI                      |
 | 0010 | Telegram over Discord; supergroup-per-directory, topic-per-session | Native streaming + Mini App + no archiving; two-level tree fits |
+| 0011 | Backend reversed to Python (FastAPI + PTB), OpenCode over HTTP     | Reference reuse (zog/open-udang); HTTP is the contract (0002)    |
