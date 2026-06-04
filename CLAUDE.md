@@ -1,24 +1,26 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with
+code in this repository.
 
 ## What Balam is
 
-A Telegram bot backed by the [OpenCode](https://opencode.ai) coding agent, plus a
-Telegram Mini App for richer views (git diffs, markdown, and a live view of the
-agent's Chrome). It runs locally on an Ubuntu VM for **one** user.
+A Telegram bot backed by the [OpenCode](https://opencode.ai) coding agent, plus
+a Telegram Mini App for richer views (git diffs, markdown, and a live view of
+the agent's Chrome). It runs locally on an Ubuntu VM for **one** user.
 
 **Read `docs/architecture-decisions.md` first.** The nine ADRs there are the
 authoritative design and the reasons behind every choice below; this file only
 summarizes. Source files carry `TODO` markers that cite the ADR they implement.
 
-> Status: this is a tooling scaffold. The app entry points boot and the workspace
-> wiring is proven end-to-end, but the bot/agent/Mini App behavior in the ADRs is
-> not implemented yet.
+> Status: this is a tooling scaffold. The app entry points boot and the
+> workspace wiring is proven end-to-end, but the bot/agent/Mini App behavior in
+> the ADRs is not implemented yet.
 
 ## Commands
 
-Run from the repo root. The runtime is **Bun** (Node is a drop-in fallback per ADR-0004).
+Run from the repo root. The runtime is **Bun** (Node is a drop-in fallback per
+ADR-0004).
 
 | Command                | What it does                                                               |
 | ---------------------- | -------------------------------------------------------------------------- |
@@ -34,17 +36,18 @@ Run from the repo root. The runtime is **Bun** (Node is a drop-in fallback per A
 
 Tooling notes:
 
-- **Biome** does both linting and formatting (not ESLint/Prettier): 2-space indent,
-  line width 100, double quotes.
-- TypeScript is `strict` with `noUncheckedIndexedAccess` and `verbatimModuleSyntax`,
-  so type-only imports **must** use `import type { … }`. All workspaces extend
-  `tsconfig.base.json` and emit nothing — builds go through `bun build`/`vite`.
+- **Biome** does both linting and formatting (not ESLint/Prettier): 2-space
+  indent, line width 100, double quotes.
+- TypeScript is `strict` with `noUncheckedIndexedAccess` and
+  `verbatimModuleSyntax`, so type-only imports **must** use `import type { … }`.
+  All workspaces extend `tsconfig.base.json` and emit nothing — builds go
+  through `bun build`/`vite`.
 - Tests use Bun's built-in runner (`import { test, expect } from "bun:test"`).
 
 ## Architecture
 
-Three layers (ADR-0003). Responsibilities are kept separate on purpose — keep agent
-logic out of the UI and UI logic out of the agent:
+Three layers (ADR-0003). Responsibilities are kept separate on purpose — keep
+agent logic out of the UI and UI logic out of the agent:
 
 ```
 Mini App frontend (apps/frontend, React+Vite) — diff/markdown viewers, live Chrome iframe
@@ -58,15 +61,19 @@ Monorepo (Bun workspaces, `packages/*` + `apps/*`):
 
 - `packages/shared` — types shared by backend and Mini App. **Consumed as raw TS
   source**: its `main`/`types`/`exports` point at `src/index.ts`, so edits are
-  picked up with no build step, and `typecheck` covers it. Import as `@balam/shared`.
+  picked up with no build step, and `typecheck` covers it. Import as
+  `@balam/shared`.
 - `apps/backend` — the core of the system. Uses `grammy` for Telegram and
   `@opencode-ai/sdk` as the OpenCode client (SDK docs:
-  https://opencode.ai/docs/sdk/).
+  https://opencode.ai/docs/sdk/). Telegram Bot API reference:
+  https://core.telegram.org/bots/api. For streaming agent output, prefer the
+  native **`sendMessageDraft`** method. Forum topics are addressed by the
+  `message_thread_id` field (ADR-0009).
 - `apps/frontend` — the Telegram Mini App. Dev server is pinned to port **5180**
   (`strictPort`) because 5173 is taken by another local project.
 
 ## Configuration
 
-Copy `.env.example` to `.env` (Bun loads it automatically). Key vars: `TELEGRAM_BOT_TOKEN`,
-`ALLOWED_TELEGRAM_USER_ID`, `OPENCODE_BASE_URL`, `OPENCODE_SERVER_PASSWORD`,
-`BALAM_PORT`, `BALAM_WORKDIR`, `VNC_WS_URL`.
+Copy `.env.example` to `.env` (Bun loads it automatically). Key vars:
+`TELEGRAM_BOT_TOKEN`, `ALLOWED_TELEGRAM_USER_ID`, `OPENCODE_BASE_URL`,
+`OPENCODE_SERVER_PASSWORD`, `BALAM_PORT`, `BALAM_WORKDIR`, `VNC_WS_URL`.
