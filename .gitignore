@@ -26,9 +26,11 @@ __pycache__/
 
 # OS / editor
 .DS_Store
+.vscode/
 
 # Generated playwright-cli config (browser-use skill; written by headed-browser/ensure.sh)
 .playwright/
+.playwright-cli/
 
 # Claude Code local settings (personal; shared config and skills are tracked)
 .claude/settings.local.json
