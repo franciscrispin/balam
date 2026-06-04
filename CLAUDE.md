@@ -9,40 +9,58 @@ A Telegram bot backed by the [OpenCode](https://opencode.ai) coding agent, plus
 a Telegram Mini App for richer views (git diffs, markdown, and a live view of
 the agent's Chrome). It runs locally on an Ubuntu VM for **one** user.
 
-**Read `docs/architecture-decisions.md` first.** The nine ADRs there are the
+**Read `docs/architecture-decisions.md` first.** The ADRs there are the
 authoritative design and the reasons behind every choice below; this file only
-summarizes. Source files carry `TODO` markers that cite the ADR they implement.
+summarizes. **ADR-0011 is load-bearing: the backend is Python** (FastAPI +
+python-telegram-bot, OpenCode over HTTP), superseding the earlier TypeScript/Bun
+choice (ADR-0004). The frontend stays TypeScript (ADR-0003).
 
-> Status: this is a tooling scaffold. The app entry points boot and the
-> workspace wiring is proven end-to-end, but the bot/agent/Mini App behavior in
-> the ADRs is not implemented yet.
+> Status: early implementation. The bot↔agent round-trip over forum topics is
+> built (config, OpenCode HTTP/SSE client, topic→session SQLite map, allowlist,
+> animated draft streaming with GFM→MarkdownV2). The Mini App, noVNC view, and
+> slash commands are not implemented yet.
+
+## Repo layout — two toolchains
+
+This is a **polyglot** repo: a Python backend beside a TypeScript frontend. They
+do not share a toolchain; the contract between them is the backend's
+FastAPI-emitted OpenAPI schema, from which the frontend's types are generated
+(ADR-0003/0011).
+
+- `apps/backend` — **Python**, managed by **uv**. The core of the system.
+- `apps/frontend` + `packages/shared` — **TypeScript**, in a **Bun workspace**.
 
 ## Commands
 
-Run from the repo root. The runtime is **Bun** (Node is a drop-in fallback per
-ADR-0004).
+### Backend (Python / uv) — run from `apps/backend` or with `uv --directory apps/backend`
 
-| Command                | What it does                                                               |
-| ---------------------- | -------------------------------------------------------------------------- |
-| `bun install`          | Install all workspace dependencies.                                        |
-| `bun run dev`          | Run backend + Mini App in watch mode (`--filter './apps/*'`).              |
-| `bun run build`        | Build both apps; the backend compiles to a single binary at `dist/balam`.  |
-| `bun run typecheck`    | Type-check every workspace (`tsc --noEmit`).                               |
-| `bun run lint`         | Lint + format check with Biome. `bun run lint:fix` to autofix.             |
-| `bun run format`       | Format with Biome.                                                         |
-| `bun run test`         | Run all tests (`bun test`).                                                |
-| `bun test <path>`      | Run a single test file, e.g. `bun test apps/backend/src/scaffold.test.ts`. |
-| `bun test -t "<name>"` | Run tests matching a name pattern.                                         |
+| Command                                          | What it does                                  |
+| ------------------------------------------------ | --------------------------------------------- |
+| `uv sync`                                        | Create the venv and install deps.             |
+| `uv run balam`                                   | Run the bot (long polling).                   |
+| `uv run pytest`                                  | Run all backend tests.                        |
+| `uv run pytest -k <name>`                        | Run tests matching a name.                    |
+| `uv run ruff check . && uv run ruff format .`    | Lint + format (the Biome equivalent for Py).  |
+
+### Frontend + shared (TypeScript / Bun) — run from the repo root
+
+| Command             | What it does                                          |
+| ------------------- | ----------------------------------------------------- |
+| `bun install`       | Install frontend + shared deps.                       |
+| `bun run dev`       | Run the Mini App (Vite) in watch mode.                |
+| `bun run build`     | Build the Mini App.                                   |
+| `bun run typecheck` | Type-check `packages/*` + the frontend.               |
+| `bun run lint`      | Biome lint/format check (`lint:fix` to autofix).      |
 
 Tooling notes:
 
-- **Biome** does both linting and formatting (not ESLint/Prettier): 2-space
-  indent, line width 100, double quotes.
-- TypeScript is `strict` with `noUncheckedIndexedAccess` and
-  `verbatimModuleSyntax`, so type-only imports **must** use `import type { … }`.
-  All workspaces extend `tsconfig.base.json` and emit nothing — builds go
-  through `bun build`/`vite`.
-- Tests use Bun's built-in runner (`import { test, expect } from "bun:test"`).
+- **Backend:** Python 3.12+, `ruff` for lint + format (line width 100), `pytest`
+  with `pytest-asyncio` (`asyncio_mode = auto`, so `async def test_*` just works).
+  The OpenCode client is hand-written over `httpx` (ADR-0002/0011) — there is no
+  TypeScript SDK in the backend. GFM→Telegram-MarkdownV2 rendering uses `mistune`
+  (`balam/markdown.py`).
+- **Frontend:** Biome (2-space, width 100, double quotes); TypeScript `strict`
+  with `verbatimModuleSyntax`, so type-only imports **must** use `import type`.
 
 ## Architecture
 
@@ -50,30 +68,28 @@ Three layers (ADR-0003). Responsibilities are kept separate on purpose — keep
 agent logic out of the UI and UI logic out of the agent:
 
 ```
-Mini App frontend (apps/frontend, React+Vite) — diff/markdown viewers, live Chrome iframe
+Mini App frontend (apps/frontend, React+Vite, TypeScript) — diff/markdown viewers, live Chrome iframe
         │ HTTP / WebSocket
-Balam backend (apps/backend, Bun) — Telegram bot, serves Mini App, runs git, proxies noVNC, talks to OpenCode
-        │ HTTP + SSE  (@opencode-ai/sdk)
+Balam backend (apps/backend, Python: FastAPI + python-telegram-bot) — Telegram bot, serves Mini App, runs git, proxies noVNC, talks to OpenCode
+        │ HTTP + SSE  (httpx, raw OpenCode HTTP API)
 OpenCode server (separate process, NOT in this repo) — the agent: model + local tools/files + browser-use skill
 ```
 
-Monorepo (Bun workspaces, `packages/*` + `apps/*`):
+Backend modules (`apps/backend/src/balam/`): `config.py` (env validation),
+`opencode.py` (httpx HTTP/SSE client), `store.py` (sqlite3 topic→session map),
+`router.py` (topic→session, lazy create), `markdown.py` (GFM→MarkdownV2),
+`streamer.py` (animated `send_message_draft` streaming + finalize), `bot.py`
+(PTB, allowlist + handler), `app.py` (boot). Telegram Bot API reference:
+https://core.telegram.org/bots/api. Streaming uses native **`send_message_draft`**;
+forum topics are addressed by `message_thread_id` (ADR-0009).
 
-- `packages/shared` — types shared by backend and Mini App. **Consumed as raw TS
-  source**: its `main`/`types`/`exports` point at `src/index.ts`, so edits are
-  picked up with no build step, and `typecheck` covers it. Import as
-  `@balam/shared`.
-- `apps/backend` — the core of the system. Uses `grammy` for Telegram and
-  `@opencode-ai/sdk` as the OpenCode client (SDK docs:
-  https://opencode.ai/docs/sdk/). Telegram Bot API reference:
-  https://core.telegram.org/bots/api. For streaming agent output, prefer the
-  native **`sendMessageDraft`** method. Forum topics are addressed by the
-  `message_thread_id` field (ADR-0009).
-- `apps/frontend` — the Telegram Mini App. Dev server is pinned to port **5180**
-  (`strictPort`) because 5173 is taken by another local project.
+`packages/shared` (TypeScript) holds types for the Mini App; `@opencode-ai/sdk`
+is **no longer used** (the backend is Python). Frontend dev server is pinned to
+port **5180** (`strictPort`) because 5173 is taken by another local project.
 
 ## Configuration
 
-Copy `.env.example` to `.env` (Bun loads it automatically). Key vars:
-`TELEGRAM_BOT_TOKEN`, `ALLOWED_TELEGRAM_USER_ID`, `OPENCODE_BASE_URL`,
-`OPENCODE_SERVER_PASSWORD`, `BALAM_PORT`, `BALAM_WORKDIR`, `VNC_WS_URL`.
+Copy `.env.example` to `.env` (pydantic-settings loads the repo-root `.env`; real
+env vars from systemd take precedence). Key vars: `TELEGRAM_BOT_TOKEN`,
+`ALLOWED_TELEGRAM_USER_ID`, `OPENCODE_BASE_URL`, `OPENCODE_SERVER_PASSWORD`,
+`BALAM_WORKDIR`, `BALAM_DB_PATH`, `VNC_WS_URL`.

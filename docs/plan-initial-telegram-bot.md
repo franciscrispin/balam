@@ -1,6 +1,25 @@
 # Plan: initial Telegram bot ↔ agent round-trip over forum topics
 
-Status: Proposed Date: 2026-05-21
+Status: Implemented (in **Python** per ADR-0011) Date: 2026-05-21
+
+> **Implementation note.** This plan was written when the backend was TypeScript.
+> It was implemented in Python after ADR-0011 reversed the language choice. The
+> design below is unchanged in intent; only the language and a few mechanics
+> differ. File mapping (`apps/backend/src/balam/`):
+>
+> | Plan component | Implemented as            | Notes                                              |
+> | -------------- | ------------------------- | -------------------------------------------------- |
+> | `config.ts`    | `config.py`               | `pydantic-settings`, fail-fast.                    |
+> | `store.ts`     | `store.py`                | stdlib `sqlite3` (not `bun:sqlite`).               |
+> | `opencode.ts`  | `opencode.py`             | raw `httpx` HTTP/SSE (not `@opencode-ai/sdk`).     |
+> | `router.ts`    | `router.py`               | unchanged.                                         |
+> | `streamer.ts`  | `streamer.py` + `markdown.py` | `send_message_draft` streaming + GFM→MarkdownV2 via `mistune`. |
+> | `bot.ts`       | `bot.py`                  | `python-telegram-bot`; allowlist via `filters.User`. |
+> | `index.ts`     | `app.py`                  | boot via PTB `run_polling` + `post_init`/`post_shutdown`. |
+>
+> The "streamed reply" path uses native `send_message_draft` (it **does** work in
+> forum topics with `message_thread_id`), not the throttled `editMessageText`
+> fallback this plan's draft originally assumed.
 
 This plan implements the first working slice of Balam: a single user messaging
 the bot inside Telegram **forum topics**, with each topic mapped to its own
