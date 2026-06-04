@@ -3,18 +3,18 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "comment": "Bun workspace covers the TypeScript frontend + shared types only. The backend is Python (apps/backend) managed by uv — see CLAUDE.md.",
   "workspaces": [
     "packages/*",
-    "apps/*"
+    "apps/frontend"
   ],
   "scripts": {
-    "dev": "bun run --filter './apps/*' dev",
-    "build": "bun run --filter './apps/*' build",
-    "typecheck": "bun run --filter './packages/*' --filter './apps/*' typecheck",
+    "dev": "bun run --filter './apps/frontend' dev",
+    "build": "bun run --filter './apps/frontend' build",
+    "typecheck": "bun run --filter './packages/*' --filter './apps/frontend' typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "format": "biome format --write .",
-    "test": "bun test"
+    "format": "biome format --write ."
   },
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",

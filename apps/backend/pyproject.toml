@@ -1,0 +1,47 @@
+[project]
+name = "balam"
+version = "0.0.0"
+description = "Telegram bot backed by the OpenCode coding agent (ADR-0011: Python backend)."
+requires-python = ">=3.12"
+dependencies = [
+    # Telegram bot; [httpx] transport + [job-queue] for scheduled work later.
+    "python-telegram-bot[httpx,job-queue]>=22.6",
+    # OpenCode HTTP/SSE client (ADR-0002 — we call the HTTP API directly).
+    "httpx>=0.27",
+    # GFM → Telegram MarkdownV2 rendering (ADR-0010).
+    "mistune>=3.0,<4.0",
+    # Mini App HTTP/WS + OpenAPI schema for the generated frontend client (ADR-0003/0006).
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # Typed, validated env configuration (ADR-0008/0007).
+    "pydantic-settings>=2.4",
+]
+
+[project.scripts]
+balam = "balam.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/balam"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

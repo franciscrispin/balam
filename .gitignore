@@ -12,6 +12,18 @@ apps/*/dist/
 # Logs
 *.log
 
+# Local SQLite topic→session map (ADR-0009)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Python backend (apps/backend, uv)
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
 # OS / editor
 .DS_Store
 
