@@ -5,13 +5,15 @@
   "permissions": {
     "allow": [
       "Bash(.claude/skills/browser-use/headed-browser/ensure.sh)",
+      "Bash(.claude/skills/browser-use/headed-browser/profile.sh:*)",
       "Bash(.claude/skills/browser-use/headed-browser/start.sh)",
       "Bash(.claude/skills/browser-use/headed-browser/stop.sh)",
-      "Bash(.claude/skills/browser-use/headed-browser/profile.sh:*)",
+      "Bash(.claude/skills/run-balam/scripts/logs.sh:*)",
+      "Bash(.claude/skills/run-balam/scripts/start.sh)",
+      "Bash(.claude/skills/run-balam/scripts/status.sh)",
+      "Bash(.claude/skills/run-balam/scripts/stop.sh)",
       "Bash(playwright-cli:*)",
-      "Bash(DISPLAY=:99 playwright-cli:*)",
-      "Bash(xdpyinfo:*)",
-      "Bash(DISPLAY=:99 xdpyinfo:*)"
+      "Bash(xdpyinfo:*)"
     ]
   }
 }
