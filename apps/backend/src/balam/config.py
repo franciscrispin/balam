@@ -42,6 +42,10 @@ class Config(BaseSettings):
     # --- Telegram trust boundary (ADR-0008) ---
     telegram_bot_token: str
     allowed_telegram_user_id: int
+    # Optional: scope the bot to a single forum supergroup (ADR-0010). When set,
+    # handlers gate on this chat id in addition to the owner id; unset → the
+    # legacy owner-anywhere behavior.
+    allowed_telegram_chat_id: int | None = None
 
     # --- OpenCode server (ADR-0001/0002/0007) ---
     opencode_base_url: str = "http://127.0.0.1:4096"
@@ -56,6 +60,7 @@ class Config(BaseSettings):
         "opencode_server_password",
         "balam_db_path",
         "balam_config_path",
+        "allowed_telegram_chat_id",
         mode="before",
     )
     @classmethod

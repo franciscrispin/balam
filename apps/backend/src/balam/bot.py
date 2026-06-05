@@ -13,7 +13,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from telegram import Update
+from telegram import (
+    Bot,
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -178,8 +186,8 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Greet inside the new topic so it isn't empty, then hand back a tappable
-    # link in the originating chat/topic (plain text → Telegram auto-links it).
+    # Greet inside the new topic so it isn't empty, then hand back a one-tap
+    # link in the originating chat/topic as an inline URL button.
     await context.bot.send_message(
         chat_id=message.chat_id,
         text=f"🗂 Context {name} — {ctx.directory}\nSend a message to start.",
@@ -187,9 +195,35 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     link = _topic_link(message.chat_id, new_thread_id, bot_id=context.bot.id)
     if link:
-        await message.reply_text(f"Opened a new {name} topic → {link}")
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Go to topic", url=link)]])
+        await message.reply_text(f"Opened a new {name} topic.", reply_markup=keyboard)
     else:
         await message.reply_text(f"Opened a new {name} topic — pick it from the topic list.")
+
+
+#: The slash commands Balam exposes. Registering them via ``setMyCommands`` is
+#: what makes ``/context`` discoverable and reliably routed to the bot in a
+#: group, where clients dispatch slash commands by the bot's registered list.
+BOT_COMMANDS = [
+    BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
+]
+
+
+async def register_commands(bot: Bot, chat_id: int | None = None) -> None:
+    """Publish :data:`BOT_COMMANDS` so clients surface and route ``/context``.
+
+    In groups a client routes a slash command by the bot's registered command
+    list (and may send it as ``/context@<bot>``); without ``setMyCommands`` the
+    command is never offered and bare ``/context`` may not be delivered. We set
+    the default and all-group-chats scopes, plus the specific group chat when
+    Balam is scoped to one, so the command appears exactly where it is used.
+    """
+    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+    if chat_id is not None:
+        from telegram import BotCommandScopeChat
+
+        await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=chat_id))
 
 
 def build_application(
@@ -212,9 +246,15 @@ def build_application(
     app.bot_data["router"] = router
 
     # Trust boundary (ADR-0008): filters.User gates by sender id, so only the
-    # owner's text messages reach the handler; everyone else is dropped silently.
-    owner_only = filters.User(user_id=config.allowed_telegram_user_id)
-    app.add_handler(CommandHandler("context", _handle_context, filters=owner_only))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & owner_only, _handle_message))
+    # owner's messages reach the handlers; everyone else is dropped silently.
+    # When a target chat is configured (ADR-0010), additionally require that
+    # chat, so the bot acts only inside the balamies supergroup. Unset → the
+    # legacy owner-anywhere behavior, preserving the DM round-trip.
+    allowed = filters.User(user_id=config.allowed_telegram_user_id)
+    if config.allowed_telegram_chat_id is not None:
+        allowed = allowed & filters.Chat(chat_id=config.allowed_telegram_chat_id)
+
+    app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & allowed, _handle_message))
 
     return app

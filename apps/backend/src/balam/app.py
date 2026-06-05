@@ -20,7 +20,7 @@ import sys
 
 from telegram.ext import Application
 
-from balam.bot import build_application
+from balam.bot import build_application, register_commands
 from balam.config import ConfigError, load_config
 from balam.contexts import ContextsConfigError, load_contexts
 from balam.opencode import OpenCode
@@ -56,7 +56,12 @@ def main() -> None:
     store = SessionStore(config.db_path)
     router = Router(store, opencode, contexts)
 
-    async def _post_init(_application: Application) -> None:
+    async def _post_init(application: Application) -> None:
+        # Publish slash commands so /context is discoverable and routed to the
+        # bot in the balamies group (clients dispatch group commands by the
+        # registered list, not just by delivery).
+        await register_commands(application.bot, config.allowed_telegram_chat_id)
+        logger.info("registered bot commands (chat scope %s)", config.allowed_telegram_chat_id)
         logger.info("waiting for OpenCode at %s ...", config.opencode_base_url)
         await opencode.wait_for_ready()
         logger.info("OpenCode is ready.")
@@ -70,8 +75,9 @@ def main() -> None:
     )
 
     logger.info(
-        "starting bot (owner %s, contexts %s, default %s) ...",
+        "starting bot (owner %s, chat %s, contexts %s, default %s) ...",
         config.allowed_telegram_user_id,
+        config.allowed_telegram_chat_id or "any",
         sorted(contexts.contexts),
         contexts.default_context,
     )
