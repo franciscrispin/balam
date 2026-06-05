@@ -12,13 +12,14 @@ the agent's Chrome). It runs locally on an Ubuntu VM for **one** user.
 **Read `docs/architecture-decisions.md` first.** The ADRs there are the
 authoritative design and the reasons behind every choice below; this file only
 summarizes. **ADR-0011 is load-bearing: the backend is Python** (FastAPI +
-python-telegram-bot, OpenCode over HTTP), superseding the earlier TypeScript/Bun
-choice (ADR-0004). The frontend stays TypeScript (ADR-0003).
+python-telegram-bot, OpenCode over HTTP). The frontend stays TypeScript
+(ADR-0003).
 
 > Status: early implementation. The bot↔agent round-trip over forum topics is
 > built (config, OpenCode HTTP/SSE client, topic→session SQLite map, allowlist,
-> animated draft streaming with GFM→MarkdownV2). The Mini App, noVNC view, and
-> slash commands are not implemented yet.
+> animated draft streaming with GFM→MarkdownV2). Workspace **contexts**
+> (`config.yaml`) and the `/context` command are built. The Mini App, noVNC
+> view, and other slash commands are not implemented yet.
 
 ## Repo layout — two toolchains
 
@@ -76,12 +77,27 @@ OpenCode server (separate process, NOT in this repo) — the agent: model + loca
 ```
 
 Backend modules (`apps/backend/src/balam/`): `config.py` (env validation),
-`opencode.py` (httpx HTTP/SSE client), `store.py` (sqlite3 topic→session map),
-`router.py` (topic→session, lazy create), `markdown.py` (GFM→MarkdownV2),
-`streamer.py` (animated `send_message_draft` streaming + finalize), `bot.py`
-(PTB, allowlist + handler), `app.py` (boot). Telegram Bot API reference:
+`contexts.py` (`config.yaml` workspace contexts), `opencode.py` (httpx HTTP/SSE
+client), `store.py` (sqlite3 topic→session map), `router.py` (topic→context→
+session, lazy create), `markdown.py` (GFM→MarkdownV2), `streamer.py` (animated
+`send_message_draft` streaming + finalize), `bot.py` (PTB, allowlist + message
+handler + `/context`), `app.py` (boot). Telegram Bot API reference:
 https://core.telegram.org/bots/api. Streaming uses native **`send_message_draft`**;
 forum topics are addressed by `message_thread_id` (ADR-0009).
+
+**Workspace contexts.** A *context* (adapted from OpenShrimp/open-udang) bundles
+a working `directory` with an optional `model` (`provider/model`) and `effort`,
+plus an `allowed_tools` list, so one bot can drive several projects. Contexts are
+defined in `config.yaml` (see `config.example.yaml`); the file is optional —
+without it Balam runs a single `default` context from `BALAM_WORKDIR`. Each
+topic binds to one context, persisted in the `context` column of the
+topic→session row; an unbound topic uses `default_context`. `/context` lists the
+contexts and the topic's current binding; `/context <name>` rebinds the topic and
+starts a fresh session in that workspace. The router passes the resolved
+directory/model/effort to the OpenCode prompt (`model` → `{providerID, modelID}`,
+`effort` → `variant`). NOTE: `allowed_tools`/`additional_directories` are parsed
+and validated but **path-scoped permission enforcement is not wired into OpenCode
+yet** (deliberately deferred).
 
 `packages/shared` (TypeScript) holds types for the Mini App; `@opencode-ai/sdk`
 is **no longer used** (the backend is Python). Frontend dev server is pinned to
@@ -92,4 +108,7 @@ port **5180** (`strictPort`) because 5173 is taken by another local project.
 Copy `.env.example` to `.env` (pydantic-settings loads the repo-root `.env`; real
 env vars from systemd take precedence). Key vars: `TELEGRAM_BOT_TOKEN`,
 `ALLOWED_TELEGRAM_USER_ID`, `OPENCODE_BASE_URL`, `OPENCODE_SERVER_PASSWORD`,
-`BALAM_WORKDIR`, `BALAM_DB_PATH`, `VNC_WS_URL`.
+`BALAM_WORKDIR` (fallback workspace when no `config.yaml`), `BALAM_DB_PATH`,
+`VNC_WS_URL`. Workspace contexts live in `config.yaml` (copy
+`config.example.yaml`; path overridable via `BALAM_CONFIG_PATH`, default
+repo-root). Secrets stay in `.env`, never `config.yaml`.
