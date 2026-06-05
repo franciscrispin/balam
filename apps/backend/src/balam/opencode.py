@@ -158,4 +158,8 @@ class OpenCode:
                 if line.startswith("data:"):
                     payload = line[len("data:") :].strip()
                     if payload:
+                        # A malformed frame is a real protocol fault: let it
+                        # propagate so the turn fails fast and visibly (the
+                        # streamer surfaces it as an error reply) rather than
+                        # silently skipping a frame the user would never notice.
                         yield json.loads(payload)
