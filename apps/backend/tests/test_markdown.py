@@ -50,6 +50,17 @@ def test_split_is_code_block_aware() -> None:
     assert chunks[1].lstrip().startswith("```python")  # next reopens it
 
 
+def test_split_reopening_a_fence_stays_within_limit() -> None:
+    # A single code-block line longer than the cap forces the hard-cut path; the
+    # appended closing fence must not push the chunk past the limit.
+    body = "```\n" + ("x" * (TELEGRAM_MAX_LENGTH + 2000)) + "\n```"
+    chunks = split_message(body)
+    assert len(chunks) >= 2
+    assert all(len(c) <= TELEGRAM_MAX_LENGTH for c in chunks)
+    # Every chunk leaves the fence balanced (closed before the split, reopened after).
+    assert all(c.count("```") % 2 == 0 for c in chunks)
+
+
 def test_empty_text_yields_no_chunks() -> None:
     assert gfm_to_telegram("") == []
     assert split_message("   ") == []

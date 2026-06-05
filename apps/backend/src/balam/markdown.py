@@ -233,13 +233,25 @@ def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]
         if split_at <= 0:
             split_at = max_length
 
-        chunk = remaining[:split_at].strip()
-        rest = remaining[split_at:].lstrip("\n")
-
         inside, fence = _is_inside_code_block(remaining, split_at)
+        # When the split lands inside a fence, the chunk gains a closing ``` and
+        # the next chunk re-opens with `fence`. Both cost space, so account for
+        # them: keep the closed chunk within the cap, and — crucially — guarantee
+        # progress. A natural boundary right after the opening fence (e.g. a
+        # single code line longer than the cap) would re-add the fence and never
+        # shrink `remaining`, looping forever; fall back to a hard cut then.
+        suffix = "\n```" if inside else ""
+        reopen = f"{fence}\n" if inside else ""
+        max_chunk = max_length - len(suffix)
+        if split_at > max_chunk or split_at <= len(reopen):
+            split_at = max_chunk
+
         if inside:
-            chunk = chunk + "\n```"
-            rest = fence + "\n" + rest
+            chunk = remaining[:split_at].rstrip() + suffix
+            rest = reopen + remaining[split_at:].lstrip("\n")
+        else:
+            chunk = remaining[:split_at].strip()
+            rest = remaining[split_at:].lstrip("\n")
 
         chunks.append(chunk)
         remaining = rest
