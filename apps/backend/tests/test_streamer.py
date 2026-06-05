@@ -116,6 +116,23 @@ def _text_part(mid: str, text: str, pid: str = "prt_1") -> dict[str, object]:
     )
 
 
+def _tool_part(
+    call_id: str, tool: str, state: dict[str, object], pid: str = "prt_tool"
+) -> dict[str, object]:
+    return _ev(
+        "message.part.updated",
+        part={
+            "type": "tool",
+            "sessionID": SID,
+            "messageID": AID,
+            "id": pid,
+            "callID": call_id,
+            "tool": tool,
+            "state": state,
+        },
+    )
+
+
 class FakeBot:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -151,7 +168,7 @@ class FakeOpenCode:
             yield event
 
 
-async def _run(events: list[dict[str, object]]) -> FakeBot:
+async def _run(events: list[dict[str, object]], *, directory: str | None = None) -> FakeBot:
     bot = FakeBot()
     await stream_reply(
         bot=bot,
@@ -160,6 +177,7 @@ async def _run(events: list[dict[str, object]]) -> FakeBot:
         chat_id=1,
         thread_id=99,
         prompt="hello",
+        directory=directory,
         draft_interval=0.01,  # tiny: finalize waits on the flusher's sleep
     )
     return bot
@@ -177,6 +195,55 @@ async def test_stream_reply_captures_assistant_text_and_skips_user_echo() -> Non
         ]
     )
     assert bot.messages == ["hey there"]
+
+
+async def test_stream_reply_renders_tool_line_interleaved_with_text() -> None:
+    fpath = "/work/proj/src/foo.py"
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _text_part(AID, "Let me look.", "prt_text1"),
+            # Tool invoked (running), then completes — renders only at terminal.
+            _tool_part("call_1", "read", {"status": "running", "input": {"filePath": fpath}}),
+            _tool_part(
+                "call_1",
+                "read",
+                {"status": "completed", "input": {"filePath": fpath}, "output": "..."},
+            ),
+            _text_part(AID, "Done.", "prt_text2"),
+            _ev("session.idle", sessionID=SID),
+        ],
+        directory="/work/proj",
+    )
+    assert len(bot.messages) == 1
+    final = bot.messages[0]
+    # Tool line, path shown relative to the context directory, interleaved
+    # between the two prose fragments in arrival order.
+    assert "🔧 Read" in final
+    assert "src/foo.py" in final
+    assert "/work/proj" not in final
+    assert final.index("look") < final.index("Read") < final.index("Done")
+
+
+async def test_stream_reply_truncates_bash_output() -> None:
+    long_output = "\n".join(f"line {i}" for i in range(200))
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "call_b",
+                "bash",
+                {"status": "completed", "input": {"command": "seq 200"}, "output": long_output},
+            ),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    final = bot.messages[0]
+    assert "🔧 Bash" in final
+    assert "seq 200" in final  # the command is shown
+    assert "truncated" in final
+    assert "line 199" in final  # the tail is kept
+    assert "line 0" not in final  # the head is dropped
 
 
 class PromptGatedOpenCode(FakeOpenCode):
