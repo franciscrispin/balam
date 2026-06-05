@@ -44,14 +44,6 @@ class SessionStore:
         """Normalize an optional ``message_thread_id`` to a concrete key."""
         return GENERAL_THREAD_ID if thread_id is None else thread_id
 
-    def get(self, chat_id: int, thread_id: int | None) -> str | None:
-        """Resolve the session for a topic, or ``None`` if none is mapped yet."""
-        row = self._db.execute(
-            "SELECT session_id FROM topic_sessions WHERE chat_id = ? AND thread_id = ?",
-            (chat_id, self.thread_key(thread_id)),
-        ).fetchone()
-        return row[0] if row else None
-
     def get_row(self, chat_id: int, thread_id: int | None) -> tuple[str, str | None] | None:
         """Resolve a topic to ``(session_id, context)``, or ``None`` if unmapped.
 
