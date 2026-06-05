@@ -26,6 +26,7 @@ from typing import Any, Protocol
 
 from balam.markdown import gfm_to_telegram
 from balam.opencode import OpenCode
+from balam.telegram_utils import thread_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ def _join_parts(parts: dict[str, tuple[int, str]]) -> str:
 
 def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTransport:
     # message_thread_id routes both the draft and the final message to the topic.
-    thread_kwargs: dict[str, Any] = {} if thread_id is None else {"message_thread_id": thread_id}
+    topic_kwargs = thread_kwargs(thread_id)
 
     class _Transport:
         async def send_draft(self, draft_id: int, text: str) -> None:
@@ -136,18 +137,18 @@ def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTrans
                 draft_id=draft_id,
                 text=text,
                 parse_mode="MarkdownV2",
-                **thread_kwargs,
+                **topic_kwargs,
             )
 
         async def send_message(self, text: str) -> None:
             try:
                 await bot.send_message(
-                    chat_id=chat_id, text=text, parse_mode="MarkdownV2", **thread_kwargs
+                    chat_id=chat_id, text=text, parse_mode="MarkdownV2", **topic_kwargs
                 )
             except Exception:
                 # Malformed MarkdownV2 → resend without formatting rather than drop.
                 logger.debug("MarkdownV2 send failed; falling back to plain text", exc_info=True)
-                await bot.send_message(chat_id=chat_id, text=text, **thread_kwargs)
+                await bot.send_message(chat_id=chat_id, text=text, **topic_kwargs)
 
     return _Transport()
 
@@ -178,7 +179,7 @@ async def stream_reply(
     """
     transport = _make_transport(bot, chat_id, thread_id)
     draft = DraftSession(transport)
-    thread_kwargs: dict[str, Any] = {} if thread_id is None else {"message_thread_id": thread_id}
+    topic_kwargs = thread_kwargs(thread_id)
 
     streaming = True
 
@@ -232,40 +233,50 @@ async def stream_reply(
             elif etype == "session.idle" and props.get("sessionID") == session_id:
                 break
 
+    # Subscribe *before* prompting so no early deltas are missed (ADR-0010).
+    consume_task = asyncio.create_task(consume())
     try:
         try:
-            await bot.send_chat_action(chat_id=chat_id, action="typing", **thread_kwargs)
+            await bot.send_chat_action(chat_id=chat_id, action="typing", **topic_kwargs)
         except Exception:
             pass
 
-        # Subscribe *before* prompting so no early deltas are missed (ADR-0010).
-        consume_task = asyncio.create_task(consume())
-        ready_task = asyncio.create_task(stream_ready.wait())
-        await asyncio.wait({ready_task, consume_task}, return_when=asyncio.FIRST_COMPLETED)
-        if consume_task.done():
-            # Stream failed before opening; re-raise instead of prompting into it.
-            ready_task.cancel()
-            await consume_task
-        else:
-            await opencode.prompt(
-                session_id,
-                prompt,
-                directory=directory,
-                provider=provider,
-                model=model,
-                effort=effort,
-            )
-            await consume_task
+        try:
+            ready_task = asyncio.create_task(stream_ready.wait())
+            await asyncio.wait({ready_task, consume_task}, return_when=asyncio.FIRST_COMPLETED)
+            if consume_task.done():
+                # Stream failed/closed before opening; surface it without prompting.
+                ready_task.cancel()
+                await consume_task
+            else:
+                await opencode.prompt(
+                    session_id,
+                    prompt,
+                    directory=directory,
+                    provider=provider,
+                    model=model,
+                    effort=effort,
+                )
+                await consume_task
+        except Exception as exc:
+            # A failed prompt or a broken event stream must still finalize a real
+            # message (ADR-0010): fold the error into the reply instead of letting
+            # it bubble out and skip finalize() below.
+            logger.exception("streaming the reply failed")
+            error_text = error_text or str(exc) or exc.__class__.__name__
 
         if error_text:
             base = _join_parts(text_parts)
             prefix = f"{base}\n\n" if base.strip() else ""
             draft.set_text(f"{prefix}⚠️ {error_text}")
     finally:
-        # Stop the flusher before finalizing so the draft and the real message
-        # don't race.
+        # Stop the flusher and the consumer before finalizing so neither races the
+        # real message, and so a leftover task can't outlive the turn.
         streaming = False
-        await flush_task
+        if not consume_task.done():
+            consume_task.cancel()
+        await asyncio.gather(flush_task, consume_task, return_exceptions=True)
 
-    # Replace the ephemeral draft with the real, persistent message(s).
+    # Replace the ephemeral draft with the real, persistent message(s) — always,
+    # even on error, so accumulated text and any error notice are delivered.
     await draft.finalize()

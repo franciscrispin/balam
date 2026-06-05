@@ -35,6 +35,7 @@ from balam.config import Config
 from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
 from balam.streamer import stream_reply
+from balam.telegram_utils import thread_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,6 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     chat_id = message.chat_id
     thread_id = message.message_thread_id
-    thread_kwargs: dict[str, Any] = {} if thread_id is None else {"message_thread_id": thread_id}
 
     router: Router = context.application.bot_data["router"]
     opencode: OpenCode = context.application.bot_data["opencode"]
@@ -88,7 +88,9 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # OpenCode error → post a short message into the topic (ADR-0009 edge).
         logger.exception("failed to handle message")
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs)
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs(thread_id)
+            )
         except Exception:
             logger.debug("failed to deliver error notice", exc_info=True)
 
@@ -179,11 +181,15 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await router.create_topic_session(message.chat_id, new_thread_id, name, name)
     except Exception as exc:
         logger.exception("failed to start session for new topic")
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            text=f"⚠️ Created the topic but couldn't start a session: {exc}",
-            message_thread_id=new_thread_id,
-        )
+        # Roll back the just-created topic: an unbound topic would silently route
+        # to default_context, not the one the user asked for. Best-effort delete.
+        try:
+            await context.bot.delete_forum_topic(
+                chat_id=message.chat_id, message_thread_id=new_thread_id
+            )
+        except Exception:
+            logger.debug("failed to delete orphan topic after session failure", exc_info=True)
+        await message.reply_text(f"⚠️ Couldn't start a session for {name!r}: {exc}")
         return
 
     # Greet inside the new topic so it isn't empty, then hand back a one-tap
