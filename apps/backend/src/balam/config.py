@@ -8,7 +8,6 @@ systemd unit) take precedence over the repo-root ``.env`` used in local dev.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from pydantic import ValidationError, field_validator
@@ -50,10 +49,15 @@ class Config(BaseSettings):
     opencode_server_password: str | None = None
 
     # --- Balam backend ---
-    balam_workdir: str | None = None
     balam_db_path: str | None = None
+    balam_config_path: str | None = None
 
-    @field_validator("opencode_server_password", "balam_workdir", "balam_db_path", mode="before")
+    @field_validator(
+        "opencode_server_password",
+        "balam_db_path",
+        "balam_config_path",
+        mode="before",
+    )
     @classmethod
     def _blank_to_default(cls, value: object) -> object:
         # Treat an empty/whitespace env value as "unset" so defaults apply.
@@ -69,14 +73,16 @@ class Config(BaseSettings):
         return value
 
     @property
-    def workdir(self) -> str:
-        """Directory the agent acts on; defaults to the current directory."""
-        return self.balam_workdir or os.getcwd()
-
-    @property
     def db_path(self) -> str:
         """SQLite file backing the topic→session map (ADR-0009)."""
         return self.balam_db_path or "balam.sqlite"
+
+    @property
+    def config_path(self) -> str:
+        """The (mandatory) ``config.yaml`` defining workspace contexts; repo-root
+        by default. :func:`balam.contexts.load_contexts` fails fast if it is
+        absent."""
+        return self.balam_config_path or str(_REPO_ROOT / "config.yaml")
 
 
 def load_config() -> Config:

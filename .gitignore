@@ -9,6 +9,9 @@ apps/*/dist/
 .env
 .env.local
 
+# Local workspace contexts (personal paths; config.example.yaml is tracked)
+config.yaml
+
 # Logs
 *.log
 

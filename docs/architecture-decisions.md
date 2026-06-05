@@ -247,6 +247,13 @@ Treat the Telegram entry point as the trust boundary and lock it to one user:
 - A stranger messaging the bot gets nothing; only the owner can drive the agent.
 - If the token leaks, an attacker can still send updates, but the user-ID
   allowlist rejects them. Rotating the token stays the recovery step.
+- **Optional chat scoping (`ALLOWED_TELEGRAM_CHAT_ID`).** Balam now targets the
+  "balamies" forum **supergroup** (ADR-0010) rather than the owner's DM. When this
+  `-100…` chat id is set, both handlers require it **in addition to** the owner id
+  (`filters.User & filters.Chat`), so the bot acts only inside that group and
+  ignores the owner everywhere else (including the old DM). It is a defense-in-depth
+  narrowing of the entry point, not a replacement for the user-ID gate, which always
+  applies; unset, the bot keeps the legacy owner-anywhere behavior.
 - This is the control that makes ADR-0007's "minimal security surface" true. If
   the system ever goes multi-user, this ADR and ADR-0007 are revisited together.
 
@@ -279,6 +286,30 @@ session.
 - A new topic with no session yet triggers session creation; a topic whose
   session is gone is recreated or reported, not silently dropped.
 - Telegram's "General" topic can default to a single catch-all session.
+- **A topic's workspace context is fixed for its lifetime** (ADR-0012). Switching
+  context never rebinds an existing topic; `/context <name>` (from any topic or General)
+  **creates a new topic** bound to `<name>` and replies with a one-tap link to
+  it, delivered as an inline **"Go to topic"** URL button. This keeps the
+  one-context-per-topic invariant, so a topic's session always remembers its own
+  history and no sessions are orphaned by rebinding. Duplicate topic names are
+  allowed (many topics may share a context).
+- **Balam runs in a forum *supergroup*, but topics also work in a private chat.**
+  The live deployment is the "balamies" supergroup (ADR-0010), so the chat id is
+  a `-100…` supergroup. Telegram's topics-in-private-chats (Bot API 9.3, Dec 2025;
+  `createForumTopic` in private chats, 9.4, Feb 2026) — enabled via BotFather
+  "Threaded Mode" — also makes `/context` topic creation work in the owner's DM,
+  where the chat id is instead the owner's **positive** user id; that path is kept
+  as a supported fallback.
+- **The one-tap link is environment-dependent** because the Bot API cannot focus
+  the client on a chat and has **no documented deep link to a topic in a private
+  chat** (thread-targeting `t.me`/`tg://` links are supergroup/channel only). So
+  `_topic_link` emits: for a `-100…` supergroup (the live deployment), the official
+  `t.me/c/<internal>/<thread>` (all clients); for the private-chat fallback, the
+  Telegram **Web** address `web.telegram.org/a/#<bot_id>_<thread>` — how the Web
+  client itself routes to the topic (verified to open it cold). Web-only, but the
+  owner drives Balam over Web, so it is a real one-tap link; on native apps the
+  fallback is "pick it from the topic list." Either way the URL is wrapped in the
+  inline "Go to topic" button.
 
 ---
 
@@ -308,10 +339,11 @@ wrong on inspection:
    arrive, which burns per-channel rate limits. For an agent that relays
    incremental output, this is now a clear Telegram advantage.
 2. **"Telegram can't express the two-level tree."** It can: forum topics are
-   single-level _within one supergroup_, but using **one supergroup per
-   directory** (the "channel") with **one forum topic per session** inside it
-   yields the required two levels — and each directory becomes a top-level entry
-   in the chat list.
+   single-level _within one supergroup_, but the directory level is carried by a
+   **workspace context** (ADR-0012) instead of by the chat hierarchy — Balam
+   tags each topic with a context that names its working directory, so a single
+   supergroup holds topics across several projects, and **one forum topic per
+   session** supplies the second level.
 
 Other factors: the rich Mini App views (git diffs, markdown, live noVNC Chrome,
 ADR-0006) have no Discord equivalent (Activities cannot embed an arbitrary
@@ -323,10 +355,14 @@ programmatic provisioning of the directory level.
 
 ### Decision
 
-Build Balam on **Telegram**. Map the directory→session tree as:
+Build Balam on **Telegram**. Realize the directory→session tree as:
 
-- **One Telegram supergroup (forum) per directory path** — the "channel".
-- **One forum topic per OpenCode session** within it (ADR-0009 unchanged).
+- **The directory dimension is a workspace context** (ADR-0012), not a separate
+  supergroup per directory. Balam is scoped to a single forum supergroup
+  ("balamies", `ALLOWED_TELEGRAM_CHAT_ID`); each topic binds to a context whose
+  `directory` is the agent's working dir.
+- **One forum topic per OpenCode session** within that supergroup (ADR-0009
+  unchanged); `/context <name>` opens a topic for a context.
 
 Stream agent output with `sendMessageDraft`, falling back to throttled
 `editMessageText` only where the native method does not fit.
@@ -334,14 +370,21 @@ Stream agent output with `sendMessageDraft`, falling back to throttled
 ### Consequences
 
 - A Telegram **bot cannot create supergroups** via the Bot API, so the owner
-  creates the handful of per-directory supergroups by hand once and adds the
-  bot; the bot then auto-creates session topics (`createForumTopic`). For a few
-  repositories this one-time manual setup is acceptable.
-- The backend's persisted mapping (ADR-0009) extends to **supergroup → directory
-  (working dir)** in addition to **topic → session**, so each session's OpenCode
-  server runs against the right `BALAM_WORKDIR` (ADR-0001).
+  creates the "balamies" supergroup by hand once and adds the bot as an admin
+  with "Manage Topics"; the bot then creates session topics itself
+  (`createForumTopic`, via `/context`). This one-time manual setup is acceptable.
+- The backend's persisted topic→session row (ADR-0009) also stores each topic's
+  **context binding** (ADR-0012), so a session's OpenCode prompts run against the
+  right context `directory` (ADR-0001) without a per-supergroup directory map.
 - The trust boundary (ADR-0008) now spans multiple supergroups: the user-ID
   allowlist still gates every update, and only owner-created groups are honored.
+  `ALLOWED_TELEGRAM_CHAT_ID` scopes the bot to a single such supergroup (ADR-0008).
+- **Slash commands must be registered (`setMyCommands`).** In a group, clients
+  offer and route slash commands by the bot's registered command list (and send
+  the disambiguated `/cmd@<bot>` form), so an unregistered `/context` is never
+  surfaced. Balam publishes its commands on startup (`post_init`) for the default,
+  all-group-chats, and the specific group scopes; PTB's `CommandHandler` matches
+  both `/context` and `/context@heybalambot`.
 - Re-evaluate if the project ever goes multi-user or if Discord ships a
   first-party streaming primitive and iframe-capable embeds.
 
@@ -359,11 +402,11 @@ fit, not capability. The frontend is fixed TypeScript (ADR-0003), but the
 backend is a free choice. Two factors decide it for Python:
 
 - **Reference reuse.** The build leans heavily on two existing Python codebases —
-  `~/projects/zog` and `~/projects/open-udang` — as worked examples for the
+  `~/projects/zog` and `~/projects/open-shrimp` — as worked examples for the
   hardest parts: animated draft streaming into forum topics (`send_message_draft`),
   GFM→Telegram-MarkdownV2 rendering (`mistune`), and the live noVNC Mini App
   (ADR-0006). In Python these are direct references; in any other language each
-  would be a *translation* (effort + divergence risk).
+  would be a _translation_ (effort + divergence risk).
 - **Mature Telegram tooling.** `python-telegram-bot` (22.6+) exposes everything
   this project needs, including `send_message_draft` for native streaming — so
   the streaming advantage that motivated Telegram (ADR-0010) is fully available
@@ -404,6 +447,57 @@ Write the backend in **Python**. Concretely:
 
 ---
 
+## ADR-0012: Workspace contexts live in a required `config.yaml`
+
+Status: Accepted Date: 2026-06-05
+
+### Context
+
+One Balam bot drives several projects, each with its own working directory and,
+optionally, its own model, thinking effort, and tool-permission profile. That is
+structured, multi-field, per-workspace configuration: it reads naturally as a
+small mapping but awkwardly as flat environment variables. Secrets and infra
+connection already live in `.env` (ADR-0008) and should not be mixed with this
+workspace map. The shape is adapted from the existing open-shrimp codebase
+(ADR-0011 reference reuse).
+
+### Decision
+
+Define named **workspace contexts** in a `config.yaml` at the repo root (path
+overridable with `BALAM_CONFIG_PATH`). Each context bundles:
+
+- `directory` — the working dir the agent acts in (the session's root).
+- `description` — a human label shown by `/context`.
+- `model` (optional) — `provider/model`, split to `{providerID, modelID}` on the
+  OpenCode prompt.
+- `effort` (optional) — one of low/medium/high/xhigh/max, sent as the prompt
+  `variant`.
+- `allowed_tools` / `additional_directories` (optional) — the tool-permission
+  profile.
+
+A top-level `default_context` names the context an unbound topic (e.g. General)
+uses. The file is **required**: Balam fails fast with one clear message if it is
+missing or malformed, and will not boot without at least one context. Each topic
+binds to exactly one context for its lifetime (ADR-0009); the binding is
+persisted in the topic→session row, and `/context <name>` opens a new topic for a
+context. Secrets never go in `config.yaml`.
+
+### Consequences
+
+- Two config surfaces, one rule: secrets and infra in `.env`, the workspace map
+  in `config.yaml`. Neither leaks into the other.
+- The router resolves a topic's directory/model/effort from its bound context and
+  passes them to the OpenCode prompt (ADR-0002). An unbound topic, or a binding to
+  a context since removed from the file, falls back to `default_context`.
+- `allowed_tools` and `additional_directories` are parsed and validated so the
+  schema is complete and forward-compatible, but **path-scoped permission
+  enforcement is not wired into OpenCode yet** — deliberately deferred. The
+  intended model: reads auto-approved inside `directory`, writes always prompt,
+  shell commands opted into by pattern.
+- Adding a workspace is a config edit, not a code change.
+
+---
+
 ## Summary
 
 | ADR  | Decision                                                           | Core reason                                                     |
@@ -416,5 +510,6 @@ Write the backend in **Python**. Concretely:
 | 0007 | Local single-user on the VM                                        | Full local access; minimal security surface                     |
 | 0008 | Telegram entry point is the trust boundary; allowlist one user ID  | The bot is internet-facing even when ports are local            |
 | 0009 | One Telegram forum topic = one OpenCode session                    | Native parallel task threads, no custom UI                      |
-| 0010 | Telegram over Discord; supergroup-per-directory, topic-per-session | Native streaming + Mini App + no archiving; two-level tree fits |
-| 0011 | Backend in Python (FastAPI + PTB), OpenCode over HTTP              | Reference reuse (zog/open-udang); HTTP is the contract (0002)    |
+| 0010 | Telegram over Discord; one supergroup, context-per-topic, session-per-topic | Native streaming + Mini App + no archiving; two-level tree fits |
+| 0011 | Backend in Python (FastAPI + PTB), OpenCode over HTTP              | Reference reuse (zog/open-shrimp); HTTP is the contract (0002)  |
+| 0012 | Workspace contexts in a required `config.yaml`                     | Per-project dir/model/effort/tools; structured config, not env  |

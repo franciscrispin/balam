@@ -15,6 +15,8 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     # Typed, validated env configuration (ADR-0008/0007).
     "pydantic-settings>=2.4",
+    # config.yaml workspace contexts (adapted from OpenShrimp).
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

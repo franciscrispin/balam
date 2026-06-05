@@ -51,3 +51,26 @@ def test_general_topic_maps_to_catch_all_key() -> None:
 def test_thread_key_normalizes_none() -> None:
     assert SessionStore.thread_key(None) == GENERAL_THREAD_ID
     assert SessionStore.thread_key(7) == 7
+
+
+def test_get_row_returns_session_and_context() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_abc", 1, context="balam")
+    assert store.get_row(100, 5) == ("ses_abc", "balam")
+
+
+def test_get_row_is_none_for_unmapped() -> None:
+    assert fresh_store().get_row(100, 5) is None
+
+
+def test_context_defaults_to_none_when_omitted() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_abc", 1)  # legacy 4-arg call
+    assert store.get_row(100, 5) == ("ses_abc", None)
+
+
+def test_set_overwrites_context() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_abc", 1, context="balam")
+    store.set(100, 5, "ses_def", 2, context="scratch")
+    assert store.get_row(100, 5) == ("ses_def", "scratch")

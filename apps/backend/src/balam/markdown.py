@@ -5,7 +5,7 @@ The OpenCode agent emits GitHub-Flavored Markdown; Telegram renders a stricter
 with ``mistune`` and walk it to emit Telegram-compatible markup, then split the
 result into ≤4096-char messages at natural boundaries (code-block-aware).
 
-The approach follows ~/projects/open-udang's ``markdown.py`` as a worked example.
+The approach follows ~/projects/open-shrimp's ``markdown.py`` as a worked example.
 """
 
 from __future__ import annotations

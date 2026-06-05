@@ -1,0 +1,33 @@
+# Balam workspace contexts. Copy to config.yaml (repo root) and edit.
+#
+# Secrets and infra connection live in .env, NOT here — this file only defines
+# the *contexts* the agent can work in. A context bundles a working directory
+# with an optional model/effort and a tool permission profile. Each Telegram
+# topic binds to one context; an unbound topic uses `default_context`.
+#
+# This file is REQUIRED: Balam will not boot without a config.yaml defining at
+# least one context. Override the path with BALAM_CONFIG_PATH.
+
+default_context: balam
+
+contexts:
+  balam:
+    directory: /home/ubuntu/projects/balam
+    description: "AI assistant"
+    # model: anthropic/claude-opus-4-8   # optional; must be provider/model
+    # effort: medium                     # optional: low | medium | high | xhigh | max
+    allowed_tools:
+      - LSP
+      # NOTE: path-scoped permission enforcement is not wired up yet, so
+      # allowed_tools is parsed/validated but not applied to OpenCode. The
+      # intended model (once implemented): Read/Glob/Grep auto-approved inside
+      # `directory`; Edit/Write always prompt; opt into commands with patterns
+      # like "Bash(git *)". Don't list Read/Edit here.
+    # additional_directories:            # extra dirs the agent may read
+    #   - /home/ubuntu/projects/open-shrimp
+
+  # Add more workspaces as needed:
+  # zog:
+  #   directory: /home/ubuntu/projects/zog
+  #   description: "AI assistant"
+  #   allowed_tools: []

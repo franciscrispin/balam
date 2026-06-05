@@ -22,6 +22,7 @@ from telegram.ext import Application
 
 from balam.bot import build_application
 from balam.config import ConfigError, load_config
+from balam.contexts import ContextsConfigError, load_contexts
 from balam.opencode import OpenCode
 from balam.router import Router
 from balam.store import SessionStore
@@ -41,14 +42,19 @@ def main() -> None:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
 
+    try:
+        contexts = load_contexts(config.config_path)
+    except ContextsConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
+
     opencode = OpenCode(
         base_url=config.opencode_base_url,
         username=config.opencode_server_username,
         password=config.opencode_server_password,
-        directory=config.workdir,
     )
     store = SessionStore(config.db_path)
-    router = Router(store, opencode)
+    router = Router(store, opencode, contexts)
 
     async def _post_init(_application: Application) -> None:
         logger.info("waiting for OpenCode at %s ...", config.opencode_base_url)
@@ -64,9 +70,10 @@ def main() -> None:
     )
 
     logger.info(
-        "starting bot (owner %s, workdir %s) ...",
+        "starting bot (owner %s, contexts %s, default %s) ...",
         config.allowed_telegram_user_id,
-        config.workdir,
+        sorted(contexts.contexts),
+        contexts.default_context,
     )
     # run_polling blocks, manages the event loop, and runs post_init/post_shutdown
     # plus graceful shutdown on SIGINT/SIGTERM.

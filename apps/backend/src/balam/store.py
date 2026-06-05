@@ -32,6 +32,7 @@ class SessionStore:
                 thread_id  INTEGER NOT NULL,
                 session_id TEXT    NOT NULL,
                 created_at INTEGER NOT NULL,
+                context    TEXT,
                 PRIMARY KEY (chat_id, thread_id)
             );
             """
@@ -51,17 +52,39 @@ class SessionStore:
         ).fetchone()
         return row[0] if row else None
 
-    def set(self, chat_id: int, thread_id: int | None, session_id: str, created_at: int) -> None:
-        """Map a topic to a session, overwriting any existing mapping (used both
-        for first creation and for recreating a session that vanished)."""
+    def get_row(self, chat_id: int, thread_id: int | None) -> tuple[str, str | None] | None:
+        """Resolve a topic to ``(session_id, context)``, or ``None`` if unmapped.
+
+        ``context`` is the bound context name (``None`` for rows created before
+        contexts existed, or never bound — the caller then uses the default)."""
+        row = self._db.execute(
+            "SELECT session_id, context FROM topic_sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, self.thread_key(thread_id)),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def set(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        session_id: str,
+        created_at: int,
+        context: str | None = None,
+    ) -> None:
+        """Map a topic to a session (and the context it was created in),
+        overwriting any existing mapping — used both for first creation and for
+        recreating a session that vanished server-side."""
         self._db.execute(
             """
-            INSERT INTO topic_sessions (chat_id, thread_id, session_id, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO topic_sessions (chat_id, thread_id, session_id, created_at, context)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (chat_id, thread_id)
-            DO UPDATE SET session_id = excluded.session_id, created_at = excluded.created_at
+            DO UPDATE SET
+                session_id = excluded.session_id,
+                created_at = excluded.created_at,
+                context = excluded.context
             """,
-            (chat_id, self.thread_key(thread_id), session_id, created_at),
+            (chat_id, self.thread_key(thread_id), session_id, created_at, context),
         )
         self._db.commit()
 
