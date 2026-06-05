@@ -136,11 +136,15 @@ class FakeOpenCode:
     def __init__(self, events: list[dict[str, object]]) -> None:
         self._events = events
         self.prompted = False
+        self.prompt_kwargs: dict[str, object] = {}
+        self.events_directory: object = "<unset>"
 
-    async def prompt(self, session_id: str, text: str) -> None:
+    async def prompt(self, session_id: str, text: str, **kwargs: object) -> None:
         self.prompted = True
+        self.prompt_kwargs = kwargs
 
-    async def events(self, *, ready: asyncio.Event | None = None):
+    async def events(self, *, directory: str | None = None, ready: asyncio.Event | None = None):
+        self.events_directory = directory
         if ready is not None:
             ready.set()
         for event in self._events:
@@ -175,12 +179,68 @@ async def test_stream_reply_captures_assistant_text_and_skips_user_echo() -> Non
     assert bot.messages == ["hey there"]
 
 
+class PromptGatedOpenCode(FakeOpenCode):
+    """Emits events only after prompt() — mirrors OpenCode (the assistant replies
+    to the prompt), so the prompt is deterministically sent before the stream
+    drains."""
+
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        super().__init__(events)
+        self._gate = asyncio.Event()
+
+    async def prompt(self, session_id: str, text: str, **kwargs: object) -> None:
+        await super().prompt(session_id, text, **kwargs)
+        self._gate.set()
+
+    async def events(self, *, directory: str | None = None, ready: asyncio.Event | None = None):
+        self.events_directory = directory
+        if ready is not None:
+            ready.set()
+        await self._gate.wait()
+        for event in self._events:
+            yield event
+
+
+async def test_stream_reply_forwards_context_to_prompt() -> None:
+    bot = FakeBot()
+    oc = PromptGatedOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _text_part(AID, "ok"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    await stream_reply(
+        bot=bot,
+        opencode=oc,
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="hello",
+        directory="/work/proj",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        effort="high",
+        draft_interval=0.01,
+    )
+    assert oc.prompt_kwargs == {
+        "directory": "/work/proj",
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "effort": "high",
+    }
+    # OpenCode scopes message/session events to the worktree, so the event
+    # subscription must carry the same directory or only server.* events arrive
+    # and the reply never finalizes (regression: subscribed without directory).
+    assert oc.events_directory == "/work/proj"
+
+
 async def test_stream_reply_subscribes_before_prompting() -> None:
     # If the stream is never established, we must not prompt into a dead sub.
     bot = FakeBot()
 
     class NeverReady(FakeOpenCode):
-        async def events(self, *, ready: asyncio.Event | None = None):
+        async def events(self, *, directory: str | None = None, ready: asyncio.Event | None = None):
             raise RuntimeError("stream failed to open")
             yield  # pragma: no cover  (makes this an async generator)
 

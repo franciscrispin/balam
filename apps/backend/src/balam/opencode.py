@@ -33,11 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 class OpenCode:
-    def __init__(
-        self, *, base_url: str, username: str, password: str | None, directory: str
-    ) -> None:
+    def __init__(self, *, base_url: str, username: str, password: str | None) -> None:
         self._base_url = base_url.rstrip("/")
-        self._directory = directory
         headers: dict[str, str] = {}
         if password:
             token = base64.b64encode(f"{username}:{password}".encode()).decode()
@@ -84,47 +81,76 @@ class OpenCode:
                 )
             await asyncio.sleep(interval)
 
-    async def create_session(self, title: str) -> str:
-        """Create a new session in the configured directory; return its id."""
+    async def create_session(self, title: str, *, directory: str) -> str:
+        """Create a new session in ``directory`` (a context's workspace); return
+        its id."""
         response = await self._client.post(
             "/session",
-            params={"directory": self._directory},
+            params={"directory": directory},
             json={"title": title},
         )
         response.raise_for_status()
         return response.json()["id"]
 
-    async def session_exists(self, session_id: str) -> bool:
+    async def session_exists(self, session_id: str, *, directory: str) -> bool:
         """Whether a session still exists server-side (false after a wipe)."""
         response = await self._client.get(
             f"/session/{session_id}",
-            params={"directory": self._directory},
+            params={"directory": directory},
         )
         return response.status_code == 200
 
-    async def prompt(self, session_id: str, text: str) -> None:
+    async def prompt(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        directory: str,
+        provider: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> None:
         """Send a user message and return immediately (``prompt_async``). The
         assistant's reply arrives over :meth:`events`, which is what lets us
-        stream it back to Telegram as it is generated."""
+        stream it back to Telegram as it is generated.
+
+        ``provider``/``model`` select the context's model (OpenCode wants
+        ``{providerID, modelID}``); ``effort`` maps to the prompt ``variant``.
+        Each is omitted when unset so the server applies its own default.
+        """
+        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
+        if provider and model:
+            body["model"] = {"providerID": provider, "modelID": model}
+        if effort is not None:
+            body["variant"] = effort
         response = await self._client.post(
             f"/session/{session_id}/prompt_async",
-            params={"directory": self._directory},
-            json={"parts": [{"type": "text", "text": text}]},
+            params={"directory": directory},
+            json=body,
         )
         response.raise_for_status()
 
-    async def events(self, *, ready: asyncio.Event | None = None) -> AsyncIterator[dict[str, Any]]:
-        """Yield decoded events from the server's global SSE stream.
+    async def events(
+        self, *, directory: str | None = None, ready: asyncio.Event | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield decoded events from the server's SSE stream.
 
-        The stream covers every session, so consumers must filter by
-        ``sessionID``. Breaking out of the ``async for`` closes the connection.
+        ``directory`` is **load-bearing**: OpenCode scopes ``message.*`` /
+        ``session.*`` events to a worktree, so a ``/event`` subscription opened
+        *without* the prompt's ``directory`` receives only global ``server.*``
+        events (``connected``/``heartbeat``) and never the session deltas or
+        ``session.idle`` the streamer waits on — the reply then never finalizes.
+        Pass the resolved context directory so those events flow. Consumers still
+        filter by ``sessionID`` since one worktree may host several sessions.
+        Breaking out of the ``async for`` closes the connection.
 
         If ``ready`` is given, it is set once the stream is established (after the
         response headers arrive). Callers prompt only after this fires, so the
         server's early ``message.updated`` / ``message.part.updated`` events
         aren't lost to a subscribe-after-prompt race.
         """
-        async with self._client.stream("GET", "/event") as response:
+        params = {"directory": directory} if directory else None
+        async with self._client.stream("GET", "/event", params=params) as response:
             response.raise_for_status()
             if ready is not None:
                 ready.set()

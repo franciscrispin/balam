@@ -160,9 +160,17 @@ async def stream_reply(
     chat_id: int,
     thread_id: int | None,
     prompt: str,
+    directory: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
 ) -> None:
     """Prompt the agent and stream its reply into the topic.
+
+    ``directory``/``provider``/``model``/``effort`` come from the topic's
+    resolved context (:class:`balam.router.ResolvedSession`) and are forwarded to
+    the prompt so the agent runs in the right workspace with the right model.
 
     Subscribes to the event stream *before* prompting so no early deltas are
     missed, animates a draft as text grows, and finalizes into real message(s)
@@ -191,7 +199,7 @@ async def stream_reply(
 
     async def consume() -> None:
         nonlocal order, error_text
-        async for event in opencode.events(ready=stream_ready):
+        async for event in opencode.events(directory=directory, ready=stream_ready):
             etype = event.get("type")
             props = event.get("properties", {})
 
@@ -239,7 +247,14 @@ async def stream_reply(
             ready_task.cancel()
             await consume_task
         else:
-            await opencode.prompt(session_id, prompt)
+            await opencode.prompt(
+                session_id,
+                prompt,
+                directory=directory,
+                provider=provider,
+                model=model,
+                effort=effort,
+            )
             await consume_task
 
         if error_text:
