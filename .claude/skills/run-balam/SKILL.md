@@ -35,14 +35,14 @@ can't prefix-match compound shell against an allowlist. The scripts move all
 that logic (env-loading, health-polling, log-waiting, graceful shutdown)
 _inside_ a file the permission system sees as one command.
 
-`SK="$PWD/.claude/skills/run-balam/scripts"` from the repo root, then:
+Run each script by its **exact relative path from the repo root**.
 
-| Action            | Command                                           | What it does                                                                                                |
-| ----------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **Start the app** | `"$SK/start.sh"`                                  | Idempotent. Starts only what's down, in the right order, waits for each to be healthy, prints final status. |
-| **Check status**  | `"$SK/status.sh"`                                 | Read-only. Reports UP / DOWN / unhealthy for all three. Safe any time.                                      |
-| **Stop the app**  | `"$SK/stop.sh"`                                   | Graceful reverse-order SIGTERM shutdown, then confirms all down.                                            |
-| **Read a log**    | `"$SK/logs.sh [opencode\|bot\|frontend] [lines]"` | Tail a process log without an ad-hoc `cat`/`grep`.                                                          |
+| Action            | Command                                                                      | What it does                                                                                                |
+| ----------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **Start the app** | `.claude/skills/run-balam/scripts/start.sh`                                  | Idempotent. Starts only what's down, in the right order, waits for each to be healthy, prints final status. |
+| **Check status**  | `.claude/skills/run-balam/scripts/status.sh`                                 | Read-only. Reports UP / DOWN / unhealthy for all three. Safe any time.                                      |
+| **Stop the app**  | `.claude/skills/run-balam/scripts/stop.sh`                                   | Graceful reverse-order SIGTERM shutdown, then confirms all down.                                            |
+| **Read a log**    | `.claude/skills/run-balam/scripts/logs.sh [opencode\|bot\|frontend] [lines]` | Tail a process log without an ad-hoc `cat`/`grep`.                                                          |
 
 To start the app, run `start.sh` and read the status block it prints at the end
 — that's the whole job. The script already waits for OpenCode's auth handshake,
