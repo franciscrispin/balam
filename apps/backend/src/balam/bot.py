@@ -10,6 +10,7 @@ Two responsibilities for this slice:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -36,6 +37,7 @@ from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
 from balam.streamer import stream_reply
 from balam.telegram_utils import thread_kwargs
+from balam.turns import TurnRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,15 @@ def _topic_title(message: Any, thread_id: int | None) -> str:
     return f"Topic {thread_id}"
 
 
+async def _notify_error(bot: Any, chat_id: int, thread_id: int | None, exc: Exception) -> None:
+    """Post a short error notice into the topic (ADR-0009 edge), swallowing any
+    delivery failure so it never masks the original error."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs(thread_id))
+    except Exception:
+        logger.debug("failed to deliver error notice", exc_info=True)
+
+
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None or message.text is None:
@@ -67,32 +78,45 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     router: Router = context.application.bot_data["router"]
     opencode: OpenCode = context.application.bot_data["opencode"]
+    turns: TurnRegistry = context.application.bot_data["turns"]
 
     try:
         resolved = await router.resolve(
             TopicRef(chat_id=chat_id, thread_id=thread_id, title=_topic_title(message, thread_id))
         )
-        await stream_reply(
-            bot=context.bot,
-            opencode=opencode,
-            session_id=resolved.session_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            prompt=message.text,
-            directory=resolved.directory,
-            provider=resolved.provider,
-            model=resolved.model,
-            effort=resolved.effort,
-        )
     except Exception as exc:
-        # OpenCode error → post a short message into the topic (ADR-0009 edge).
-        logger.exception("failed to handle message")
+        # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
+        logger.exception("failed to resolve session")
+        await _notify_error(context.bot, chat_id, thread_id, exc)
+        return
+
+    # Run the turn as a background task registered in the turn registry, so the
+    # handler returns immediately and a concurrent /cancel update can interrupt it
+    # (PTB processes updates sequentially, so awaiting here would block /cancel).
+    async def run() -> None:
         try:
-            await context.bot.send_message(
-                chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs(thread_id)
+            await stream_reply(
+                bot=context.bot,
+                opencode=opencode,
+                session_id=resolved.session_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                prompt=message.text,
+                directory=resolved.directory,
+                provider=resolved.provider,
+                model=resolved.model,
+                effort=resolved.effort,
             )
-        except Exception:
-            logger.debug("failed to deliver error notice", exc_info=True)
+        except asyncio.CancelledError:
+            raise  # /cancel aborted the turn; let the task settle as cancelled.
+        except Exception as exc:
+            logger.exception("failed to handle message")
+            await _notify_error(context.bot, chat_id, thread_id, exc)
+        finally:
+            turns.clear(chat_id, thread_id, task)
+
+    task = asyncio.create_task(run())
+    turns.register(chat_id, thread_id, task, resolved.session_id, resolved.directory)
 
 
 def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str | None:
@@ -207,10 +231,98 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(f"Opened a new {name} topic — pick it from the topic list.")
 
 
+def _abort_turn(turn: Any, opencode: OpenCode) -> asyncio.Task[None] | None:
+    """Cancel a running turn locally and abort it server-side (best-effort).
+
+    Cancelling the local task stops streaming; the abort tells OpenCode to stop
+    generating. Returns the abort task (fire-and-forget) so callers needn't await
+    the round-trip before replying. ``None`` when there is no turn.
+    """
+    if turn is None:
+        return None
+    turn.task.cancel()
+    return asyncio.create_task(opencode.abort_session(turn.session_id, directory=turn.directory))
+
+
+async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/new`` — start a fresh session in the current topic.
+
+    Cancels any in-flight turn, then drops the topic's session row so the next
+    message lazily recreates the session in the same context (:meth:`Router.resolve`).
+    """
+    message = update.message
+    if message is None:
+        return
+
+    router: Router = context.application.bot_data["router"]
+    opencode: OpenCode = context.application.bot_data["opencode"]
+    turns: TurnRegistry = context.application.bot_data["turns"]
+    ref = TopicRef(
+        chat_id=message.chat_id,
+        thread_id=message.message_thread_id,
+        title=_topic_title(message, message.message_thread_id),
+    )
+
+    _abort_turn(turns.get(ref.chat_id, ref.thread_id), opencode)
+    router.clear_session(ref)
+    await message.reply_text("🆕 Started a new session.")
+
+
+async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/status`` — report the topic's context, session, and whether a turn runs."""
+    message = update.message
+    if message is None:
+        return
+
+    router: Router = context.application.bot_data["router"]
+    turns: TurnRegistry = context.application.bot_data["turns"]
+    ref = TopicRef(
+        chat_id=message.chat_id,
+        thread_id=message.message_thread_id,
+        title=_topic_title(message, message.message_thread_id),
+    )
+
+    name = router.current_context_name(ref)
+    ctx = router.contexts.get(name)
+    session_id = router.current_session_id(ref)
+    running = turns.get(ref.chat_id, ref.thread_id) is not None
+
+    lines = [
+        f"Context: {name}",
+        f"Directory: {ctx.directory}",
+        f"Model: {ctx.model or '(server default)'}",
+        f"Effort: {ctx.effort or '(server default)'}",
+        f"Session: {session_id or '(none yet — send a message to start)'}",
+        f"Turn: {'running' if running else 'idle'}",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/cancel`` — abort the turn running in the current topic, if any."""
+    message = update.message
+    if message is None:
+        return
+
+    opencode: OpenCode = context.application.bot_data["opencode"]
+    turns: TurnRegistry = context.application.bot_data["turns"]
+
+    turn = turns.get(message.chat_id, message.message_thread_id)
+    if turn is None:
+        await message.reply_text("No running turn.")
+        return
+
+    _abort_turn(turn, opencode)
+    await message.reply_text("🛑 Cancelled.")
+
+
 #: The slash commands Balam exposes. Registering them via ``setMyCommands`` is
-#: what makes ``/context`` discoverable and reliably routed to the bot in a
-#: group, where clients dispatch slash commands by the bot's registered list.
+#: what makes them discoverable and reliably routed to the bot in a group, where
+#: clients dispatch slash commands by the bot's registered list.
 BOT_COMMANDS = [
+    BotCommand("new", "Start a fresh session in this topic"),
+    BotCommand("status", "Show this topic's context, session, and turn state"),
+    BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
 ]
 
@@ -250,6 +362,8 @@ def build_application(
     app.bot_data["config"] = config
     app.bot_data["opencode"] = opencode
     app.bot_data["router"] = router
+    # In-flight turns, keyed by topic, so /cancel can interrupt a running reply.
+    app.bot_data["turns"] = TurnRegistry()
 
     # Trust boundary (ADR-0008): filters.User gates by sender id, so only the
     # owner's messages reach the handlers; everyone else is dropped silently.
@@ -260,6 +374,9 @@ def build_application(
     if config.allowed_telegram_chat_id is not None:
         allowed = allowed & filters.Chat(chat_id=config.allowed_telegram_chat_id)
 
+    app.add_handler(CommandHandler("new", _handle_new, filters=allowed))
+    app.add_handler(CommandHandler("status", _handle_status, filters=allowed))
+    app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & allowed, _handle_message))
 

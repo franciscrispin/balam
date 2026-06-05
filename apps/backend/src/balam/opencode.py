@@ -15,6 +15,7 @@ Endpoints (from the OpenAPI spec at ``/doc``):
   POST /session                      create a session
   GET  /session/{id}                 fetch a session (existence check)
   POST /session/{id}/prompt_async    send a message, return immediately
+  POST /session/{id}/abort           cancel the running turn (best-effort)
   GET  /event                        SSE stream of all server events
 """
 
@@ -129,6 +130,23 @@ class OpenCode:
             json=body,
         )
         response.raise_for_status()
+
+    async def abort_session(self, session_id: str, *, directory: str) -> None:
+        """Cancel the turn running in ``session_id`` (``POST /session/{id}/abort``).
+
+        Best-effort: ``/cancel`` also cancels the local streaming task, so the
+        turn stops regardless of the server's answer. A failure here is logged,
+        not raised — an already-idle session abort would otherwise surface a
+        spurious error to the user.
+        """
+        try:
+            response = await self._client.post(
+                f"/session/{session_id}/abort",
+                params={"directory": directory},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.warning("failed to abort session %s", session_id, exc_info=True)
 
     async def events(
         self, *, directory: str | None = None, ready: asyncio.Event | None = None

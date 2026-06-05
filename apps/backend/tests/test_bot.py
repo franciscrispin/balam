@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -6,7 +8,10 @@ from telegram.ext import CommandHandler, MessageHandler
 
 from balam.bot import (
     BOT_COMMANDS,
+    _handle_cancel,
     _handle_context,
+    _handle_new,
+    _handle_status,
     _topic_link,
     build_application,
     is_owner,
@@ -15,6 +20,7 @@ from balam.bot import (
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
+from balam.turns import TurnRegistry
 
 OWNER = 424242
 SUPERGROUP = -1001234567890
@@ -59,6 +65,7 @@ def test_topic_link_none_for_private_chat_without_bot_id() -> None:
 class _FakeOpenCode:
     def __init__(self) -> None:
         self._n = 0
+        self.aborted: list[tuple[str, str | None]] = []
 
     async def create_session(self, title: str, *, directory: str | None = None) -> str:
         self._n += 1
@@ -66,6 +73,9 @@ class _FakeOpenCode:
 
     async def session_exists(self, session_id: str, *, directory: str | None = None) -> bool:
         return True
+
+    async def abort_session(self, session_id: str, *, directory: str | None = None) -> None:
+        self.aborted.append((session_id, directory))
 
 
 def _router() -> Router:
@@ -186,6 +196,117 @@ async def test_unknown_context_is_rejected_without_creating_a_topic() -> None:
     assert any("Unknown context" in reply for reply in message.replies)
 
 
+# --- /new, /status, /cancel ---------------------------------------------------
+
+
+def _session_cmd_env(message: _FakeMessage):
+    """An (update, context) pair wired with router + opencode + turns, plus the
+    bare opencode/turns/router handles for assertions."""
+    opencode = _FakeOpenCode()
+    contexts = ContextsConfig(
+        default_context="balam",
+        contexts={
+            "balam": ContextConfig(
+                directory="/work/balam", description="Balam", model="anthropic/claude-opus-4-8"
+            ),
+        },
+    )
+    router = Router(SessionStore(":memory:"), opencode, contexts)
+    turns = TurnRegistry()
+    update = SimpleNamespace(message=message)
+    context = SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={"router": router, "opencode": opencode, "turns": turns}
+        ),
+    )
+    return update, context, router, opencode, turns
+
+
+def _sleeping_turn(turns: TurnRegistry, chat_id: int, thread_id: int | None, session_id: str):
+    """Register a never-finishing turn (a parked task) for a topic; return it."""
+    task = asyncio.ensure_future(asyncio.Event().wait())
+    turns.register(chat_id, thread_id, task, session_id, "/work/balam")
+    return task
+
+
+async def test_new_clears_session_so_next_message_recreates() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, _opencode, _turns = _session_cmd_env(message)
+    ref = TopicRef(SUPERGROUP, 5, "t")
+
+    first = (await router.resolve(ref)).session_id
+    await _handle_new(update, context)
+
+    # The row is gone, so the topic has no session until the next message.
+    assert router.current_session_id(ref) is None
+    assert any("new session" in r.lower() for r in message.replies)
+    # The next message lazily recreates a *different* session in the same context.
+    second = (await router.resolve(ref)).session_id
+    assert second != first
+
+
+async def test_new_cancels_in_flight_turn() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, _router, opencode, turns = _session_cmd_env(message)
+    task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
+
+    await _handle_new(update, context)
+    await asyncio.sleep(0)  # let the fire-and-forget abort task run
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    assert opencode.aborted == [("ses_running", "/work/balam")]
+
+
+async def test_status_reports_context_session_and_idle() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, _opencode, _turns = _session_cmd_env(message)
+    session_id = (await router.resolve(TopicRef(SUPERGROUP, 5, "t"))).session_id
+
+    await _handle_status(update, context)
+
+    reply = message.replies[-1]
+    assert "balam" in reply
+    assert session_id in reply
+    assert "idle" in reply
+
+
+async def test_status_reports_running_turn() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, _router, _opencode, turns = _session_cmd_env(message)
+    task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
+
+    await _handle_status(update, context)
+
+    assert "running" in message.replies[-1]
+    task.cancel()
+
+
+async def test_cancel_with_no_running_turn() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, *_ = _session_cmd_env(message)
+
+    await _handle_cancel(update, context)
+
+    assert any("No running turn" in r for r in message.replies)
+
+
+async def test_cancel_aborts_running_turn() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, _router, opencode, turns = _session_cmd_env(message)
+    task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
+
+    await _handle_cancel(update, context)
+    await asyncio.sleep(0)  # let the fire-and-forget abort task run
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    assert opencode.aborted == [("ses_running", "/work/balam")]
+    assert any("Cancelled" in r for r in message.replies)
+
+
 # --- chat scoping (ADR-0010): the bot acts only in the balamies supergroup -----
 
 
@@ -203,7 +324,10 @@ def _message_handler(app) -> MessageHandler:
 
 
 def _command_handler(app) -> CommandHandler:
-    return next(h for h in app.handlers[0] if isinstance(h, CommandHandler))
+    # All command handlers share the same `allowed` filter; pick /context's.
+    return next(
+        h for h in app.handlers[0] if isinstance(h, CommandHandler) and "context" in h.commands
+    )
 
 
 def _text_update(chat_id: int, user_id: int, text: str = "hello") -> Update:
@@ -291,5 +415,6 @@ async def test_register_commands_adds_chat_scope_when_configured() -> None:
     assert chat_scoped and chat_scoped[0][1] == SUPERGROUP
 
 
-def test_bot_commands_includes_context() -> None:
-    assert any(c.command == "context" for c in BOT_COMMANDS)
+def test_bot_commands_includes_all_commands() -> None:
+    names = {c.command for c in BOT_COMMANDS}
+    assert {"new", "status", "cancel", "context"} <= names
