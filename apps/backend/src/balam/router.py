@@ -66,13 +66,6 @@ class Router:
         row = self._store.get_row(ref.chat_id, ref.thread_id)
         return row[0] if row else None
 
-    def clear_session(self, ref: TopicRef) -> None:
-        """Drop a topic's session mapping so the next message lazily creates a
-        fresh one in the same context (used by ``/new``). The old OpenCode session
-        is left orphaned server-side but unreferenced — consistent with the
-        lazy-create model in :meth:`resolve`."""
-        self._store.delete(ref.chat_id, ref.thread_id)
-
     async def create_topic_session(
         self, chat_id: int, thread_id: int | None, title: str, name: str
     ) -> str:

@@ -229,34 +229,35 @@ def _sleeping_turn(turns: TurnRegistry, chat_id: int, thread_id: int | None, ses
     return task
 
 
-async def test_new_clears_session_so_next_message_recreates() -> None:
+async def test_new_opens_a_new_topic_in_the_current_context() -> None:
+    # /new mirrors /context <name>, but reuses the current topic's context.
+    router = _router()
+    bot = _FakeBot(new_thread_id=900)
+    await router.create_topic_session(SUPERGROUP, 5, "scratch", "scratch")  # current topic
     message = _FakeMessage(SUPERGROUP, thread_id=5)
-    update, context, router, _opencode, _turns = _session_cmd_env(message)
-    ref = TopicRef(SUPERGROUP, 5, "t")
+    update, context = _update_context(bot, router, message, [])
 
-    first = (await router.resolve(ref)).session_id
     await _handle_new(update, context)
 
-    # The row is gone, so the topic has no session until the next message.
-    assert router.current_session_id(ref) is None
-    assert any("new session" in r.lower() for r in message.replies)
-    # The next message lazily recreates a *different* session in the same context.
-    second = (await router.resolve(ref)).session_id
-    assert second != first
+    # A brand-new topic is created, bound to the same context as the current one.
+    assert bot.created_topics == [(SUPERGROUP, "scratch")]
+    assert router.current_context_name(TopicRef(SUPERGROUP, 900, "t")) == "scratch"
+    # The current topic is left untouched — its session is preserved.
+    assert router.current_session_id(TopicRef(SUPERGROUP, 5, "t")) is not None
+    # A one-tap link to the new topic is handed back.
+    assert "https://t.me/c/1234567890/900" in _button_urls(message)
 
 
-async def test_new_cancels_in_flight_turn() -> None:
-    message = _FakeMessage(SUPERGROUP, thread_id=5)
-    update, context, _router, opencode, turns = _session_cmd_env(message)
-    task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
+async def test_new_from_unbound_topic_uses_default_context() -> None:
+    router = _router()
+    bot = _FakeBot(new_thread_id=901)
+    message = _FakeMessage(SUPERGROUP, thread_id=None)  # General — unbound
+    update, context = _update_context(bot, router, message, [])
 
     await _handle_new(update, context)
-    await asyncio.sleep(0)  # let the fire-and-forget abort task run
 
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-    assert task.cancelled()
-    assert opencode.aborted == [("ses_running", "/work/balam")]
+    assert bot.created_topics == [(SUPERGROUP, "balam")]  # default_context
+    assert router.current_context_name(TopicRef(SUPERGROUP, 901, "t")) == "balam"
 
 
 async def test_status_reports_context_session_and_idle() -> None:

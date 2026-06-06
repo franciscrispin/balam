@@ -144,16 +144,62 @@ def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str 
     return None
 
 
+async def _open_context_topic(message: Any, bot: Any, router: Router, name: str) -> None:
+    """Create a fresh forum topic bound to context ``name``, start its session,
+    greet inside it, and reply with a one-tap link. Shared by ``/context <name>``
+    and ``/new``.
+
+    One context per topic for life — we never rebind an existing topic, so a
+    topic's session always remembers its own history. The Bot API can't move the
+    user's view, so we create the topic, greet it, and hand back a deep link to
+    tap. Requires a forum supergroup with the bot an admin holding "Manage
+    Topics"; duplicate topic names are fine (many topics may share one context).
+    """
+    ctx = router.contexts.contexts[name]
+    try:
+        topic = await bot.create_forum_topic(chat_id=message.chat_id, name=name)
+    except Exception as exc:
+        logger.exception("failed to create forum topic")
+        await message.reply_text(
+            f"⚠️ Couldn't create a topic for {name!r}: {exc}\n"
+            "This chat must be a forum supergroup and the bot an admin with "
+            "the 'Manage Topics' permission."
+        )
+        return
+
+    new_thread_id = topic.message_thread_id
+    try:
+        await router.create_topic_session(message.chat_id, new_thread_id, name, name)
+    except Exception as exc:
+        logger.exception("failed to start session for new topic")
+        # Roll back the just-created topic: an unbound topic would silently route
+        # to default_context, not the one we meant. Best-effort delete.
+        try:
+            await bot.delete_forum_topic(chat_id=message.chat_id, message_thread_id=new_thread_id)
+        except Exception:
+            logger.debug("failed to delete orphan topic after session failure", exc_info=True)
+        await message.reply_text(f"⚠️ Couldn't start a session for {name!r}: {exc}")
+        return
+
+    # Greet inside the new topic so it isn't empty, then hand back a one-tap link
+    # in the originating chat/topic as an inline URL button.
+    await bot.send_message(
+        chat_id=message.chat_id,
+        text=f"🗂 Context {name} — {ctx.directory}\nSend a message to start.",
+        message_thread_id=new_thread_id,
+    )
+    link = _topic_link(message.chat_id, new_thread_id, bot_id=bot.id)
+    if link:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Go to topic", url=link)]])
+        await message.reply_text(f"Opened a new {name} topic.", reply_markup=keyboard)
+    else:
+        await message.reply_text(f"Opened a new {name} topic — pick it from the topic list.")
+
+
 async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/context`` lists workspaces and the topic's current binding;
     ``/context <name>`` creates a *new* topic bound to that context and replies
-    with a one-tap link to it.
-
-    Switching never rebinds the current topic: one context per topic for life,
-    so a topic's session always remembers its own history. The Bot API can't
-    move the user's view, so we create the topic, greet inside it, and hand back
-    a deep link to tap.
-    """
+    with a one-tap link to it (see :func:`_open_context_topic`)."""
     message = update.message
     if message is None:
         return
@@ -184,51 +230,7 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(f"Unknown context {name!r}. Available: {available}")
         return
 
-    ctx = contexts.contexts[name]
-
-    # Create a fresh forum topic for the context (allowing duplicate names: many
-    # topics may share one context). Requires a forum supergroup and the bot to
-    # be an admin with "Manage Topics".
-    try:
-        topic = await context.bot.create_forum_topic(chat_id=message.chat_id, name=name)
-    except Exception as exc:
-        logger.exception("failed to create forum topic")
-        await message.reply_text(
-            f"⚠️ Couldn't create a topic for {name!r}: {exc}\n"
-            "This chat must be a forum supergroup and the bot an admin with "
-            "the 'Manage Topics' permission."
-        )
-        return
-
-    new_thread_id = topic.message_thread_id
-    try:
-        await router.create_topic_session(message.chat_id, new_thread_id, name, name)
-    except Exception as exc:
-        logger.exception("failed to start session for new topic")
-        # Roll back the just-created topic: an unbound topic would silently route
-        # to default_context, not the one the user asked for. Best-effort delete.
-        try:
-            await context.bot.delete_forum_topic(
-                chat_id=message.chat_id, message_thread_id=new_thread_id
-            )
-        except Exception:
-            logger.debug("failed to delete orphan topic after session failure", exc_info=True)
-        await message.reply_text(f"⚠️ Couldn't start a session for {name!r}: {exc}")
-        return
-
-    # Greet inside the new topic so it isn't empty, then hand back a one-tap
-    # link in the originating chat/topic as an inline URL button.
-    await context.bot.send_message(
-        chat_id=message.chat_id,
-        text=f"🗂 Context {name} — {ctx.directory}\nSend a message to start.",
-        message_thread_id=new_thread_id,
-    )
-    link = _topic_link(message.chat_id, new_thread_id, bot_id=context.bot.id)
-    if link:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Go to topic", url=link)]])
-        await message.reply_text(f"Opened a new {name} topic.", reply_markup=keyboard)
-    else:
-        await message.reply_text(f"Opened a new {name} topic — pick it from the topic list.")
+    await _open_context_topic(message, context.bot, router, name)
 
 
 def _abort_turn(turn: Any, opencode: OpenCode) -> asyncio.Task[None] | None:
@@ -245,27 +247,25 @@ def _abort_turn(turn: Any, opencode: OpenCode) -> asyncio.Task[None] | None:
 
 
 async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/new`` — start a fresh session in the current topic.
+    """``/new`` — open a fresh topic with a new session in the *current* context.
 
-    Cancels any in-flight turn, then drops the topic's session row so the next
-    message lazily recreates the session in the same context (:meth:`Router.resolve`).
+    The same flow as ``/context <name>`` (:func:`_open_context_topic`), but the
+    context is taken from the current topic's binding (``default_context`` when
+    unbound) instead of an argument. The current topic is left untouched — one
+    context per topic for life — so its history is preserved and the fresh start
+    lives in its own topic.
     """
     message = update.message
     if message is None:
         return
 
     router: Router = context.application.bot_data["router"]
-    opencode: OpenCode = context.application.bot_data["opencode"]
-    turns: TurnRegistry = context.application.bot_data["turns"]
     ref = TopicRef(
         chat_id=message.chat_id,
         thread_id=message.message_thread_id,
         title=_topic_title(message, message.message_thread_id),
     )
-
-    _abort_turn(turns.get(ref.chat_id, ref.thread_id), opencode)
-    router.clear_session(ref)
-    await message.reply_text("🆕 Started a new session.")
+    await _open_context_topic(message, context.bot, router, router.current_context_name(ref))
 
 
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -320,7 +320,7 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 #: what makes them discoverable and reliably routed to the bot in a group, where
 #: clients dispatch slash commands by the bot's registered list.
 BOT_COMMANDS = [
-    BotCommand("new", "Start a fresh session in this topic"),
+    BotCommand("new", "Open a new topic with a fresh session in this context"),
     BotCommand("status", "Show this topic's context, session, and turn state"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
