@@ -43,6 +43,9 @@ class ResolvedSession:
     provider: str | None
     model: str | None
     effort: str | None
+    #: Extra directories the context grants access to, beyond ``directory``;
+    #: forwarded to the approval layer's directory boundary (ADR-0012).
+    additional_directories: list[str]
 
 
 class Router:
@@ -115,4 +118,5 @@ class Router:
             provider=provider,
             model=model,
             effort=ctx.effort,
+            additional_directories=list(ctx.additional_directories),
         )

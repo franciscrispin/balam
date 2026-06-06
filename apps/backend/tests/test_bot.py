@@ -4,10 +4,12 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from telegram import Chat, Message, MessageEntity, Update, User
-from telegram.ext import CommandHandler, MessageHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
+from balam.approvals import Choice, PendingApprovals
 from balam.bot import (
     BOT_COMMANDS,
+    _handle_approval_callback,
     _handle_cancel,
     _handle_context,
     _handle_new,
@@ -419,3 +421,105 @@ async def test_register_commands_adds_chat_scope_when_configured() -> None:
 def test_bot_commands_includes_all_commands() -> None:
     names = {c.command for c in BOT_COMMANDS}
     assert {"new", "status", "cancel", "context"} <= names
+
+
+# --- approval inline-keyboard callback ----------------------------------------
+
+
+class _FakeCBMessage:
+    def __init__(self, chat_id: int = SUPERGROUP) -> None:
+        self.text = "🔐 Allow Edit?"
+        self.text_markdown_v2 = "🔐 Allow Edit?"
+        self.chat = SimpleNamespace(id=chat_id)
+        self.edited: list[str] = []
+
+    async def edit_text(self, *, text: str, reply_markup=None, **_: object) -> None:
+        self.edited.append(text)
+
+
+class _FakeQuery:
+    def __init__(self, data: str, user_id: int, message: _FakeCBMessage | None) -> None:
+        self.data = data
+        self.from_user = SimpleNamespace(id=user_id)
+        self.message = message
+        self.answers: list[str | None] = []
+
+    async def answer(self, text: str | None = None, **_: object) -> None:
+        self.answers.append(text)
+
+
+def _callback_env(query: _FakeQuery, pending: PendingApprovals, *, chat_id: int | None = None):
+    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id)
+    update = SimpleNamespace(callback_query=query)
+    context = SimpleNamespace(
+        application=SimpleNamespace(bot_data={"config": config, "pending": pending})
+    )
+    return update, context
+
+
+async def test_approval_callback_owner_allow_resolves_future() -> None:
+    pending = PendingApprovals()
+    token, future = pending.register("ses_x")
+    query = _FakeQuery(f"appr:allow:{token}", OWNER, _FakeCBMessage())
+    update, context = _callback_env(query, pending)
+
+    await _handle_approval_callback(update, context)
+
+    assert future.done() and future.result() is Choice.ALLOW
+    assert query.message.edited  # outcome annotated, keyboard removed
+
+
+async def test_approval_callback_all_sets_accept_all_edits() -> None:
+    pending = PendingApprovals()
+    token, future = pending.register("ses_y")
+    query = _FakeQuery(f"appr:all:{token}", OWNER, _FakeCBMessage())
+    update, context = _callback_env(query, pending)
+
+    await _handle_approval_callback(update, context)
+
+    assert future.result() is Choice.ALL
+    assert pending.is_accept_all_edits("ses_y") is True
+
+
+async def test_approval_callback_ignores_stranger() -> None:
+    pending = PendingApprovals()
+    token, future = pending.register("ses_x")
+    query = _FakeQuery(f"appr:allow:{token}", 999, _FakeCBMessage())
+    update, context = _callback_env(query, pending)
+
+    await _handle_approval_callback(update, context)
+
+    assert not future.done()  # a stranger's tap never resolves the approval
+
+
+async def test_approval_callback_rejects_owner_in_other_chat() -> None:
+    pending = PendingApprovals()
+    token, future = pending.register("ses_x")
+    # Scoped to SUPERGROUP, but the press comes from a different chat.
+    query = _FakeQuery(f"appr:allow:{token}", OWNER, _FakeCBMessage(chat_id=111))
+    update, context = _callback_env(query, pending, chat_id=SUPERGROUP)
+
+    await _handle_approval_callback(update, context)
+
+    assert not future.done()
+
+
+async def test_approval_callback_expired_token_is_acknowledged() -> None:
+    pending = PendingApprovals()
+    query = _FakeQuery("appr:allow:gone", OWNER, _FakeCBMessage())
+    update, context = _callback_env(query, pending)
+
+    await _handle_approval_callback(update, context)
+
+    assert any("expired" in (a or "").lower() for a in query.answers)
+    # The stale keyboard is still stripped (edit with the original text, no buttons).
+    assert query.message.edited
+
+
+def _callback_handler(app) -> CallbackQueryHandler:
+    return next(h for h in app.handlers[0] if isinstance(h, CallbackQueryHandler))
+
+
+def test_callback_handler_is_registered() -> None:
+    # The approval keyboard is routed by a CallbackQueryHandler matching appr:*.
+    assert _callback_handler(_build(SUPERGROUP)) is not None

@@ -16,6 +16,7 @@ Endpoints (from the OpenAPI spec at ``/doc``):
   GET  /session/{id}                 fetch a session (existence check)
   POST /session/{id}/prompt_async    send a message, return immediately
   POST /session/{id}/abort           cancel the running turn (best-effort)
+  POST /permission/{id}/reply        answer a permission.asked request
   GET  /event                        SSE stream of all server events
 """
 
@@ -31,6 +32,18 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+#: Permission ruleset applied at session create so OpenCode *asks* (raises a
+#: ``permission.asked`` SSE event) before every tool call rather than running it
+#: unattended. Balam's approval layer (:mod:`balam.approvals`) then enforces the
+#: directory boundary on each request, auto-allowing reads in the workspace and
+#: prompting for the rest. OpenCode evaluates the LAST matching rule, so the
+#: ask-all baseline goes first and the ``todowrite`` allow (internal bookkeeping,
+#: never user-visible) follows it. See ADR-0012 and the open-shrimp reference.
+ASK_ALL_PERMISSIONS: list[dict[str, str]] = [
+    {"permission": "*", "pattern": "*", "action": "ask"},
+    {"permission": "todowrite", "pattern": "*", "action": "allow"},
+]
 
 
 class OpenCode:
@@ -88,7 +101,7 @@ class OpenCode:
         response = await self._client.post(
             "/session",
             params={"directory": directory},
-            json={"title": title},
+            json={"title": title, "permission": ASK_ALL_PERMISSIONS},
         )
         response.raise_for_status()
         return response.json()["id"]
@@ -147,6 +160,34 @@ class OpenCode:
             response.raise_for_status()
         except httpx.HTTPError:
             logger.warning("failed to abort session %s", session_id, exc_info=True)
+
+    async def reply_permission(
+        self,
+        request_id: str,
+        reply: str,
+        *,
+        directory: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Answer a ``permission.asked`` request (``POST /permission/{id}/reply``).
+
+        ``reply`` is ``"once"`` / ``"always"`` (allow) or ``"reject"`` (deny,
+        with an optional ``message`` surfaced to the agent). Best-effort: a
+        failure — e.g. the request was already resolved (404), or the turn was
+        aborted out from under us — is logged, not raised, so it never tears the
+        stream down.
+        """
+        body: dict[str, Any] = {"reply": reply}
+        if message is not None:
+            body["message"] = message
+        params = {"directory": directory} if directory else None
+        try:
+            response = await self._client.post(
+                f"/permission/{request_id}/reply", params=params, json=body
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.warning("failed to reply to permission %s", request_id, exc_info=True)
 
     async def events(
         self, *, directory: str | None = None, ready: asyncio.Event | None = None

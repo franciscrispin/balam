@@ -82,8 +82,10 @@ def main() -> None:
         contexts.default_context,
     )
     # run_polling blocks, manages the event loop, and runs post_init/post_shutdown
-    # plus graceful shutdown on SIGINT/SIGTERM.
-    app.run_polling(allowed_updates=["message"])
+    # plus graceful shutdown on SIGINT/SIGTERM. We need both ``message`` (the
+    # round-trip) and ``callback_query`` (taps on the tool-approval inline
+    # keyboard, ADR-0012) delivered — Telegram omits any update type not listed.
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

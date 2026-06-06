@@ -1,5 +1,6 @@
 import asyncio
 
+from balam.approvals import Choice, PendingApprovals
 from balam.streamer import DraftSession, stream_reply
 
 
@@ -136,6 +137,7 @@ def _tool_part(
 class FakeBot:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.keyboards: list[object] = []
 
     async def send_chat_action(self, **kwargs: object) -> None:
         pass
@@ -143,8 +145,12 @@ class FakeBot:
     async def send_message_draft(self, **kwargs: object) -> None:
         pass
 
-    async def send_message(self, *, text: str, **kwargs: object) -> None:
+    async def send_message(
+        self, *, text: str, reply_markup: object = None, **kwargs: object
+    ) -> None:
         self.messages.append(text)
+        if reply_markup is not None:
+            self.keyboards.append(reply_markup)
 
 
 class FakeOpenCode:
@@ -300,6 +306,174 @@ async def test_stream_reply_forwards_context_to_prompt() -> None:
     # subscription must carry the same directory or only server.* events arrive
     # and the reply never finalizes (regression: subscribed without directory).
     assert oc.events_directory == "/work/proj"
+
+
+# --- permission.asked handling (interactive approval) -------------------------
+
+
+def _permission(request_id: str, call_id: str, category: str = "read") -> dict[str, object]:
+    return _ev(
+        "permission.asked",
+        id=request_id,
+        sessionID=SID,
+        permission=category,
+        patterns=[],
+        metadata={},
+        always=[],
+        tool={"messageID": AID, "callID": call_id},
+    )
+
+
+class PermissionOpenCode(FakeOpenCode):
+    """Records ``reply_permission`` calls and lets the event script wait for a
+    reply before proceeding (``"WAIT_REPLY"`` sentinel), mirroring how OpenCode
+    stays busy until a permission is answered."""
+
+    def __init__(self, events: list[object]) -> None:
+        super().__init__([])
+        self._script = events
+        self.replies: list[tuple[str, str, str | None]] = []
+        self._replied = asyncio.Event()
+
+    async def reply_permission(
+        self,
+        request_id: str,
+        reply: str,
+        *,
+        directory: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.replies.append((request_id, reply, message))
+        self._replied.set()
+
+    async def events(self, *, directory: str | None = None, ready: asyncio.Event | None = None):
+        self.events_directory = directory
+        if ready is not None:
+            ready.set()
+        for event in self._script:
+            if event == "WAIT_REPLY":
+                await self._replied.wait()
+                continue
+            yield event
+
+
+def _token_from_keyboard(markup: object) -> str:
+    for row in markup.inline_keyboard:  # type: ignore[attr-defined]
+        for button in row:
+            if button.callback_data and button.callback_data.startswith("appr:"):
+                return button.callback_data.split(":", 2)[2]
+    raise AssertionError("no approval button found")
+
+
+async def test_permission_auto_allows_read_in_workspace() -> None:
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "c1", "read", {"status": "running", "input": {"filePath": "/work/proj/a.py"}}
+            ),
+            _permission("per_1", "c1", category="read"),
+            "WAIT_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        opencode=oc,
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="x",
+        directory="/work/proj",
+        pending=pending,
+        allowed_dirs=["/work/proj"],
+        draft_interval=0.01,
+    )
+    # Auto-allowed with reply "once"; no keyboard shown.
+    assert oc.replies == [("per_1", "once", None)]
+    assert bot.keyboards == []
+
+
+async def test_permission_asks_and_denies_out_of_scope_read() -> None:
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part("c1", "read", {"status": "running", "input": {"filePath": "/etc/hosts"}}),
+            _permission("per_1", "c1", category="read"),
+            "WAIT_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    task = asyncio.create_task(
+        stream_reply(
+            bot=bot,
+            opencode=oc,
+            session_id=SID,
+            chat_id=1,
+            thread_id=99,
+            prompt="x",
+            directory="/work/proj",
+            pending=pending,
+            allowed_dirs=["/work/proj"],
+            draft_interval=0.01,
+        )
+    )
+    # Wait for the approval keyboard, then tap "Deny".
+    for _ in range(200):
+        if bot.keyboards:
+            break
+        await asyncio.sleep(0.01)
+    assert bot.keyboards, "expected an approval keyboard"
+    token = _token_from_keyboard(bot.keyboards[0])
+    assert pending.resolve(token, Choice.DENY) is True
+    await task
+    assert oc.replies == [("per_1", "reject", "Denied by the user.")]
+
+
+async def test_permission_accept_all_edits_unblocks_session() -> None:
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "c1", "edit", {"status": "running", "input": {"filePath": "/work/proj/a.py"}}
+            ),
+            _permission("per_1", "c1", category="edit"),
+            "WAIT_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    task = asyncio.create_task(
+        stream_reply(
+            bot=bot,
+            opencode=oc,
+            session_id=SID,
+            chat_id=1,
+            thread_id=99,
+            prompt="x",
+            directory="/work/proj",
+            pending=pending,
+            allowed_dirs=["/work/proj"],
+            draft_interval=0.01,
+        )
+    )
+    for _ in range(200):
+        if bot.keyboards:
+            break
+        await asyncio.sleep(0.01)
+    assert bot.keyboards, "an in-workspace edit should prompt before accept-all"
+    token = _token_from_keyboard(bot.keyboards[0])
+    pending.resolve(token, Choice.ALL)
+    await task
+    # Allowed with "once" for this call, and the session flag is now set so the
+    # next in-workspace edit auto-allows.
+    assert oc.replies == [("per_1", "once", None)]
+    assert pending.is_accept_all_edits(SID) is True
 
 
 async def test_stream_reply_subscribes_before_prompting() -> None:

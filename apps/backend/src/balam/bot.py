@@ -26,12 +26,14 @@ from telegram import (
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+from balam.approvals import Choice, PendingApprovals
 from balam.config import Config
 from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
@@ -79,6 +81,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     router: Router = context.application.bot_data["router"]
     opencode: OpenCode = context.application.bot_data["opencode"]
     turns: TurnRegistry = context.application.bot_data["turns"]
+    pending: PendingApprovals = context.application.bot_data["pending"]
 
     try:
         resolved = await router.resolve(
@@ -106,6 +109,8 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 provider=resolved.provider,
                 model=resolved.model,
                 effort=resolved.effort,
+                pending=pending,
+                allowed_dirs=[resolved.directory, *resolved.additional_directories],
             )
         except asyncio.CancelledError:
             raise  # /cancel aborted the turn; let the task settle as cancelled.
@@ -316,6 +321,79 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await message.reply_text("🛑 Cancelled.")
 
 
+#: Per approval choice: ``(inline note appended to the prompt — already
+#: MarkdownV2-escaped, toast shown on the callback answer)``.
+_CHOICE_FEEDBACK = {
+    Choice.ALLOW: ("✅ Allowed\\.", "Allowed."),
+    Choice.ALL: ("✅ Allowed — accepting all edits this session\\.", "Accepting all edits."),
+    Choice.DENY: ("❌ Denied\\.", "Denied."),
+}
+
+
+async def _handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resolve an approval inline keyboard (``appr:<choice>:<token>``).
+
+    ``CallbackQueryHandler`` carries no ``filters``, so the ADR-0008 trust
+    boundary is re-checked here by hand: the press must come from the owner (and
+    the configured chat, when scoped). The matching pending future is resolved in
+    :class:`PendingApprovals`; the streamer's waiting task then replies to
+    OpenCode. We just acknowledge and strip the now-spent keyboard.
+    """
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("appr:"):
+        return
+
+    config: Config = context.application.bot_data["config"]
+    user = query.from_user
+    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+        await query.answer()
+        return
+    if config.allowed_telegram_chat_id is not None:
+        chat = query.message.chat if query.message else None
+        if chat is None or chat.id != config.allowed_telegram_chat_id:
+            await query.answer()
+            return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed approval.")
+        return
+    _, choice_str, token = parts
+    try:
+        choice = Choice(choice_str)
+    except ValueError:
+        await query.answer("Unknown approval choice.")
+        return
+
+    pending: PendingApprovals = context.application.bot_data["pending"]
+    if not pending.resolve(token, choice):
+        await query.answer("This approval has expired.")
+        await _clear_keyboard(query)
+        return
+
+    note, toast = _CHOICE_FEEDBACK[choice]
+    await query.answer(toast)
+    await _clear_keyboard(query, note=note)
+
+
+async def _clear_keyboard(query: Any, note: str | None = None) -> None:
+    """Strip a spent approval keyboard, appending a one-line outcome when given.
+
+    ``note`` (when set) must already be MarkdownV2-escaped. Best-effort: a failed
+    edit — e.g. a message too old to edit — is logged, not raised; the callback
+    answer already told the user the outcome.
+    """
+    message = getattr(query, "message", None)
+    if message is None:
+        return
+    original = message.text_markdown_v2 or message.text or ""
+    text = f"{original}\n\n{note}" if note else original
+    try:
+        await message.edit_text(text=text, parse_mode="MarkdownV2", reply_markup=None)
+    except Exception:
+        logger.debug("failed to update spent approval message", exc_info=True)
+
+
 #: The slash commands Balam exposes. Registering them via ``setMyCommands`` is
 #: what makes them discoverable and reliably routed to the bot in a group, where
 #: clients dispatch slash commands by the bot's registered list.
@@ -364,6 +442,8 @@ def build_application(
     app.bot_data["router"] = router
     # In-flight turns, keyed by topic, so /cancel can interrupt a running reply.
     app.bot_data["turns"] = TurnRegistry()
+    # Outstanding tool-approval prompts + per-session "accept all edits" state.
+    app.bot_data["pending"] = PendingApprovals()
 
     # Trust boundary (ADR-0008): filters.User gates by sender id, so only the
     # owner's messages reach the handlers; everyone else is dropped silently.
@@ -379,5 +459,8 @@ def build_application(
     app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & allowed, _handle_message))
+    # CallbackQueryHandler takes no filter; the handler re-checks the trust
+    # boundary (ADR-0008) itself before resolving an approval.
+    app.add_handler(CallbackQueryHandler(_handle_approval_callback, pattern=r"^appr:"))
 
     return app

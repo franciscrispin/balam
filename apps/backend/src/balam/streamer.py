@@ -25,6 +25,16 @@ import random
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+from balam.approvals import (
+    Choice,
+    PendingApprovals,
+    Verdict,
+    decide,
+    is_edit,
+    request_target_paths,
+)
 from balam.markdown import gfm_to_telegram
 from balam.opencode import OpenCode
 from balam.telegram_utils import thread_kwargs
@@ -50,6 +60,7 @@ _TOOL_DISPLAY: dict[str, str] = {
     "grep": "Grep",
     "list": "LS",
     "webfetch": "WebFetch",
+    "apply_patch": "ApplyPatch",
     "todowrite": "TodoWrite",
     "task": "Task",
     "agent": "Agent",
@@ -180,6 +191,24 @@ def _relpath(path: str, directory: str | None) -> str:
     return path if rel.startswith("..") else rel
 
 
+#: apply_patch envelope headers; the path follows the prefix. Used only to render
+#: a readable tool line (the boundary check uses the permission metadata instead).
+_APPLY_PATCH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
+
+
+def _apply_patch_files(patch_text: str) -> list[str]:
+    """File paths an apply_patch envelope touches, for display."""
+    out: list[str] = []
+    for line in patch_text.splitlines():
+        for prefix in _APPLY_PATCH_HEADERS:
+            if line.startswith(prefix):
+                path = line[len(prefix) :].strip()
+                if path:
+                    out.append(path)
+                break
+    return out
+
+
 def _tool_summary(tool: str, tool_input: dict[str, Any], directory: str | None) -> str:
     """A one-line argument summary for a tool call (paths shown workspace-relative)."""
     if tool in ("read", "edit", "write"):
@@ -192,6 +221,11 @@ def _tool_summary(tool: str, tool_input: dict[str, Any], directory: str | None) 
         pattern = tool_input.get("pattern", "")
         path = tool_input.get("path", "")
         return f"{pattern} in {_relpath(path, directory)}" if path else pattern
+    if tool == "apply_patch":
+        # The raw patchText envelope is huge and breaks MarkdownV2; show the files
+        # it touches instead (parsed from the envelope headers).
+        paths = _apply_patch_files(tool_input.get("patchText", ""))
+        return ", ".join(_relpath(p, directory) for p in paths)
     if tool == "webfetch":
         return tool_input.get("url", "")
     if tool in ("task", "agent"):
@@ -261,6 +295,43 @@ def _render_tool_part(
     return line
 
 
+def _format_approval_request(tool: str, tool_input: dict[str, Any], directory: str | None) -> str:
+    """A GFM prompt asking the user to approve one tool call.
+
+    Bash shows the command; file tools show the (workspace-relative) path; other
+    tools fall back to the generic argument summary — the same vocabulary as the
+    inline tool lines so a prompt reads like the stream around it.
+    """
+    display = _TOOL_DISPLAY.get(tool, tool)
+    header = f"🔐 Allow **{display}**?"
+    if tool == "bash":
+        command = tool_input.get("command", "")
+        return f"{header}\n```\n{command}\n```" if command else header
+    summary = _tool_summary(tool, tool_input, directory)
+    return f"{header}\n`{summary}`" if summary else header
+
+
+def _approval_keyboard(token: str, category: str) -> InlineKeyboardMarkup:
+    """The inline keyboard for an approval prompt. Edit requests (category
+    ``edit`` — edit/write/apply_patch) also offer "accept all edits" so the user
+    can stop being asked for in-workspace edits."""
+    rows = [
+        [
+            InlineKeyboardButton("Allow once", callback_data=f"appr:{Choice.ALLOW.value}:{token}"),
+            InlineKeyboardButton("Deny", callback_data=f"appr:{Choice.DENY.value}:{token}"),
+        ]
+    ]
+    if is_edit(category):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Accept all edits", callback_data=f"appr:{Choice.ALL.value}:{token}"
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
 def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTransport:
     # message_thread_id routes both the draft and the final message to the topic.
     topic_kwargs = thread_kwargs(thread_id)
@@ -300,6 +371,8 @@ async def stream_reply(
     provider: str | None = None,
     model: str | None = None,
     effort: str | None = None,
+    pending: PendingApprovals | None = None,
+    allowed_dirs: list[str] | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
 ) -> None:
     """Prompt the agent and stream its reply into the topic.
@@ -311,6 +384,13 @@ async def stream_reply(
     Subscribes to the event stream *before* prompting so no early deltas are
     missed, animates a draft as text grows, and finalizes into real message(s)
     on ``session.idle`` (or ``session.error``).
+
+    When ``pending`` is given, ``permission.asked`` events are handled (ADR-0012):
+    each is dispatched to a background task that recovers the call's tool/input
+    from the tool-part cache, runs :func:`balam.approvals.decide` against
+    ``allowed_dirs``, and either auto-replies to OpenCode or sends an inline
+    keyboard and awaits the user's choice. Without ``pending`` the events are
+    ignored (e.g. unit tests of the text/tool path).
     """
     transport = _make_transport(bot, chat_id, thread_id)
     draft = DraftSession(transport)
@@ -336,6 +416,105 @@ async def stream_reply(
     order = 0
     error_text: str | None = None
     stream_ready = asyncio.Event()
+    dirs = allowed_dirs or ([directory] if directory else [])
+    # Per-request approval tasks, so the SSE loop isn't blocked while the user
+    # decides. Torn down with the consumer.
+    permission_tasks: set[asyncio.Task[None]] = set()
+
+    async def await_tool_input(call_id: str) -> tuple[str | None, dict[str, Any]]:
+        """Recover a call's ``(tool, input)`` from the tool-part cache, briefly
+        waiting for it: ``permission.asked`` can race ahead of the tool part that
+        carries the input. Falls back to whatever is cached when the wait lapses.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 1.0
+        while True:
+            entry = tool_parts.get(call_id)
+            if entry and entry[1]:
+                return entry[0], entry[1]
+            if loop.time() >= deadline:
+                return (entry[0], entry[1]) if entry else (None, {})
+            await asyncio.sleep(0.05)
+
+    async def request_approval(
+        request_id: str, category: str, tool: str, tool_input: dict[str, Any]
+    ) -> None:
+        """Ask the user via an inline keyboard, then reply to OpenCode. The
+        callback handler resolves the future and updates the message; here we
+        only translate the choice into a permission reply. ``category`` drives the
+        keyboard (whether to offer "accept all edits"); ``tool`` is display-only."""
+        assert pending is not None
+        token, future = pending.register(session_id)
+        gfm = _format_approval_request(tool, tool_input, directory)
+        keyboard = _approval_keyboard(token, category)
+        chunks = gfm_to_telegram(gfm)
+        text = chunks[0] if chunks else f"🔐 Allow {tool}?"
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="MarkdownV2",
+                reply_markup=keyboard,
+                **topic_kwargs,
+            )
+        except Exception:
+            logger.debug("approval keyboard MarkdownV2 send failed; retrying plain", exc_info=True)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔐 Allow {tool}? (see request)",
+                    reply_markup=keyboard,
+                    **topic_kwargs,
+                )
+            except Exception:
+                logger.exception("failed to send approval keyboard; denying")
+                pending.discard(token)
+                await opencode.reply_permission(
+                    request_id, "reject", directory=directory, message="Could not prompt the user."
+                )
+                return
+        try:
+            choice = await future
+        except asyncio.CancelledError:
+            # Turn torn down (e.g. /cancel) before the user answered: unblock the
+            # server so it isn't left waiting on a permission that will never come.
+            await opencode.reply_permission(
+                request_id, "reject", directory=directory, message="Cancelled."
+            )
+            raise
+        finally:
+            pending.discard(token)
+        if choice is Choice.DENY:
+            await opencode.reply_permission(
+                request_id, "reject", directory=directory, message="Denied by the user."
+            )
+        else:
+            await opencode.reply_permission(request_id, "once", directory=directory)
+
+    async def handle_permission(request: dict[str, Any]) -> None:
+        request_id = request.get("id")
+        if not request_id:
+            return
+        category = request.get("permission") or ""
+        metadata = request.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tool_ref = request.get("tool")
+        call_id = tool_ref.get("callID", "") if isinstance(tool_ref, dict) else ""
+        cached_tool, tool_input = await await_tool_input(call_id) if call_id else (None, {})
+        cwd = dirs[0] if dirs else None
+        # Classify by OpenCode's permission category; take edit targets from the
+        # permission metadata (authoritative for apply_patch) and reads from input.
+        paths = request_target_paths(category, metadata, tool_input, cwd)
+        verdict = decide(
+            category,
+            paths,
+            allowed_dirs=dirs,
+            accept_all_edits=pending.is_accept_all_edits(session_id) if pending else False,
+        )
+        if verdict is Verdict.ALLOW:
+            await opencode.reply_permission(request_id, "once", directory=directory)
+            return
+        await request_approval(request_id, category, cached_tool or category, tool_input)
 
     async def consume() -> None:
         nonlocal order, error_text
@@ -392,6 +571,16 @@ async def stream_reply(
                         stream_parts[key] = (stream_parts[key][0], "tool", rendered)
                         draft.set_text(_join_stream(stream_parts))
 
+            elif etype == "permission.asked":
+                # ``props`` is the PermissionRequest. Handle in a child task so a
+                # slow user decision doesn't stall the SSE loop (the session stays
+                # busy — not idle — while a permission is pending).
+                if pending is None or props.get("sessionID") != session_id:
+                    continue
+                ptask = asyncio.create_task(handle_permission(props))
+                permission_tasks.add(ptask)
+                ptask.add_done_callback(permission_tasks.discard)
+
             elif etype == "session.error" and props.get("sessionID") == session_id:
                 error_text = _describe_error(props.get("error"))
                 break
@@ -437,11 +626,16 @@ async def stream_reply(
             draft.set_text(f"{prefix}⚠️ {error_text}")
     finally:
         # Stop the flusher and the consumer before finalizing so neither races the
-        # real message, and so a leftover task can't outlive the turn.
+        # real message, and so a leftover task can't outlive the turn. Pending
+        # approval tasks are cancelled too; each rejects its request on the way
+        # out so OpenCode isn't left blocked on an answer that will never come.
         streaming = False
         if not consume_task.done():
             consume_task.cancel()
-        await asyncio.gather(flush_task, consume_task, return_exceptions=True)
+        for ptask in list(permission_tasks):
+            if not ptask.done():
+                ptask.cancel()
+        await asyncio.gather(flush_task, consume_task, *permission_tasks, return_exceptions=True)
 
     # Replace the ephemeral draft with the real, persistent message(s) — always,
     # even on error, so accumulated text and any error notice are delivered.
