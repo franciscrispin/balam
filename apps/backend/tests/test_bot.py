@@ -250,6 +250,32 @@ async def test_new_opens_a_new_topic_in_the_current_context() -> None:
     assert "https://t.me/c/1234567890/900" in _button_urls(message)
 
 
+async def test_new_with_arg_opens_topic_in_named_context() -> None:
+    # /new <name> binds the new topic to <name>, not the current topic's context.
+    router = _router()
+    bot = _FakeBot(new_thread_id=902)
+    await router.create_topic_session(SUPERGROUP, 5, "balam", "balam")  # current topic
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context = _update_context(bot, router, message, ["scratch"])
+
+    await _handle_new(update, context)
+
+    assert bot.created_topics == [(SUPERGROUP, "scratch")]
+    assert router.current_context_name(TopicRef(SUPERGROUP, 902, "t")) == "scratch"
+
+
+async def test_new_with_unknown_context_reports_error() -> None:
+    router = _router()
+    bot = _FakeBot(new_thread_id=903)
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context = _update_context(bot, router, message, ["nope"])
+
+    await _handle_new(update, context)
+
+    assert bot.created_topics == []
+    assert "Unknown context" in message.replies[-1]
+
+
 async def test_new_from_unbound_topic_uses_default_context() -> None:
     router = _router()
     bot = _FakeBot(new_thread_id=901)

@@ -252,25 +252,34 @@ def _abort_turn(turn: Any, opencode: OpenCode) -> asyncio.Task[None] | None:
 
 
 async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/new`` — open a fresh topic with a new session in the *current* context.
+    """``/new [name]`` — open a fresh topic with a new session.
 
-    The same flow as ``/context <name>`` (:func:`_open_context_topic`), but the
-    context is taken from the current topic's binding (``default_context`` when
-    unbound) instead of an argument. The current topic is left untouched — one
-    context per topic for life — so its history is preserved and the fresh start
-    lives in its own topic.
+    The same flow as ``/context <name>`` (:func:`_open_context_topic`). With an
+    argument, the new topic is bound to context ``name``; without one, it reuses
+    the current topic's binding (``default_context`` when unbound). The current
+    topic is left untouched — one context per topic for life — so its history is
+    preserved and the fresh start lives in its own topic.
     """
     message = update.message
     if message is None:
         return
 
     router: Router = context.application.bot_data["router"]
-    ref = TopicRef(
-        chat_id=message.chat_id,
-        thread_id=message.message_thread_id,
-        title=_topic_title(message, message.message_thread_id),
-    )
-    await _open_context_topic(message, context.bot, router, router.current_context_name(ref))
+    args = context.args or []
+    if args:
+        name = args[0]
+        if name not in router.contexts.contexts:
+            available = ", ".join(sorted(router.contexts.contexts))
+            await message.reply_text(f"Unknown context {name!r}. Available: {available}")
+            return
+    else:
+        ref = TopicRef(
+            chat_id=message.chat_id,
+            thread_id=message.message_thread_id,
+            title=_topic_title(message, message.message_thread_id),
+        )
+        name = router.current_context_name(ref)
+    await _open_context_topic(message, context.bot, router, name)
 
 
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -398,7 +407,7 @@ async def _clear_keyboard(query: Any, note: str | None = None) -> None:
 #: what makes them discoverable and reliably routed to the bot in a group, where
 #: clients dispatch slash commands by the bot's registered list.
 BOT_COMMANDS = [
-    BotCommand("new", "Open a new topic with a fresh session in this context"),
+    BotCommand("new", "Open a new topic (this context, or /new <name> for another)"),
     BotCommand("status", "Show this topic's context, session, and turn state"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
