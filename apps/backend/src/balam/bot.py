@@ -14,6 +14,13 @@ import asyncio
 import logging
 from typing import Any
 
+from balam.approvals import Choice, PendingApprovals
+from balam.config import Config
+from balam.opencode import OpenCode
+from balam.router import Router, TopicRef
+from balam.streamer import stream_reply
+from balam.telegram_utils import thread_kwargs
+from balam.turns import TurnRegistry
 from telegram import (
     Bot,
     BotCommand,
@@ -32,14 +39,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-from balam.approvals import Choice, PendingApprovals
-from balam.config import Config
-from balam.opencode import OpenCode
-from balam.router import Router, TopicRef
-from balam.streamer import stream_reply
-from balam.telegram_utils import thread_kwargs
-from balam.turns import TurnRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +60,15 @@ def _topic_title(message: Any, thread_id: int | None) -> str:
     return f"Topic {thread_id}"
 
 
-async def _notify_error(bot: Any, chat_id: int, thread_id: int | None, exc: Exception) -> None:
+async def _notify_error(
+    bot: Any, chat_id: int, thread_id: int | None, exc: Exception
+) -> None:
     """Post a short error notice into the topic (ADR-0009 edge), swallowing any
     delivery failure so it never masks the original error."""
     try:
-        await bot.send_message(chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs(thread_id))
+        await bot.send_message(
+            chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs(thread_id)
+        )
     except Exception:
         logger.debug("failed to deliver error notice", exc_info=True)
 
@@ -85,7 +88,11 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         resolved = await router.resolve(
-            TopicRef(chat_id=chat_id, thread_id=thread_id, title=_topic_title(message, thread_id))
+            TopicRef(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                title=_topic_title(message, thread_id),
+            )
         )
     except Exception as exc:
         # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
@@ -149,7 +156,9 @@ def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str 
     return None
 
 
-async def _open_context_topic(message: Any, bot: Any, router: Router, name: str) -> None:
+async def _open_context_topic(
+    message: Any, bot: Any, router: Router, name: str
+) -> None:
     """Create a fresh forum topic bound to context ``name``, start its session,
     greet inside it, and reply with a one-tap link. Shared by ``/context <name>``
     and ``/new``.
@@ -180,9 +189,13 @@ async def _open_context_topic(message: Any, bot: Any, router: Router, name: str)
         # Roll back the just-created topic: an unbound topic would silently route
         # to default_context, not the one we meant. Best-effort delete.
         try:
-            await bot.delete_forum_topic(chat_id=message.chat_id, message_thread_id=new_thread_id)
+            await bot.delete_forum_topic(
+                chat_id=message.chat_id, message_thread_id=new_thread_id
+            )
         except Exception:
-            logger.debug("failed to delete orphan topic after session failure", exc_info=True)
+            logger.debug(
+                "failed to delete orphan topic after session failure", exc_info=True
+            )
         await message.reply_text(f"⚠️ Couldn't start a session for {name!r}: {exc}")
         return
 
@@ -195,10 +208,14 @@ async def _open_context_topic(message: Any, bot: Any, router: Router, name: str)
     )
     link = _topic_link(message.chat_id, new_thread_id, bot_id=bot.id)
     if link:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Go to topic", url=link)]])
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Go to topic", url=link)]]
+        )
         await message.reply_text(f"Opened a new {name} topic.", reply_markup=keyboard)
     else:
-        await message.reply_text(f"Opened a new {name} topic — pick it from the topic list.")
+        await message.reply_text(
+            f"Opened a new {name} topic — pick it from the topic list."
+        )
 
 
 async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -248,7 +265,9 @@ def _abort_turn(turn: Any, opencode: OpenCode) -> asyncio.Task[None] | None:
     if turn is None:
         return None
     turn.task.cancel()
-    return asyncio.create_task(opencode.abort_session(turn.session_id, directory=turn.directory))
+    return asyncio.create_task(
+        opencode.abort_session(turn.session_id, directory=turn.directory)
+    )
 
 
 async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,7 +289,9 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         name = args[0]
         if name not in router.contexts.contexts:
             available = ", ".join(sorted(router.contexts.contexts))
-            await message.reply_text(f"Unknown context {name!r}. Available: {available}")
+            await message.reply_text(
+                f"Unknown context {name!r}. Available: {available}"
+            )
             return
     else:
         ref = TopicRef(
@@ -334,12 +355,17 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 #: MarkdownV2-escaped, toast shown on the callback answer)``.
 _CHOICE_FEEDBACK = {
     Choice.ALLOW: ("✅ Allowed\\.", "Allowed."),
-    Choice.ALL: ("✅ Allowed — accepting all edits this session\\.", "Accepting all edits."),
+    Choice.ALL: (
+        "✅ Allowed — accepting all edits this session\\.",
+        "Accepting all edits.",
+    ),
     Choice.DENY: ("❌ Denied\\.", "Denied."),
 }
 
 
-async def _handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _handle_approval_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Resolve an approval inline keyboard (``appr:<choice>:<token>``).
 
     ``CallbackQueryHandler`` carries no ``filters``, so the ADR-0008 trust
@@ -428,7 +454,9 @@ async def register_commands(bot: Bot, chat_id: int | None = None) -> None:
     if chat_id is not None:
         from telegram import BotCommandScopeChat
 
-        await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=chat_id))
+        await bot.set_my_commands(
+            BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=chat_id)
+        )
 
 
 def build_application(
@@ -457,7 +485,7 @@ def build_application(
     # Trust boundary (ADR-0008): filters.User gates by sender id, so only the
     # owner's messages reach the handlers; everyone else is dropped silently.
     # When a target chat is configured (ADR-0010), additionally require that
-    # chat, so the bot acts only inside the balamies supergroup. Unset → the
+    # chat, so the bot acts only inside the workspace supergroup. Unset → the
     # legacy owner-anywhere behavior, preserving the DM round-trip.
     allowed = filters.User(user_id=config.allowed_telegram_user_id)
     if config.allowed_telegram_chat_id is not None:
@@ -467,7 +495,9 @@ def build_application(
     app.add_handler(CommandHandler("status", _handle_status, filters=allowed))
     app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & allowed, _handle_message))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & allowed, _handle_message)
+    )
     # CallbackQueryHandler takes no filter; the handler re-checks the trust
     # boundary (ADR-0008) itself before resolving an approval.
     app.add_handler(CallbackQueryHandler(_handle_approval_callback, pattern=r"^appr:"))

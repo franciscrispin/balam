@@ -39,13 +39,13 @@ backend's FastAPI OpenAPI schema, from which frontend types are generated.
 
 ### Frontend + shared (TypeScript / Bun) — run from the repo root
 
-| Command             | What it does                            |
-| ------------------- | --------------------------------------- |
-| `bun install`       | Install frontend + shared deps          |
-| `bun run dev`       | Run the Mini App (Vite) in watch mode   |
-| `bun run build`     | Build the Mini App                      |
-| `bun run typecheck` | Type-check `packages/*` + the frontend  |
-| `bun run lint`      | Biome lint/format (`lint:fix` autofixes)|
+| Command             | What it does                             |
+| ------------------- | ---------------------------------------- |
+| `bun install`       | Install frontend + shared deps           |
+| `bun run dev`       | Run the Mini App (Vite) in watch mode    |
+| `bun run build`     | Build the Mini App                       |
+| `bun run typecheck` | Type-check `packages/*` + the frontend   |
+| `bun run lint`      | Biome lint/format (`lint:fix` autofixes) |
 
 Tooling gotchas:
 
@@ -96,7 +96,7 @@ Caveat: `allowed_tools`/`additional_directories` are parsed and validated but
 
 - **Secrets / env:** copy `.env.example` → `.env` (loaded by pydantic-settings;
   systemd env vars take precedence). `ALLOWED_TELEGRAM_CHAT_ID` (optional `-100…`
-  id) scopes the bot to the "balamies" forum supergroup; unset → legacy
+  id) scopes the bot to the "workspace" forum supergroup; unset → legacy
   owner-anywhere DM behavior (ADR-0008 trust boundary unchanged).
 - **Contexts:** copy `config.example.yaml` → `config.yaml` (**required**; path
   via `BALAM_CONFIG_PATH`). Secrets stay in `.env`, never `config.yaml`.

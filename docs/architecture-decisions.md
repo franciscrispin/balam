@@ -248,7 +248,7 @@ Treat the Telegram entry point as the trust boundary and lock it to one user:
 - If the token leaks, an attacker can still send updates, but the user-ID
   allowlist rejects them. Rotating the token stays the recovery step.
 - **Optional chat scoping (`ALLOWED_TELEGRAM_CHAT_ID`).** Balam now targets the
-  "balamies" forum **supergroup** (ADR-0010) rather than the owner's DM. When this
+  "workspace" forum **supergroup** (ADR-0010) rather than the owner's DM. When this
   `-100…` chat id is set, both handlers require it **in addition to** the owner id
   (`filters.User & filters.Chat`), so the bot acts only inside that group and
   ignores the owner everywhere else (including the old DM). It is a defense-in-depth
@@ -293,8 +293,8 @@ session.
   one-context-per-topic invariant, so a topic's session always remembers its own
   history and no sessions are orphaned by rebinding. Duplicate topic names are
   allowed (many topics may share a context).
-- **Balam runs in a forum *supergroup*, but topics also work in a private chat.**
-  The live deployment is the "balamies" supergroup (ADR-0010), so the chat id is
+- **Balam runs in a forum _supergroup_, but topics also work in a private chat.**
+  The live deployment is the "workspace" supergroup (ADR-0010), so the chat id is
   a `-100…` supergroup. Telegram's topics-in-private-chats (Bot API 9.3, Dec 2025;
   `createForumTopic` in private chats, 9.4, Feb 2026) — enabled via BotFather
   "Threaded Mode" — also makes `/context` topic creation work in the owner's DM,
@@ -359,7 +359,7 @@ Build Balam on **Telegram**. Realize the directory→session tree as:
 
 - **The directory dimension is a workspace context** (ADR-0012), not a separate
   supergroup per directory. Balam is scoped to a single forum supergroup
-  ("balamies", `ALLOWED_TELEGRAM_CHAT_ID`); each topic binds to a context whose
+  ("workspace", `ALLOWED_TELEGRAM_CHAT_ID`); each topic binds to a context whose
   `directory` is the agent's working dir.
 - **One forum topic per OpenCode session** within that supergroup (ADR-0009
   unchanged); `/context <name>` opens a topic for a context.
@@ -370,7 +370,7 @@ Stream agent output with `sendMessageDraft`, falling back to throttled
 ### Consequences
 
 - A Telegram **bot cannot create supergroups** via the Bot API, so the owner
-  creates the "balamies" supergroup by hand once and adds the bot as an admin
+  creates the "workspace" supergroup by hand once and adds the bot as an admin
   with "Manage Topics"; the bot then creates session topics itself
   (`createForumTopic`, via `/context`). This one-time manual setup is acceptable.
 - The backend's persisted topic→session row (ADR-0009) also stores each topic's
@@ -500,16 +500,16 @@ context. Secrets never go in `config.yaml`.
 
 ## Summary
 
-| ADR  | Decision                                                           | Core reason                                                     |
-| ---- | ------------------------------------------------------------------ | --------------------------------------------------------------- |
-| 0001 | OpenCode as headless server (systemd), Balam as client             | Keeps sessions/tools warm; bot stays small                      |
-| 0002 | HTTP API is source of truth; thin `httpx` client, no SDK           | Contract-first; language never limits capability                |
-| 0003 | Three layers; frontend is fixed TypeScript                         | Clear responsibilities; Mini App must be web                    |
-| 0005 | Browser-use as an OpenCode skill                                   | Reuse skill; backend language irrelevant to it                  |
-| 0006 | Live Chrome via embedded noVNC iframe                              | Real-time view from a standard stack; least UI code             |
-| 0007 | Local single-user on the VM                                        | Full local access; minimal security surface                     |
-| 0008 | Telegram entry point is the trust boundary; allowlist one user ID  | The bot is internet-facing even when ports are local            |
-| 0009 | One Telegram forum topic = one OpenCode session                    | Native parallel task threads, no custom UI                      |
+| ADR  | Decision                                                                    | Core reason                                                     |
+| ---- | --------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| 0001 | OpenCode as headless server (systemd), Balam as client                      | Keeps sessions/tools warm; bot stays small                      |
+| 0002 | HTTP API is source of truth; thin `httpx` client, no SDK                    | Contract-first; language never limits capability                |
+| 0003 | Three layers; frontend is fixed TypeScript                                  | Clear responsibilities; Mini App must be web                    |
+| 0005 | Browser-use as an OpenCode skill                                            | Reuse skill; backend language irrelevant to it                  |
+| 0006 | Live Chrome via embedded noVNC iframe                                       | Real-time view from a standard stack; least UI code             |
+| 0007 | Local single-user on the VM                                                 | Full local access; minimal security surface                     |
+| 0008 | Telegram entry point is the trust boundary; allowlist one user ID           | The bot is internet-facing even when ports are local            |
+| 0009 | One Telegram forum topic = one OpenCode session                             | Native parallel task threads, no custom UI                      |
 | 0010 | Telegram over Discord; one supergroup, context-per-topic, session-per-topic | Native streaming + Mini App + no archiving; two-level tree fits |
-| 0011 | Backend in Python (FastAPI + PTB), OpenCode over HTTP              | Reference reuse (zog/open-shrimp); HTTP is the contract (0002)  |
-| 0012 | Workspace contexts in a required `config.yaml`                     | Per-project dir/model/effort/tools; structured config, not env  |
+| 0011 | Backend in Python (FastAPI + PTB), OpenCode over HTTP                       | Reference reuse (zog/open-shrimp); HTTP is the contract (0002)  |
+| 0012 | Workspace contexts in a required `config.yaml`                              | Per-project dir/model/effort/tools; structured config, not env  |

@@ -3,9 +3,6 @@ import contextlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from telegram import Chat, Message, MessageEntity, Update, User
-from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
-
 from balam.approvals import Choice, PendingApprovals
 from balam.bot import (
     BOT_COMMANDS,
@@ -23,6 +20,8 @@ from balam.contexts import ContextConfig, ContextsConfig
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
 from balam.turns import TurnRegistry
+from telegram import Chat, Message, MessageEntity, Update, User
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
 OWNER = 424242
 SUPERGROUP = -1001234567890
@@ -57,7 +56,10 @@ def test_topic_link_for_private_supergroup() -> None:
 
 def test_topic_link_for_private_chat_uses_web_address() -> None:
     # Private chat with topics has no documented deep link → Telegram Web URL.
-    assert _topic_link(24320651, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
+    assert (
+        _topic_link(24320651, 42, bot_id=BOT_ID)
+        == f"https://web.telegram.org/a/#{BOT_ID}_42"
+    )
 
 
 def test_topic_link_none_for_private_chat_without_bot_id() -> None:
@@ -73,10 +75,14 @@ class _FakeOpenCode:
         self._n += 1
         return f"ses_{self._n}"
 
-    async def session_exists(self, session_id: str, *, directory: str | None = None) -> bool:
+    async def session_exists(
+        self, session_id: str, *, directory: str | None = None
+    ) -> bool:
         return True
 
-    async def abort_session(self, session_id: str, *, directory: str | None = None) -> None:
+    async def abort_session(
+        self, session_id: str, *, directory: str | None = None
+    ) -> None:
         self.aborted.append((session_id, directory))
 
 
@@ -103,7 +109,12 @@ class _FakeBot:
         return SimpleNamespace(message_thread_id=self._new_thread_id, name=name)
 
     async def send_message(
-        self, *, chat_id: int, text: str, message_thread_id: int | None = None, **_: object
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        message_thread_id: int | None = None,
+        **_: object,
     ) -> None:
         self.sent.append((chat_id, text, message_thread_id))
 
@@ -116,7 +127,9 @@ class _FakeMessage:
         self.replies: list[str] = []
         self.reply_markups: list[object] = []
 
-    async def reply_text(self, text: str, *, reply_markup: object = None, **_: object) -> None:
+    async def reply_text(
+        self, text: str, *, reply_markup: object = None, **_: object
+    ) -> None:
         self.replies.append(text)
         self.reply_markups.append(reply_markup)
 
@@ -132,7 +145,9 @@ def _button_urls(message: _FakeMessage) -> list[str]:
     return urls
 
 
-def _update_context(bot: _FakeBot, router: Router, message: _FakeMessage, args: list[str]):
+def _update_context(
+    bot: _FakeBot, router: Router, message: _FakeMessage, args: list[str]
+):
     update = SimpleNamespace(message=message)
     context = SimpleNamespace(
         application=SimpleNamespace(bot_data={"router": router}),
@@ -209,7 +224,9 @@ def _session_cmd_env(message: _FakeMessage):
         default_context="balam",
         contexts={
             "balam": ContextConfig(
-                directory="/work/balam", description="Balam", model="anthropic/claude-opus-4-8"
+                directory="/work/balam",
+                description="Balam",
+                model="anthropic/claude-opus-4-8",
             ),
         },
     )
@@ -224,7 +241,9 @@ def _session_cmd_env(message: _FakeMessage):
     return update, context, router, opencode, turns
 
 
-def _sleeping_turn(turns: TurnRegistry, chat_id: int, thread_id: int | None, session_id: str):
+def _sleeping_turn(
+    turns: TurnRegistry, chat_id: int, thread_id: int | None, session_id: str
+):
     """Register a never-finishing turn (a parked task) for a topic; return it."""
     task = asyncio.ensure_future(asyncio.Event().wait())
     turns.register(chat_id, thread_id, task, session_id, "/work/balam")
@@ -235,7 +254,9 @@ async def test_new_opens_a_new_topic_in_the_current_context() -> None:
     # /new mirrors /context <name>, but reuses the current topic's context.
     router = _router()
     bot = _FakeBot(new_thread_id=900)
-    await router.create_topic_session(SUPERGROUP, 5, "scratch", "scratch")  # current topic
+    await router.create_topic_session(
+        SUPERGROUP, 5, "scratch", "scratch"
+    )  # current topic
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, [])
 
@@ -336,7 +357,7 @@ async def test_cancel_aborts_running_turn() -> None:
     assert any("Cancelled" in r for r in message.replies)
 
 
-# --- chat scoping (ADR-0010): the bot acts only in the balamies supergroup -----
+# --- chat scoping (ADR-0010): the bot acts only in the workspace supergroup -----
 
 
 def _config(*, chat_id: int | None) -> SimpleNamespace:
@@ -355,14 +376,18 @@ def _message_handler(app) -> MessageHandler:
 def _command_handler(app) -> CommandHandler:
     # All command handlers share the same `allowed` filter; pick /context's.
     return next(
-        h for h in app.handlers[0] if isinstance(h, CommandHandler) and "context" in h.commands
+        h
+        for h in app.handlers[0]
+        if isinstance(h, CommandHandler) and "context" in h.commands
     )
 
 
 def _text_update(chat_id: int, user_id: int, text: str = "hello") -> Update:
     entities = []
     if text.startswith("/"):
-        entities = [MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text))]
+        entities = [
+            MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text))
+        ]
     message = Message(
         message_id=1,
         date=datetime(2026, 6, 5, tzinfo=UTC),
@@ -410,7 +435,9 @@ def test_command_handler_scoped_rejects_owner_in_other_chat() -> None:
 
 def test_command_handler_scoped_accepts_owner_in_target_chat() -> None:
     handler = _command_handler(_build(SUPERGROUP))
-    assert handler.check_update(_text_update(SUPERGROUP, OWNER, "/context")) is not False
+    assert (
+        handler.check_update(_text_update(SUPERGROUP, OWNER, "/context")) is not False
+    )
 
 
 # --- command registration (setMyCommands) makes /context work in groups -------
@@ -474,8 +501,12 @@ class _FakeQuery:
         self.answers.append(text)
 
 
-def _callback_env(query: _FakeQuery, pending: PendingApprovals, *, chat_id: int | None = None):
-    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id)
+def _callback_env(
+    query: _FakeQuery, pending: PendingApprovals, *, chat_id: int | None = None
+):
+    config = SimpleNamespace(
+        allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id
+    )
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
         application=SimpleNamespace(bot_data={"config": config, "pending": pending})

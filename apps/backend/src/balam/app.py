@@ -18,14 +18,13 @@ from __future__ import annotations
 import logging
 import sys
 
-from telegram.ext import Application
-
 from balam.bot import build_application, register_commands
 from balam.config import ConfigError, load_config
 from balam.contexts import ContextsConfigError, load_contexts
 from balam.opencode import OpenCode
 from balam.router import Router
 from balam.store import SessionStore
+from telegram.ext import Application
 
 logger = logging.getLogger("balam")
 
@@ -58,10 +57,12 @@ def main() -> None:
 
     async def _post_init(application: Application) -> None:
         # Publish slash commands so /context is discoverable and routed to the
-        # bot in the balamies group (clients dispatch group commands by the
+        # bot in the workspace group (clients dispatch group commands by the
         # registered list, not just by delivery).
         await register_commands(application.bot, config.allowed_telegram_chat_id)
-        logger.info("registered bot commands (chat scope %s)", config.allowed_telegram_chat_id)
+        logger.info(
+            "registered bot commands (chat scope %s)", config.allowed_telegram_chat_id
+        )
         logger.info("waiting for OpenCode at %s ...", config.opencode_base_url)
         await opencode.wait_for_ready()
         logger.info("OpenCode is ready.")
