@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from telegram import (
     Bot,
@@ -23,6 +24,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
+    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -340,6 +342,82 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await message.reply_text("\n".join(lines))
 
 
+def _mini_app_url(config: Config, view: str, context_name: str) -> tuple[str, bool]:
+    """Build the Mini App URL for ``view`` bound to ``context_name``.
+
+    Returns ``(url, is_public)``. With a configured HTTPS base, the URL is public
+    and can back a native ``web_app`` button; otherwise it is the local
+    ``127.0.0.1`` address, which Telegram won't open in-app (ADR-0007) but the
+    owner can open in a browser.
+    """
+    base = config.balam_public_url or f"http://127.0.0.1:{config.balam_port}"
+    is_public = config.balam_public_url is not None
+    return f"{base}/?view={view}&context={quote(context_name)}", is_public
+
+
+async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/diff`` — open the Mini App git diff viewer for this topic's context.
+
+    With a public HTTPS base (``BALAM_PUBLIC_URL``) we attach a native ``web_app``
+    button that opens inside Telegram with ``initData`` auth; without one we reply
+    with the local URL to open in a browser, since Telegram requires HTTPS for
+    web_app buttons and the VM is localhost-only (ADR-0007)."""
+    message = update.message
+    if message is None:
+        return
+
+    config: Config = context.application.bot_data["config"]
+    router: Router = context.application.bot_data["router"]
+    ref = TopicRef(
+        chat_id=message.chat_id,
+        thread_id=message.message_thread_id,
+        title=_topic_title(message, message.message_thread_id),
+    )
+    name = router.current_context_name(ref)
+    url, is_public = _mini_app_url(config, "diff", name)
+    is_private = getattr(message.chat, "type", None) == "private"
+
+    # Preferred path: a direct Mini App link (ADR-0013). It opens the app inside
+    # Telegram's webview — with signed initData — in ANY chat type, so it works in
+    # the workspace supergroup where web_app inline buttons are rejected. Needs a
+    # BotFather-registered short name and the bot's username. The start_param
+    # carries view+context as "view__context" (Telegram allows [A-Za-z0-9_-]).
+    shortname = config.balam_miniapp_shortname
+    bot_username = getattr(context.bot, "username", None)
+    if is_public and shortname and bot_username:
+        start_param = f"diff__{name}"
+        link = f"https://t.me/{bot_username}/{shortname}?startapp={quote(start_param)}"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("View changes", url=link)]])
+        await message.reply_text(f"Changes in {name}:", reply_markup=keyboard)
+        return
+
+    if is_public and is_private:
+        # web_app inline buttons open the Mini App inside Telegram's webview (with
+        # initData, ADR-0008) — but Telegram allows them ONLY in private chats.
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("View changes", web_app=WebAppInfo(url=url))]]
+        )
+        await message.reply_text(f"Changes in {name}:", reply_markup=keyboard)
+    elif is_public:
+        # In groups/supergroups a web_app inline button is rejected
+        # (Button_type_invalid). Offer a plain URL button instead; it opens in the
+        # external browser (no initData there), so the Mini App needs the owner's
+        # Telegram session to authenticate — see the note.
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("View changes", url=url)]])
+        await message.reply_text(
+            f"Changes in {name}: {url}\n\n"
+            "Opens in your browser. (Telegram only allows the in-app Mini App button "
+            "in a private chat with the bot.)",
+            reply_markup=keyboard,
+        )
+    else:
+        await message.reply_text(
+            f"Diff viewer for {name}:\n{url}\n\n"
+            "Opens in a browser. To open inside Telegram, serve the Mini App from "
+            "a public HTTPS URL and set BALAM_PUBLIC_URL (ADR-0013)."
+        )
+
+
 async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/cancel`` — abort the turn running in the current topic, if any."""
     message = update.message
@@ -445,6 +523,7 @@ BOT_COMMANDS = [
     BotCommand("status", "Show this topic's context, session, and turn state"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
+    BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
 ]
 
 
@@ -504,6 +583,7 @@ def build_application(
     app.add_handler(CommandHandler("status", _handle_status, filters=allowed))
     app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
+    app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & allowed,
