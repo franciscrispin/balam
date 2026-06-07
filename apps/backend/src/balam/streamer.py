@@ -1,17 +1,21 @@
 """Stream an OpenCode reply into a Telegram topic using native message drafts.
 
-Telegram's ``sendMessageDraft`` streams partial text without flicker (ADR-0010)
-and works inside forum topics when ``message_thread_id`` is passed. This follows
-the proven approach in ~/projects/zog (``src/zog/stream.py``):
+Telegram's ``sendMessageDraft`` streams partial text without flicker (ADR-0010).
+But it is **private-chat only** — its documented ``chat_id`` is "the target private
+chat", and a supergroup/topic is rejected with ``Textdraft_peer_invalid``. So in the
+"workspace" forum supergroup (the live deployment) we fall back to **live-edit
+streaming**: send one real message and edit it in place as the text grows — the
+throttled ``editMessageText`` path ADR-0010 specifies. Approach follows zog
+(``src/zog/stream.py``) and open-shrimp (``stream.py``'s ``_send_live_edit``):
 
   1. Accumulate assistant text as it streams; mark the draft dirty.
-  2. A background loop flushes a draft every ~0.5s via ``send_message_draft``,
-     reusing one ``draft_id`` so Telegram *animates* the updates.
-  3. If a draft call fails, disable drafts and degrade gracefully — the final
-     real message still goes out.
-  4. On turn completion, send the real message(s) via ``send_message``. Both the
-     draft and the final message render GFM as Telegram MarkdownV2 (ADR-0010),
-     split into ≤4096-char chunks.
+  2. A background loop flushes every ~0.5s, reusing one ``draft_id`` so Telegram
+     *animates* native drafts.
+  3. If a draft call fails, switch to live-edit streaming for the rest of the turn
+     (works in groups) instead of going silent.
+  4. On turn completion, send the real message(s). A live-edit message is reused
+     for the first chunk (no duplicate); overflow goes to new messages. Drafts and
+     final messages render GFM as Telegram MarkdownV2 (ADR-0010), ≤4096-char chunks.
 
 The transport-agnostic :class:`DraftSession` is unit-tested with a fake.
 """
@@ -72,17 +76,27 @@ Renderer = Callable[[str], list[str]]
 
 
 class DraftTransport(Protocol):
-    """Where draft previews and final messages land."""
+    """Where draft previews and final messages land.
+
+    ``send_message`` returns the new message's id (or ``None``) so the live-edit
+    fallback can keep editing it; ``edit_message`` updates a message in place.
+    """
 
     async def send_draft(self, draft_id: int, text: str) -> None: ...
-    async def send_message(self, text: str) -> None: ...
+    async def send_message(self, text: str) -> int | None: ...
+    async def edit_message(self, message_id: int, text: str) -> None: ...
 
 
 class DraftSession:
     """Tracks the in-progress draft for one streamed reply: accumulates text,
     flushes it as an animated draft, and finalizes into real message(s).
 
-    Mirrors zog's ``_DraftState`` + ``_flush_draft`` + finalize flow.
+    Mirrors zog's ``_DraftState`` + ``_flush_draft`` + finalize flow. Native
+    ``sendMessageDraft`` only works in **private chats** (Telegram rejects it
+    elsewhere with ``Textdraft_peer_invalid``); in a forum supergroup the first
+    draft fails, so we fall back to **live-edit streaming** — send one real
+    message and keep editing it in place — exactly the throttled ``editMessageText``
+    fallback ADR-0010 calls for (ported from open-shrimp's ``_send_live_edit``).
     """
 
     def __init__(
@@ -98,7 +112,12 @@ class DraftSession:
         self._render = render
         self._raw = ""
         self._dirty = False
+        # Native drafts disabled (unsupported chat type) → use live-edit instead.
         self._disabled = False
+        # The live-edit message reused across flushes and at finalize, and the
+        # last text pushed to it (so an unchanged render is not re-sent).
+        self._live_edit_message_id: int | None = None
+        self._live_edit_last: str | None = None
 
     @property
     def text(self) -> str:
@@ -115,13 +134,16 @@ class DraftSession:
             self._dirty = True
 
     async def flush_draft(self) -> None:
-        """Flush the current text as a draft preview, if dirty and not disabled.
+        """Flush the current text as a streaming preview, if dirty.
 
-        Only the first chunk is previewed (full content is split at finalize). A
-        failed draft call disables further previews — it never tears down the
-        stream.
+        Uses native ``sendMessageDraft`` until it fails (e.g. a group chat, which
+        Telegram refuses), then switches permanently to live-edit streaming. Only
+        the first chunk is previewed; the full content is split at finalize.
         """
-        if self._disabled or not self._dirty:
+        if not self._dirty:
+            return
+        if self._disabled:
+            await self._flush_live_edit()
             return
         chunks = self._render(self._raw)
         if not chunks:
@@ -130,16 +152,54 @@ class DraftSession:
             await self._transport.send_draft(self._draft_id, chunks[0])
             self._dirty = False
         except Exception:
-            logger.debug("send_message_draft failed; disabling drafts", exc_info=True)
+            # Native drafts aren't available for this chat (a supergroup/topic
+            # raises Textdraft_peer_invalid) — switch to live-edit and flush it
+            # now so the user doesn't wait for the next tick. Expected in groups,
+            # so log without the traceback.
+            logger.info("draft streaming unavailable; switching to live-edit streaming")
             self._disabled = True
+            await self._flush_live_edit()
+
+    async def _flush_live_edit(self) -> None:
+        """Live-edit fallback: send one message, then edit it in place as text
+        grows. Defers while the text overflows one chunk (handled at finalize)."""
+        if not self._dirty:
+            return
+        chunks = self._render(self._raw)
+        if not chunks or len(chunks) > 1:
+            return
+        text = chunks[0]
+        if text == self._live_edit_last:
+            self._dirty = False
+            return
+        try:
+            if self._live_edit_message_id is None:
+                self._live_edit_message_id = await self._transport.send_message(text)
+            else:
+                await self._transport.edit_message(self._live_edit_message_id, text)
+            self._live_edit_last = text
+            self._dirty = False
+        except Exception:
+            logger.debug("live-edit flush failed", exc_info=True)
 
     async def finalize(
         self, fallback: str = "(the agent finished without producing any text)"
     ) -> None:
-        """Send the accumulated text as real message(s), split at the char cap."""
+        """Send the accumulated text as real message(s), split at the char cap.
+
+        If a live-edit message exists, its first chunk is delivered by editing
+        that message in place (no duplicate of the streamed bubble); any overflow
+        chunks are sent as new messages.
+        """
         text = self._raw if self._raw.strip() else fallback
-        for chunk in self._render(text):
-            await self._transport.send_message(chunk)
+        for i, chunk in enumerate(self._render(text)):
+            if i == 0 and self._live_edit_message_id is not None:
+                # Skip the edit when the streamed bubble already shows this text —
+                # Telegram would otherwise 400 with "message is not modified".
+                if chunk != self._live_edit_last:
+                    await self._transport.edit_message(self._live_edit_message_id, chunk)
+            else:
+                await self._transport.send_message(chunk)
 
 
 def _describe_error(error: Any) -> str:
@@ -348,15 +408,36 @@ def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTrans
                 **topic_kwargs,
             )
 
-        async def send_message(self, text: str) -> None:
+        async def send_message(self, text: str) -> int | None:
             try:
-                await bot.send_message(
+                msg = await bot.send_message(
                     chat_id=chat_id, text=text, parse_mode="MarkdownV2", **topic_kwargs
                 )
             except Exception:
                 # Malformed MarkdownV2 → resend without formatting rather than drop.
                 logger.debug("MarkdownV2 send failed; falling back to plain text", exc_info=True)
-                await bot.send_message(chat_id=chat_id, text=text, **topic_kwargs)
+                msg = await bot.send_message(chat_id=chat_id, text=text, **topic_kwargs)
+            return getattr(msg, "message_id", None)
+
+        async def edit_message(self, message_id: int, text: str) -> None:
+            # edit_message_text addresses the message by id within the chat, so no
+            # thread kwargs. "message is not modified" is benign (identical render).
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="MarkdownV2",
+                )
+            except Exception as exc:
+                if "not modified" in str(exc).lower():
+                    return
+                logger.debug("MarkdownV2 edit failed; falling back to plain text", exc_info=True)
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+                except Exception as exc2:
+                    if "not modified" not in str(exc2).lower():
+                        raise
 
     return _Transport()
 

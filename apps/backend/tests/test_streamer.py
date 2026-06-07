@@ -1,24 +1,36 @@
 import asyncio
+from types import SimpleNamespace
 
 from balam.approvals import Choice, PendingApprovals
 from balam.attachments import PromptFile
-from balam.streamer import DraftSession, stream_reply
+from balam.streamer import DraftSession, _make_transport, stream_reply
 
 
 class FakeTransport:
-    """Records draft/message calls; can simulate draft failures."""
+    """Records draft/message/edit calls; can simulate draft failures.
+
+    ``send_message`` hands back an incrementing id so the live-edit fallback has a
+    message to edit, mirroring the real transport.
+    """
 
     def __init__(self, *, fail_drafts: bool = False) -> None:
         self.fail_drafts = fail_drafts
         self.ops: list[tuple[str, int | None, str]] = []
+        self._next_id = 100
 
     async def send_draft(self, draft_id: int, text: str) -> None:
         if self.fail_drafts:
-            raise RuntimeError("drafts unavailable")
+            raise RuntimeError("Textdraft_peer_invalid")
         self.ops.append(("draft", draft_id, text))
 
-    async def send_message(self, text: str) -> None:
+    async def send_message(self, text: str) -> int | None:
         self.ops.append(("message", None, text))
+        mid = self._next_id
+        self._next_id += 1
+        return mid
+
+    async def edit_message(self, message_id: int, text: str) -> None:
+        self.ops.append(("edit", message_id, text))
 
 
 # Identity-ish renderer so DraftSession tests are independent of markdown.
@@ -57,15 +69,80 @@ async def test_set_text_to_same_value_does_not_redirty() -> None:
     assert t.ops == [("draft", 1, "same")]
 
 
-async def test_failing_draft_disables_drafts() -> None:
+async def test_failing_draft_falls_back_to_live_edit_streaming() -> None:
+    # A group chat rejects sendMessageDraft → switch to live-edit: send one
+    # message, then edit it in place as the text grows (no silent gap).
     t = FakeTransport(fail_drafts=True)
     session = DraftSession(t, draft_id=7, render=_identity)
+
     session.set_text("hi")
-    await session.flush_draft()
+    await session.flush_draft()  # draft fails → send the live-edit message now
     assert session.drafts_disabled is True
+
     session.set_text("hi there")
-    await session.flush_draft()  # disabled → no-op
-    assert t.ops == []
+    await session.flush_draft()  # edits the same message in place
+    session.set_text("hi there friend")
+    await session.flush_draft()
+
+    assert t.ops == [
+        ("message", None, "hi"),
+        ("edit", 100, "hi there"),
+        ("edit", 100, "hi there friend"),
+    ]
+
+
+async def test_live_edit_skips_unchanged_render() -> None:
+    # Different raw text that renders identically must not trigger a redundant edit.
+    def collapse(text: str) -> list[str]:
+        return [text.strip()] if text.strip() else []
+
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=collapse)
+    session.set_text("hi")
+    await session.flush_draft()  # sends ("message", 100, "hi")
+    session.set_text("hi ")  # dirty, but renders to "hi" → no redundant edit
+    await session.flush_draft()
+    assert t.ops == [("message", None, "hi")]
+
+
+async def test_finalize_reuses_live_edit_message_for_first_chunk() -> None:
+    # After live-edit streaming, finalize edits the streamed bubble (no duplicate)
+    # and sends overflow chunks as new messages.
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_chunk5)
+    session.set_text("abc")  # one chunk → starts live-edit, shows "abc"
+    await session.flush_draft()
+    assert t.ops == [("message", None, "abc")]
+
+    session.set_text("abcdefgh")  # final text, now two chunks
+    await session.finalize()
+    # first chunk edits the existing bubble (text changed); overflow is a new message.
+    assert t.ops == [
+        ("message", None, "abc"),
+        ("edit", 100, "abcde"),
+        ("message", None, "fgh"),
+    ]
+
+
+async def test_finalize_skips_redundant_edit_when_unchanged() -> None:
+    # If the streamed bubble already shows the final first chunk, finalize must not
+    # re-edit it (Telegram 400 "message is not modified").
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_identity)
+    session.set_text("done")
+    await session.flush_draft()  # live-edit message shows "done"
+    await session.finalize()  # same text → no edit
+    assert t.ops == [("message", None, "done")]
+
+
+async def test_live_edit_defers_while_text_overflows_one_chunk() -> None:
+    # While streaming text spans >1 chunk, live-edit holds off (finalize handles
+    # the split) rather than thrashing the single edited message.
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_chunk5)
+    session.set_text("abcdefghij")  # two chunks immediately
+    await session.flush_draft()
+    assert t.ops == []  # nothing streamed yet
 
 
 async def test_finalize_sends_real_message() -> None:
@@ -89,6 +166,59 @@ async def test_finalize_emits_fallback_when_no_text() -> None:
     session = DraftSession(t, draft_id=1, render=_identity)
     await session.finalize("(nothing)")
     assert t.ops == [("message", None, "(nothing)")]
+
+
+# --- the real transport wiring (_make_transport) ------------------------------
+
+
+class _RecordBot:
+    """A bot stub recording PTB calls; can simulate MarkdownV2 parse failures."""
+
+    def __init__(self, *, fail_markdown: bool = False) -> None:
+        self.fail_markdown = fail_markdown
+        self.calls: list[tuple] = []
+        self._id = 500
+
+    async def send_message_draft(self, **kwargs: object) -> None:
+        self.calls.append(("draft", kwargs))
+
+    async def send_message(self, *, chat_id: int, text: str, **kwargs: object):
+        if self.fail_markdown and kwargs.get("parse_mode") == "MarkdownV2":
+            raise RuntimeError("can't parse entities")
+        self.calls.append(("send", text, kwargs.get("parse_mode")))
+        self._id += 1
+        return SimpleNamespace(message_id=self._id)
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, text: str, **kwargs: object
+    ) -> None:
+        if self.fail_markdown and kwargs.get("parse_mode") == "MarkdownV2":
+            raise RuntimeError("can't parse entities")
+        self.calls.append(("edit", message_id, text, kwargs.get("parse_mode")))
+
+
+async def test_transport_send_returns_id_and_edit_wires_through() -> None:
+    bot = _RecordBot()
+    transport = _make_transport(bot, chat_id=1, thread_id=7)
+
+    mid = await transport.send_message("hello")
+    assert mid == 501  # the live-edit fallback needs the real message id back
+
+    await transport.edit_message(mid, "hello world")
+    assert ("edit", 501, "hello world", "MarkdownV2") in bot.calls
+
+
+async def test_transport_edit_falls_back_to_plain_text_on_markdown_error() -> None:
+    bot = _RecordBot(fail_markdown=True)
+    transport = _make_transport(bot, chat_id=1, thread_id=None)
+
+    # send: MarkdownV2 raises → retried as plain text (parse_mode None).
+    await transport.send_message("x")
+    assert any(c[0] == "send" and c[2] is None for c in bot.calls)
+
+    # edit: MarkdownV2 raises → retried as plain text rather than dropping.
+    await transport.edit_message(777, "y")
+    assert any(c[0] == "edit" and c[1] == 777 and c[3] is None for c in bot.calls)
 
 
 # --- stream_reply event-loop regression tests ---------------------------------
