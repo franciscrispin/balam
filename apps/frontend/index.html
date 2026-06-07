@@ -2,8 +2,36 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Balam is fixed-light; ignore the chat's color scheme (see docs/design-system.md). -->
+    <meta name="color-scheme" content="light" />
     <title>Balam</title>
+    <!-- Telegram Mini App SDK: provides window.Telegram.WebApp (ready/expand/start_param). -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <!-- Self-hosted fonts, preloaded to avoid FOUT (files under public/fonts). -->
+    <link
+      rel="preload"
+      href="/fonts/source-serif-4-variable.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      href="/fonts/hanken-grotesk-variable.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      href="/fonts/jetbrains-mono-variable.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <!-- TODO(noVNC, ADR-0006): the CSP frame-src for the noVNC origin is set on the
+         backend's response headers when FastAPI serves this build. -->
   </head>
   <body>
     <div id="root"></div>

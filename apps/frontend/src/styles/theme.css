@@ -1,0 +1,202 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+ * Fonts — self-hosted variable woff2 (offline-first; see docs/design-system.md
+ * §8). Files live under apps/frontend/public/fonts.
+ * ------------------------------------------------------------------------- */
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("/fonts/source-serif-4-variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Hanken Grotesk";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("/fonts/hanken-grotesk-variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono-variable.woff2") format("woff2");
+}
+
+/* ---------------------------------------------------------------------------
+ * Design tokens — the fixed claude.ai light palette. Components read these via
+ * the @theme inline mapping below; never hardcode hex.
+ * ------------------------------------------------------------------------- */
+:root {
+  /* Neutrals & roles (light) */
+  --background: #faf9f5;
+  --card: #ffffff;
+  --muted: #f0eee6;
+  --foreground: #1a1a18;
+  --muted-foreground: #6b6961;
+  --border: #e7e4d8;
+  --primary: #cc785c;
+  --primary-foreground: #ffffff;
+  --ring: #cc785c;
+  --destructive: #b3322a;
+  --destructive-foreground: #ffffff;
+
+  /* Brand anchors */
+  --clay: #cc785c;
+  --clay-hover: #b8634a;
+  --kraft: #d4a27f;
+  --manilla: #ebdbbc;
+
+  /* Semantic — diff + status (desaturated to read on paper) */
+  --diff-added-bg: #e9f3ec;
+  --diff-added-fg: #1f7a3d;
+  --diff-removed-bg: #fbeae9;
+  --diff-removed-fg: #b3322a;
+  --diff-added-gutter: #cdebd6;
+  --diff-removed-gutter: #f6d4d1;
+  --warning-bg: #fff3df;
+  --warning-fg: #9a6a00;
+
+  /* Radius */
+  --radius: 0.625rem;
+
+  /* Elevation — soft, warm, low; never hard black */
+  --shadow-sm: 0 1px 2px rgba(40, 35, 25, 0.06);
+  --shadow-md: 0 4px 16px rgba(40, 35, 25, 0.08);
+  --shadow-lg: 0 12px 32px rgba(40, 35, 25, 0.12);
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur-fast: 150ms;
+  --dur-base: 220ms;
+  --dur-slow: 320ms;
+
+  /* Type */
+  --font-serif: "Source Serif 4", Georgia, serif;
+  --font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+}
+
+/* Map tokens to Tailwind v4 utilities (bg-background, text-primary,
+ * bg-diff-added, font-serif, rounded-lg, shadow-md, …). */
+@theme inline {
+  --color-background: var(--background);
+  --color-card: var(--card);
+  --color-card-foreground: var(--foreground);
+  --color-popover: var(--card);
+  --color-popover-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-foreground: var(--foreground);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--muted);
+  --color-secondary-foreground: var(--foreground);
+  --color-accent: var(--muted);
+  --color-accent-foreground: var(--foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-ring: var(--ring);
+
+  --color-clay: var(--clay);
+  --color-clay-hover: var(--clay-hover);
+  --color-kraft: var(--kraft);
+  --color-manilla: var(--manilla);
+
+  --color-diff-added: var(--diff-added-bg);
+  --color-diff-added-fg: var(--diff-added-fg);
+  --color-diff-removed: var(--diff-removed-bg);
+  --color-diff-removed-fg: var(--diff-removed-fg);
+  --color-diff-added-gutter: var(--diff-added-gutter);
+  --color-diff-removed-gutter: var(--diff-removed-gutter);
+  --color-warning: var(--warning-bg);
+  --color-warning-fg: var(--warning-fg);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+
+  --ease-brand: var(--ease);
+
+  --font-serif: var(--font-serif);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+/* ---------------------------------------------------------------------------
+ * Base — paper canvas, calm type, always-visible focus, mount animation.
+ * ------------------------------------------------------------------------- */
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 26px;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  /* Page content does a single 8px rise + fade on mount (design-system §5). */
+  @keyframes balam-rise {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .balam-rise {
+    animation: balam-rise var(--dur-slow) var(--ease) both;
+  }
+
+  /* Quiet pulsing clay dot for streaming/connecting states (not a spinner). */
+  @keyframes balam-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  .balam-pulse {
+    animation: balam-pulse 1.4s var(--ease) infinite;
+  }
+}
+
+/* Motion is feedback, not flair — respect the user's preference. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
