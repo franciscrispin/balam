@@ -31,6 +31,8 @@ from typing import Any
 
 import httpx
 
+from balam.opencode_tools import Permission
+
 logger = logging.getLogger(__name__)
 
 #: Fallback permission ruleset for sessions created without an explicit one: makes
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 #: reference.
 ASK_ALL_PERMISSIONS: list[dict[str, str]] = [
     {"permission": "*", "pattern": "*", "action": "ask"},
-    {"permission": "todowrite", "pattern": "*", "action": "allow"},
+    {"permission": Permission.TODOWRITE, "pattern": "*", "action": "allow"},
 ]
 
 

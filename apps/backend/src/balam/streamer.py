@@ -37,6 +37,7 @@ from balam.approvals import (
 )
 from balam.markdown import gfm_to_telegram
 from balam.opencode import OpenCode
+from balam.opencode_tools import Tool
 from balam.telegram_utils import thread_kwargs
 
 logger = logging.getLogger(__name__)
@@ -52,18 +53,18 @@ BASH_OUTPUT_MAX_CHARS = 1500
 #: OpenCode's lowercase wire tool names → a friendly display label. Unknown
 #: names (e.g. MCP tools) fall through unchanged.
 _TOOL_DISPLAY: dict[str, str] = {
-    "bash": "Bash",
-    "read": "Read",
-    "edit": "Edit",
-    "write": "Write",
-    "glob": "Glob",
-    "grep": "Grep",
-    "list": "LS",
-    "webfetch": "WebFetch",
-    "apply_patch": "ApplyPatch",
-    "todowrite": "TodoWrite",
-    "task": "Task",
-    "agent": "Agent",
+    Tool.BASH: "Bash",
+    Tool.READ: "Read",
+    Tool.EDIT: "Edit",
+    Tool.WRITE: "Write",
+    Tool.GLOB: "Glob",
+    Tool.GREP: "Grep",
+    Tool.LIST: "LS",
+    Tool.WEBFETCH: "WebFetch",
+    Tool.APPLY_PATCH: "ApplyPatch",
+    Tool.TODOWRITE: "TodoWrite",
+    Tool.TASK: "Task",
+    Tool.AGENT: "Agent",
 }
 
 Renderer = Callable[[str], list[str]]
@@ -211,24 +212,24 @@ def _apply_patch_files(patch_text: str) -> list[str]:
 
 def _tool_summary(tool: str, tool_input: dict[str, Any], directory: str | None) -> str:
     """A one-line argument summary for a tool call (paths shown workspace-relative)."""
-    if tool in ("read", "edit", "write"):
+    if tool in (Tool.READ, Tool.EDIT, Tool.WRITE):
         return _relpath(tool_input.get("filePath", ""), directory)
-    if tool == "list":
+    if tool == Tool.LIST:
         return _relpath(tool_input.get("path", ""), directory)
-    if tool == "glob":
+    if tool == Tool.GLOB:
         return tool_input.get("pattern", "")
-    if tool == "grep":
+    if tool == Tool.GREP:
         pattern = tool_input.get("pattern", "")
         path = tool_input.get("path", "")
         return f"{pattern} in {_relpath(path, directory)}" if path else pattern
-    if tool == "apply_patch":
+    if tool == Tool.APPLY_PATCH:
         # The raw patchText envelope is huge and breaks MarkdownV2; show the files
         # it touches instead (parsed from the envelope headers).
         paths = _apply_patch_files(tool_input.get("patchText", ""))
         return ", ".join(_relpath(p, directory) for p in paths)
-    if tool == "webfetch":
+    if tool == Tool.WEBFETCH:
         return tool_input.get("url", "")
-    if tool in ("task", "agent"):
+    if tool in (Tool.TASK, Tool.AGENT):
         return tool_input.get("description", "") or tool_input.get("subagent_type", "")
     # Generic: first string-valued argument, capped.
     for value in tool_input.values():
@@ -274,7 +275,7 @@ def _render_tool_part(
     fenced blocks; everything else is a one-liner like ``🔧 Read src/foo.py``.
     """
     status = state.get("status")
-    if tool == "bash":
+    if tool == Tool.BASH:
         command = tool_input.get("command", "")
         line = "🔧 Bash"
         if command:
@@ -304,7 +305,7 @@ def _format_approval_request(tool: str, tool_input: dict[str, Any], directory: s
     """
     display = _TOOL_DISPLAY.get(tool, tool)
     header = f"🔐 Allow **{display}**?"
-    if tool == "bash":
+    if tool == Tool.BASH:
         command = tool_input.get("command", "")
         return f"{header}\n```\n{command}\n```" if command else header
     summary = _tool_summary(tool, tool_input, directory)

@@ -32,21 +32,24 @@ from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import Any
 
+from balam.opencode_tools import Permission
+
 #: We classify a permission request by OpenCode's own **permission category** (the
 #: ``permission`` field on the ``permission.asked`` event), *not* by tool name.
 #: This is the authoritative axis: OpenCode maps every tool to one of these
-#: categories, and crucially the ``edit`` category covers *all* file mutations —
-#: the ``edit`` and ``write`` tools and the multi-file ``apply_patch`` — so we
-#: can't miss a mutating tool the way a hand-maintained tool-name set does
-#: (verified live; see ``docs/balam-tier1-implementation-plan.md``). Categories
-#: come from OpenCode's docs: read, edit, glob, grep, bash, task, skill, lsp,
-#: question, webfetch, websearch, external_directory, doom_loop.
+#: categories (see :class:`balam.opencode_tools.Permission`), and crucially the
+#: ``edit`` category covers *all* file mutations — the ``edit`` and ``write``
+#: tools and the multi-file ``apply_patch`` — so we can't miss a mutating tool the
+#: way a hand-maintained tool-name set does (verified live; see
+#: ``docs/balam-tier1-implementation-plan.md``).
 
 #: The single category covering edit/write/apply_patch — offers "accept all edits".
-EDIT_CATEGORY = "edit"
+EDIT_CATEGORY = Permission.EDIT
 
 #: Read-only categories Balam auto-allows inside the workspace.
-READ_CATEGORIES = frozenset({"read", "glob", "grep", "list", "lsp"})
+READ_CATEGORIES = frozenset(
+    {Permission.READ, Permission.GLOB, Permission.GREP, Permission.LIST, Permission.LSP}
+)
 
 
 def is_edit(category: str) -> bool:

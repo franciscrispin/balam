@@ -34,21 +34,23 @@ whole filesystem; out-of-workspace writes still prompt.
 from __future__ import annotations
 
 from balam.contexts import ContextConfig
+from balam.opencode_tools import Permission, Tool
 
 #: Internal bookkeeping tools that are never user-visible and always allowed, so
 #: they don't generate approval noise. Kept deliberately minimal (matches the
 #: legacy ``ASK_ALL_PERMISSIONS`` baseline).
-ALWAYS_ALLOWED_PERMS: tuple[str, ...] = ("todowrite",)
+ALWAYS_ALLOWED_PERMS: tuple[Permission, ...] = (Permission.TODOWRITE,)
 
 #: ``allowed_tools`` names that mean "let the model edit files". OpenCode folds
-#: edit/write/apply_patch into one ``edit`` permission category, so we normalize
-#: them all to that.
-EDIT_PERMISSION = "edit"
-MUTATING_INPUT_NAMES = frozenset({"edit", "write", "apply_patch"})
+#: the edit/write/apply_patch *tools* into one ``edit`` *permission* category, so
+#: we normalize them all to that.
+MUTATING_INPUT_NAMES = frozenset({Tool.EDIT, Tool.WRITE, Tool.APPLY_PATCH})
 
 #: Categories whose pattern is a filesystem path (leading slash stripped, ``**``
 #: glob). A bare entry for one of these is scoped to the workspace directories.
-FILE_PATH_CATEGORIES = frozenset({"read", "edit", "glob", "grep", "list"})
+FILE_PATH_CATEGORIES = frozenset(
+    {Permission.READ, Permission.EDIT, Permission.GLOB, Permission.GREP, Permission.LIST}
+)
 
 
 def _strip_leading_slash(path: str) -> str:
@@ -92,7 +94,8 @@ def parse_allowed_tool(entry: str) -> tuple[str | None, str | None]:
 
 
 def _allow(permission: str, pattern: str) -> dict[str, str]:
-    return {"permission": permission, "pattern": pattern, "action": "allow"}
+    # str() so an enum member serializes as a plain string in the wire payload.
+    return {"permission": str(permission), "pattern": pattern, "action": "allow"}
 
 
 def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
@@ -114,7 +117,7 @@ def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
         if permission is None:
             continue
         if permission in MUTATING_INPUT_NAMES:
-            permission = EDIT_PERMISSION
+            permission = Permission.EDIT
         if permission in FILE_PATH_CATEGORIES:
             if pattern is None:
                 # Scope to the workspace (and any additional dirs), not the whole FS.
@@ -130,6 +133,6 @@ def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
     # external_directory gate doesn't prompt for them; the read/edit within them
     # is still bounded locally (allowed_dirs in :mod:`balam.approvals`).
     for directory in ctx.additional_directories:
-        rules.append(_allow("external_directory", _external_directory_pattern(directory)))
+        rules.append(_allow(Permission.EXTERNAL_DIRECTORY, _external_directory_pattern(directory)))
 
     return rules
