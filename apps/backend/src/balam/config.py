@@ -55,12 +55,27 @@ class Config(BaseSettings):
     # --- Balam backend ---
     balam_db_path: str | None = None
     balam_config_path: str | None = None
+    # Port the FastAPI Mini App server listens on (Mini App + API), bound to
+    # 127.0.0.1 (ADR-0007). Mirrors BALAM_PORT in .env.example.
+    balam_port: int = 3000
+    # Public HTTPS base URL the Mini App is reachable at (e.g. a tunnel). When
+    # set, /diff offers a native in-Telegram ``web_app`` button (Telegram requires
+    # HTTPS); unset → /diff replies with the local 127.0.0.1 URL to open in a
+    # browser (ADR-0007: no public URL by default). No trailing slash.
+    balam_public_url: str | None = None
+    # BotFather Mini App short name (ADR-0013). When set, /diff sends a direct
+    # Mini App link ``t.me/<bot>/<shortname>?startapp=…`` that opens the app inside
+    # Telegram's webview in ANY chat type (groups included) — unlike a ``web_app``
+    # inline button, which Telegram permits only in private chats.
+    balam_miniapp_shortname: str | None = None
 
     @field_validator(
         "opencode_server_password",
         "balam_db_path",
         "balam_config_path",
         "allowed_telegram_chat_id",
+        "balam_public_url",
+        "balam_miniapp_shortname",
         mode="before",
     )
     @classmethod
