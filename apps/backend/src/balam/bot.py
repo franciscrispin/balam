@@ -255,19 +255,28 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _open_context_topic(message, context.bot, router, name)
 
 
-def _abort_turn(turn: Any, opencode: OpenCode) -> asyncio.Task[None] | None:
+def _abort_turn(
+    turn: Any, opencode: OpenCode, tasks: set[asyncio.Task[None]]
+) -> asyncio.Task[None] | None:
     """Cancel a running turn locally and abort it server-side (best-effort).
 
     Cancelling the local task stops streaming; the abort tells OpenCode to stop
-    generating. Returns the abort task (fire-and-forget) so callers needn't await
-    the round-trip before replying. ``None`` when there is no turn.
+    generating. The abort runs as a background task so callers needn't await the
+    round-trip before replying — but it is anchored in ``tasks`` (with a done
+    callback that removes it) because the event loop keeps only a *weak*
+    reference to a bare task: an unanchored one can be garbage-collected
+    mid-flight, dropping the abort and leaving OpenCode generating. ``None`` when
+    there is no turn.
     """
     if turn is None:
         return None
     turn.task.cancel()
-    return asyncio.create_task(
+    task = asyncio.create_task(
         opencode.abort_session(turn.session_id, directory=turn.directory)
     )
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
 
 
 async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -347,7 +356,10 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("No running turn.")
         return
 
-    _abort_turn(turn, opencode)
+    tasks: set[asyncio.Task[None]] = context.application.bot_data.setdefault(
+        "background_tasks", set()
+    )
+    _abort_turn(turn, opencode, tasks)
     await message.reply_text("🛑 Cancelled.")
 
 
@@ -481,6 +493,9 @@ def build_application(
     app.bot_data["turns"] = TurnRegistry()
     # Outstanding tool-approval prompts + per-session "accept all edits" state.
     app.bot_data["pending"] = PendingApprovals()
+    # Anchors fire-and-forget background tasks (e.g. /cancel's server-side abort)
+    # so the loop's weak task references can't let them be GC'd mid-flight.
+    app.bot_data["background_tasks"] = set()
 
     # Trust boundary (ADR-0008): filters.User gates by sender id, so only the
     # owner's messages reach the handlers; everyone else is dropped silently.
