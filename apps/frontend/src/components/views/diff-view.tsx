@@ -1,33 +1,66 @@
 import type { DiffHunk } from "@balam/shared";
+import { useCallback, useEffect, useState } from "react";
+import { useLaunchContext } from "@/components/launch-context";
 import { EmptyState } from "@/components/states/empty-state";
+import { ErrorState } from "@/components/states/error-state";
+import { LoadingState } from "@/components/states/loading-state";
+import { ApiError, getDiff } from "@/lib/api";
 import { HunkCard } from "./hunk-card";
 
-// Sample hunk — the real viewer will fetch structured hunks from the backend
-// (deferred). This drives the real Shiki pipeline to prove the surface.
-const SAMPLE_HUNK: DiffHunk = {
-  id: "sample-1",
-  file_path: "apps/backend/src/balam/streamer.ts",
-  language: "typescript",
-  is_binary: false,
-  is_empty: false,
-  hunk_header: "@@ -12,6 +12,8 @@",
-  lines: [
-    { type: "context", old_no: 12, new_no: 12, content: "export function draft(text: string) {" },
-    { type: "context", old_no: 13, new_no: 13, content: "  const trimmed = text.trim();" },
-    { type: "delete", old_no: 14, new_no: null, content: "  return trimmed;" },
-    { type: "add", old_no: null, new_no: 14, content: "  if (!trimmed) return null;" },
-    { type: "add", old_no: null, new_no: 15, content: "  return trimmed.slice(0, MAX_LEN);" },
-    { type: "context", old_no: 15, new_no: 16, content: "}" },
-  ],
-};
+type State =
+  | { status: "loading" }
+  | { status: "ready"; hunks: DiffHunk[] }
+  | { status: "error"; message: string; recoverable: boolean };
 
 export default function DiffView() {
-  return (
-    <div className="space-y-6">
-      <HunkCard hunk={SAMPLE_HUNK} />
+  const { context } = useLaunchContext();
+  const [state, setState] = useState<State>({ status: "loading" });
+
+  // Returns a cancel cleanup so the effect drops a stale response on unmount /
+  // context change; Retry re-invokes it directly.
+  const load = useCallback(() => {
+    let cancelled = false;
+    setState({ status: "loading" });
+    getDiff(context)
+      .then((res) => {
+        if (!cancelled) setState({ status: "ready", hunks: res.hunks });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // Auth failures are unrecoverable here (no Retry, per design-system §7) —
+        // re-fetching won't fix a bad/absent Mini App session.
+        const isAuth = err instanceof ApiError && err.isAuth;
+        setState({
+          status: "error",
+          message: isAuth ? "Couldn't verify this Mini App session." : "Couldn't load changes.",
+          recoverable: !isAuth,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [context]);
+
+  useEffect(load, [load]);
+
+  if (state.status === "loading") {
+    return <LoadingState />;
+  }
+  if (state.status === "error") {
+    return <ErrorState message={state.message} onRetry={state.recoverable ? load : undefined} />;
+  }
+  if (state.hunks.length === 0) {
+    return (
       <section className="rounded-lg border border-dashed">
         <EmptyState message="No changes yet." />
       </section>
+    );
+  }
+  return (
+    <div className="space-y-6">
+      {state.hunks.map((hunk) => (
+        <HunkCard key={hunk.id} hunk={hunk} />
+      ))}
     </div>
   );
 }

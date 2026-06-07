@@ -1,36 +1,24 @@
 /**
  * Types shared by the Balam backend and the Mini App.
  *
- * Real shared models (the Mini App API contract) will be generated from the
- * backend's FastAPI OpenAPI schema later (ADR-0003). For now this holds the
- * diff-hunk contract — mirroring the structured hunk format the backend will
- * emit for the diff viewer — plus a placeholder used to prove workspace wiring.
+ * The Mini App API contract is generated from the backend's FastAPI OpenAPI
+ * schema (ADR-0003) — `./api.ts` is produced by the root `gen:api` script and is
+ * the single source of truth. This module re-exports the handful of generated
+ * models the frontend consumes under stable names, so call sites import from
+ * `@balam/shared` and never touch the generated `components[...]` shape directly.
  */
-export interface AppInfo {
-  name: string;
-  version: string;
-}
+import type { components } from "./api";
+
+export type { components, operations, paths } from "./api";
+
+/** Identity of the running backend (`GET /api/app-info`). */
+export type AppInfo = components["schemas"]["AppInfo"];
 
 /** A single line within a diff hunk. `old_no`/`new_no` are null where absent. */
-export interface HunkLine {
-  type: "context" | "add" | "delete";
-  old_no: number | null;
-  new_no: number | null;
-  content: string;
-}
+export type HunkLine = components["schemas"]["HunkLine"];
 
-/**
- * One contiguous hunk of a file's diff. The backend supplies these
- * pre-parsed; the frontend only renders + syntax-highlights them.
- */
-export interface DiffHunk {
-  id: string;
-  file_path: string;
-  /** Language id for syntax highlighting (e.g. "typescript", "python"). */
-  language: string;
-  is_binary: boolean;
-  is_empty: boolean;
-  /** The `@@ -a,b +c,d @@` header line. */
-  hunk_header: string;
-  lines: HunkLine[];
-}
+/** One contiguous hunk of a file's diff, pre-parsed + ready to highlight. */
+export type DiffHunk = components["schemas"]["DiffHunk"];
+
+/** The working-tree diff of a context (`GET /api/diff`). */
+export type DiffResponse = components["schemas"]["DiffResponse"];

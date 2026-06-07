@@ -13,8 +13,8 @@ export default defineConfig({
   server: {
     port: 5180,
     strictPort: true,
-    // Deferred (frontend-only slice). Uncomment once the FastAPI backend serves
-    // the Mini App API on BALAM_PORT (3000):
-    // proxy: { "/api": "http://127.0.0.1:3000" },
+    // Proxy the Mini App API to the FastAPI backend (BALAM_PORT) so `bun run dev`
+    // (5180) and the served build hit the same relative `/api/*` paths.
+    proxy: { "/api": "http://127.0.0.1:3000" },
   },
 });

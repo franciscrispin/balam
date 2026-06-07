@@ -1,10 +1,11 @@
 import { useMemo } from "react";
 import { AppShell } from "@/components/app-shell/app-shell";
+import { resolveLaunch } from "@/lib/launch";
 import { initTelegram } from "@/lib/telegram";
-import { resolveView } from "@/lib/views";
 
 export function App() {
-  // Init Telegram once and pick the initial view from the deep-link start_param.
-  const initialView = useMemo(() => resolveView(initTelegram().startParam), []);
-  return <AppShell initialView={initialView} />;
+  // Init Telegram once and resolve the launch: initial view + workspace context
+  // from the deep link (query params, with start_param as a fallback).
+  const launch = useMemo(() => resolveLaunch(initTelegram().startParam), []);
+  return <AppShell initialView={launch.view} context={launch.context} />;
 }

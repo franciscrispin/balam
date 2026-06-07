@@ -14,10 +14,12 @@
     "typecheck": "bun run --filter './packages/*' --filter './apps/frontend' typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "format": "biome format --write ."
+    "format": "biome format --write .",
+    "gen:api": "uv --directory apps/backend run python scripts/dump_openapi.py > /tmp/balam-openapi.json && openapi-typescript /tmp/balam-openapi.json -o packages/shared/src/api.ts && biome format --write packages/shared/src/api.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.16",
+    "openapi-typescript": "^7.5.0",
     "typescript": "^6.0.3"
   }
 }
