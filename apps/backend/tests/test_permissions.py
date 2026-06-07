@@ -56,6 +56,16 @@ def test_flag_tool_defaults_to_star_pattern() -> None:
     assert {"permission": "webfetch", "pattern": "*", "action": "allow"} in rules
 
 
+def test_bare_skill_allows_every_skill() -> None:
+    # "Skill" (no pattern) pre-approves all skills, so OpenCode never raises a
+    # permission.asked for a skill invocation. The allow must follow the ask-all
+    # baseline (OpenCode uses the last matching rule).
+    rules = build_ruleset(_ctx(allowed_tools=["Skill"]))
+    allow = {"permission": "skill", "pattern": "*", "action": "allow"}
+    assert allow in rules
+    assert rules.index(allow) > rules.index({"permission": "*", "pattern": "*", "action": "ask"})
+
+
 def test_bare_edit_is_scoped_to_workspace_not_global() -> None:
     rules = build_ruleset(_ctx(allowed_tools=["Edit"]))
     # File-path category: no leading slash, ** glob, scoped to the directory.
