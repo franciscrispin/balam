@@ -11,9 +11,12 @@ Each Telegram topic binds to one context, persisted alongside its session in the
 topic→session map (:mod:`balam.store`); a topic with no binding uses
 ``default_context``.
 
-NOTE: ``allowed_tools`` and ``additional_directories`` are parsed and validated
-so the schema is complete and forward-compatible, but path-scoped permission
-enforcement is **not** wired into OpenCode yet — that is deliberately deferred.
+``allowed_tools`` and ``additional_directories`` are translated into a native
+OpenCode permission ruleset by :mod:`balam.permissions` (the opt-in half of the
+hybrid enforcement model): pre-approved tools become ``allow`` rules so OpenCode
+runs them without prompting, and extra directories get ``external_directory``
+grants. Everything not pre-approved stays ``ask`` and falls through to the local,
+symlink-safe approval layer (:mod:`balam.approvals`).
 """
 
 from __future__ import annotations

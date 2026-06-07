@@ -9,6 +9,7 @@ class FakeOpenCode:
     def __init__(self, *, existing: set[str] | None = None) -> None:
         self.existing = existing or set()
         self.created: list[tuple[str, str | None]] = []
+        self.permissions: list[list[dict[str, str]] | None] = []
         self.exists_calls: list[tuple[str, str | None]] = []
         self._counter = 0
 
@@ -16,11 +17,18 @@ class FakeOpenCode:
         self.exists_calls.append((session_id, directory))
         return session_id in self.existing
 
-    async def create_session(self, title: str, *, directory: str | None = None) -> str:
+    async def create_session(
+        self,
+        title: str,
+        *,
+        directory: str | None = None,
+        permission: list[dict[str, str]] | None = None,
+    ) -> str:
         self._counter += 1
         sid = f"ses_{self._counter}"
         self.existing.add(sid)
         self.created.append((sid, directory))
+        self.permissions.append(permission)
         return sid
 
 
@@ -111,6 +119,29 @@ def test_current_context_name_defaults_when_unbound() -> None:
     store, oc = _store(), FakeOpenCode()
     router = Router(store, oc, _contexts())
     assert router.current_context_name(TopicRef(1, 5, "t")) == "balam"
+
+
+async def test_create_session_passes_context_ruleset() -> None:
+    store, oc = _store(), FakeOpenCode()
+    contexts = ContextsConfig(
+        default_context="balam",
+        contexts={
+            "balam": ContextConfig(
+                directory="/work/balam",
+                description="Balam",
+                allowed_tools=["LSP", "Bash(git *)"],
+            )
+        },
+    )
+    router = Router(store, oc, contexts)
+
+    await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    ruleset = oc.permissions[0]
+    assert ruleset is not None
+    assert ruleset[0] == {"permission": "*", "pattern": "*", "action": "ask"}
+    assert {"permission": "lsp", "pattern": "*", "action": "allow"} in ruleset
+    assert {"permission": "bash", "pattern": "git *", "action": "allow"} in ruleset
 
 
 async def test_unknown_bound_context_falls_back_to_default() -> None:

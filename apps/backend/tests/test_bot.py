@@ -71,7 +71,13 @@ class _FakeOpenCode:
         self._n = 0
         self.aborted: list[tuple[str, str | None]] = []
 
-    async def create_session(self, title: str, *, directory: str | None = None) -> str:
+    async def create_session(
+        self,
+        title: str,
+        *,
+        directory: str | None = None,
+        permission: list[dict[str, str]] | None = None,
+    ) -> str:
         self._n += 1
         return f"ses_{self._n}"
 

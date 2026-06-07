@@ -1,0 +1,135 @@
+"""Translate a context's ``allowed_tools`` + ``additional_directories`` into a
+native OpenCode permission ruleset (ADR-0012).
+
+This is the *opt-in* half of Balam's hybrid enforcement. Tools the user has
+pre-approved in ``config.yaml`` become ``allow`` rules in the session ruleset, so
+OpenCode runs them without ever raising a ``permission.asked`` event. Everything
+the user did *not* pre-approve stays ``ask`` and falls through to Balam's local
+approval layer (:mod:`balam.approvals`), which keeps the symlink-safe directory
+boundary (``os.path.realpath``) and the human keyboard as the backstop. OpenCode
+matches patterns against the *literal* path, so the local check — not a native
+rule — is what stops a symlink inside the workspace from escaping it.
+
+Wire format (``PermissionRuleset`` in the OpenCode OpenAPI): a list of
+``{"permission", "pattern", "action"}``. OpenCode evaluates the **last matching
+rule**, so order matters: an ask-all baseline goes first, blanket allows after.
+
+Pattern formats differ per category — verified live against opencode v1.15.13;
+getting one wrong degrades to "ask the human" (safe), never to over-allow:
+
+  * **file-path** categories (``read``/``edit``/``glob``/``grep``/``list``) match
+    the candidate path with its **leading slash stripped**, globbed with ``**`` —
+    pattern ``"home/user/proj/**"``.
+  * **external_directory** (the cross-workspace access gate) matches **with** a
+    leading slash and a single-star directory glob — pattern ``"/home/user/proj/*"``.
+  * **bash** patterns are command globs, used verbatim — e.g. ``"git *"``.
+
+The file mutations ``edit``/``write``/``apply_patch`` all map to OpenCode's single
+``edit`` permission category. A bare mutating entry (no pattern) is **scoped to
+the workspace** — one rule per ``directory`` + ``additional_directories`` — so
+listing ``Edit`` pre-approves writes *inside* the workspace without opening the
+whole filesystem; out-of-workspace writes still prompt.
+"""
+
+from __future__ import annotations
+
+from balam.contexts import ContextConfig
+
+#: Internal bookkeeping tools that are never user-visible and always allowed, so
+#: they don't generate approval noise. Kept deliberately minimal (matches the
+#: legacy ``ASK_ALL_PERMISSIONS`` baseline).
+ALWAYS_ALLOWED_PERMS: tuple[str, ...] = ("todowrite",)
+
+#: ``allowed_tools`` names that mean "let the model edit files". OpenCode folds
+#: edit/write/apply_patch into one ``edit`` permission category, so we normalize
+#: them all to that.
+EDIT_PERMISSION = "edit"
+MUTATING_INPUT_NAMES = frozenset({"edit", "write", "apply_patch"})
+
+#: Categories whose pattern is a filesystem path (leading slash stripped, ``**``
+#: glob). A bare entry for one of these is scoped to the workspace directories.
+FILE_PATH_CATEGORIES = frozenset({"read", "edit", "glob", "grep", "list"})
+
+
+def _strip_leading_slash(path: str) -> str:
+    return path[1:] if path.startswith("/") else path
+
+
+def _file_path_pattern(directory: str) -> str:
+    """Native ``read``/``edit`` pattern matching everything under *directory*."""
+    return _strip_leading_slash(directory).rstrip("/") + "/**"
+
+
+def _external_directory_pattern(directory: str) -> str:
+    """Native ``external_directory`` pattern (leading slash, single-star glob)."""
+    return "/" + _strip_leading_slash(directory).rstrip("/") + "/*"
+
+
+def parse_allowed_tool(entry: str) -> tuple[str | None, str | None]:
+    """Parse an ``allowed_tools`` entry into ``(permission, pattern)``.
+
+    Accepts the capitalised hooks form (``LSP``, ``Bash(git *)``) and the
+    OpenCode wire form (``lsp``, ``bash(git *)``), lowercasing to a native
+    permission name. MCP qualified names (``mcp__server__tool``) collapse to
+    OpenCode's ``server_tool`` form. Returns ``(None, None)`` for a blank entry.
+    """
+    text = entry.strip()
+    if not text:
+        return None, None
+    pattern: str | None = None
+    if "(" in text and text.endswith(")"):
+        head, _, tail = text.partition("(")
+        text = head.strip()
+        pattern = tail[:-1].strip() or None
+    if text.startswith("mcp__"):
+        parts = text.split("__", 2)
+        if len(parts) == 3:
+            return f"{parts[1]}_{parts[2]}", pattern
+        return text, pattern
+    if text.startswith("_"):  # already an OpenCode-internal permission name
+        return text, pattern
+    return text.lower(), pattern
+
+
+def _allow(permission: str, pattern: str) -> dict[str, str]:
+    return {"permission": permission, "pattern": pattern, "action": "allow"}
+
+
+def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
+    """The native OpenCode permission ruleset for a context.
+
+    Order is load-bearing (OpenCode uses the last matching rule): the ask-all
+    baseline first, then the always-allowed internals, then the user's
+    ``allowed_tools`` opt-ins, then ``external_directory`` grants for the extra
+    directories. A context with no opt-ins reduces to the ask-everything baseline.
+    """
+    workspace_dirs = [ctx.directory, *ctx.additional_directories]
+
+    rules: list[dict[str, str]] = [{"permission": "*", "pattern": "*", "action": "ask"}]
+    for perm in ALWAYS_ALLOWED_PERMS:
+        rules.append(_allow(perm, "*"))
+
+    for entry in ctx.allowed_tools:
+        permission, pattern = parse_allowed_tool(entry)
+        if permission is None:
+            continue
+        if permission in MUTATING_INPUT_NAMES:
+            permission = EDIT_PERMISSION
+        if permission in FILE_PATH_CATEGORIES:
+            if pattern is None:
+                # Scope to the workspace (and any additional dirs), not the whole FS.
+                for directory in workspace_dirs:
+                    rules.append(_allow(permission, _file_path_pattern(directory)))
+            else:
+                rules.append(_allow(permission, _strip_leading_slash(pattern)))
+        else:
+            # Command/flag categories (bash, lsp, webfetch, …): pattern verbatim.
+            rules.append(_allow(permission, pattern or "*"))
+
+    # Grant cross-workspace access to the extra directories so OpenCode's
+    # external_directory gate doesn't prompt for them; the read/edit within them
+    # is still bounded locally (allowed_dirs in :mod:`balam.approvals`).
+    for directory in ctx.additional_directories:
+        rules.append(_allow("external_directory", _external_directory_pattern(directory)))
+
+    return rules

@@ -489,11 +489,21 @@ context. Secrets never go in `config.yaml`.
 - The router resolves a topic's directory/model/effort from its bound context and
   passes them to the OpenCode prompt (ADR-0002). An unbound topic, or a binding to
   a context since removed from the file, falls back to `default_context`.
-- `allowed_tools` and `additional_directories` are parsed and validated so the
-  schema is complete and forward-compatible, but **path-scoped permission
-  enforcement is not wired into OpenCode yet** — deliberately deferred. The
-  intended model: reads auto-approved inside `directory`, writes always prompt,
-  shell commands opted into by pattern.
+- `allowed_tools` and `additional_directories` are enforced via a **hybrid**
+  model (`balam.permissions` + `balam.approvals`). The *opt-in* half is native:
+  pre-approved tools are translated into OpenCode `allow` rules (so they run
+  without prompting), `additional_directories` become `external_directory` grants,
+  and bare `Edit`/`Write` entries are scoped to the workspace dirs. The *boundary*
+  half stays local: reads/edits not pre-approved fall through to the approval
+  layer, which auto-approves reads inside `directory` and prompts otherwise.
+  Enforcement is split deliberately — OpenCode matches permission patterns against
+  the *literal* path (verified live against v1.15.13: a symlink inside the
+  workspace pointing out is auto-allowed by a native `read <dir>/**` rule), so the
+  symlink-safe `os.path.realpath` boundary must live in Balam, not in a native
+  rule. Pattern formats are category-specific and also verified live: file-path
+  categories (`read`/`edit`) strip the leading slash and glob with `**`;
+  `external_directory` keeps the leading slash with a `/*` glob; `bash` patterns
+  are command globs.
 - Adding a workspace is a config edit, not a code change.
 
 ---

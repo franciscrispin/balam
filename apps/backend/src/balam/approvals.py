@@ -14,11 +14,13 @@ and the multi-file ``apply_patch``), so we can't miss a mutating tool. Target
 paths come from the request itself (``metadata`` for edits — authoritative for
 apply_patch — and the tool input for reads).
 
-This ships the **directory-boundary** routing only: reads inside the workspace
+This is the **boundary** half of the hybrid model: reads inside the workspace
 auto-allow; mutations inside it auto-allow only once the user has chosen "accept
 all edits" for the session; everything else — out-of-scope paths, Bash, network,
-unknown categories — prompts. The ``allowed_tools`` hard-enforcement engine stays
-deferred (ADR-0012); human approval is the backstop.
+unknown categories — prompts. The *opt-in* half (translating ``allowed_tools`` /
+``additional_directories`` into native OpenCode ``allow`` rules) lives in
+:mod:`balam.permissions`; tools pre-approved there never reach this layer. Human
+approval is the backstop for everything else.
 """
 
 from __future__ import annotations

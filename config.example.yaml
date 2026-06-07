@@ -18,12 +18,13 @@ contexts:
     # effort: medium                     # optional: low | medium | high | xhigh | max
     allowed_tools:
       - LSP
-      # NOTE: path-scoped permission enforcement is not wired up yet, so
-      # allowed_tools is parsed/validated but not applied to OpenCode. The
-      # intended model (once implemented): Read/Glob/Grep auto-approved inside
-      # `directory`; Edit/Write always prompt; opt into commands with patterns
-      # like "Bash(git *)". Don't list Read/Edit here.
-    # additional_directories:            # extra dirs the agent may read
+      # Tools listed here are pre-approved: OpenCode runs them without prompting.
+      # Reads inside `directory` are already auto-approved locally, so you don't
+      # need to list Read/Glob/Grep. Opt into commands with a pattern, e.g.
+      # "Bash(git *)". Listing "Edit"/"Write" pre-approves edits *inside* the
+      # workspace (out-of-workspace edits still prompt); leave them off to keep
+      # the per-edit approval prompt.
+    # additional_directories:            # extra dirs the agent may read/edit
     #   - /home/ubuntu/projects/open-shrimp
 
   # Add more workspaces as needed:

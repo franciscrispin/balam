@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from balam.contexts import ContextsConfig
 from balam.opencode import OpenCode
+from balam.permissions import build_ruleset
 from balam.store import SessionStore
 
 
@@ -83,7 +84,9 @@ class Router:
         caller validates that ``name`` exists.
         """
         ctx = self._contexts.contexts[name]
-        session_id = await self._opencode.create_session(title, directory=ctx.directory)
+        session_id = await self._opencode.create_session(
+            title, directory=ctx.directory, permission=build_ruleset(ctx)
+        )
         self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=name)
         return session_id
 
@@ -102,7 +105,9 @@ class Router:
             if existing:
                 # Mapped session is gone server-side: clear the stale row, recreate.
                 self._store.delete(ref.chat_id, ref.thread_id)
-            session_id = await self._opencode.create_session(ref.title, directory=ctx.directory)
+            session_id = await self._opencode.create_session(
+                ref.title, directory=ctx.directory, permission=build_ruleset(ctx)
+            )
             self._store.set(
                 ref.chat_id,
                 ref.thread_id,

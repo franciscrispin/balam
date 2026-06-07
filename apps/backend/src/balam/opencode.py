@@ -33,13 +33,14 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-#: Permission ruleset applied at session create so OpenCode *asks* (raises a
-#: ``permission.asked`` SSE event) before every tool call rather than running it
-#: unattended. Balam's approval layer (:mod:`balam.approvals`) then enforces the
-#: directory boundary on each request, auto-allowing reads in the workspace and
-#: prompting for the rest. OpenCode evaluates the LAST matching rule, so the
-#: ask-all baseline goes first and the ``todowrite`` allow (internal bookkeeping,
-#: never user-visible) follows it. See ADR-0012 and the open-shrimp reference.
+#: Fallback permission ruleset for sessions created without an explicit one: makes
+#: OpenCode *ask* (raise a ``permission.asked`` SSE event) before every tool call
+#: rather than run it unattended. The real per-context ruleset is built by
+#: :func:`balam.permissions.build_ruleset` and passed to :meth:`OpenCode.create_session`;
+#: this baseline is its zero-opt-in case. OpenCode evaluates the LAST matching
+#: rule, so the ask-all baseline goes first and the ``todowrite`` allow (internal
+#: bookkeeping, never user-visible) follows it. See ADR-0012 and the open-shrimp
+#: reference.
 ASK_ALL_PERMISSIONS: list[dict[str, str]] = [
     {"permission": "*", "pattern": "*", "action": "ask"},
     {"permission": "todowrite", "pattern": "*", "action": "allow"},
@@ -95,13 +96,27 @@ class OpenCode:
                 )
             await asyncio.sleep(interval)
 
-    async def create_session(self, title: str, *, directory: str) -> str:
+    async def create_session(
+        self,
+        title: str,
+        *,
+        directory: str,
+        permission: list[dict[str, str]] | None = None,
+    ) -> str:
         """Create a new session in ``directory`` (a context's workspace); return
-        its id."""
+        its id.
+
+        ``permission`` is the session's native ruleset (see
+        :mod:`balam.permissions`); it defaults to :data:`ASK_ALL_PERMISSIONS` so a
+        caller that doesn't compute one still gets the ask-everything baseline.
+        """
         response = await self._client.post(
             "/session",
             params={"directory": directory},
-            json={"title": title, "permission": ASK_ALL_PERMISSIONS},
+            json={
+                "title": title,
+                "permission": permission if permission is not None else ASK_ALL_PERMISSIONS,
+            },
         )
         response.raise_for_status()
         return response.json()["id"]
