@@ -508,6 +508,61 @@ context. Secrets never go in `config.yaml`.
 
 ---
 
+## ADR-0013: Expose the Mini App through an authenticated Cloudflare tunnel
+
+Status: Accepted Date: 2026-06-07 Amends: ADR-0007
+
+### Context
+
+ADR-0007 keeps every port on `127.0.0.1` and ADR-0007/0006 deferred any public
+URL. But a Telegram Mini App only loads inside Telegram's webview from a **public
+HTTPS origin**, and `web_app` inline buttons require an HTTPS URL — so the diff
+viewer (ADR-0003) cannot be exercised end-to-end inside Telegram while the backend
+is localhost-only. ADR-0008 already anticipated this exact surface: "Validate Mini
+App `initData` on every request." The boundary exists; it just needs to start
+doing its job.
+
+### Decision
+
+Expose **only** the Balam FastAPI server (the Mini App + its `/api`) to the
+internet through a **Cloudflare tunnel**, treating Mini App `initData` (ADR-0008)
+as the trust boundary. This narrowly amends ADR-0007's "no public URL" for this
+one authenticated surface; everything else stays local.
+
+Conditions (all enforced):
+
+- **One ingress only.** The tunnel maps a single hostname → `http://127.0.0.1:3000`
+  (the FastAPI server). OpenCode (`:4096`) and the VNC/noVNC ports (ADR-0006) are
+  **never** tunneled.
+- **`initData` is always required.** Every `/api` request must carry valid Telegram
+  `initData` (ADR-0008); there is no auth bypass. The user-ID allowlist still applies.
+- **No Cloudflare Access on the hostname.** Access's interactive login cannot run
+  inside Telegram's webview; `initData` is the auth, not a second gate.
+- **Reduced surface.** `/docs`, `/redoc`, and the HTTP `/openapi.json` route are not
+  served; type generation reads the schema in-process (`scripts/dump_openapi.py`),
+  not over HTTP, so nothing is lost.
+- **Reachable as the Mini App's `BALAM_PUBLIC_URL`.** The bot builds the `/diff`
+  `web_app` button from it; with it unset the bot falls back to the local URL.
+
+### Consequences
+
+- The VM opens **no inbound port**: `cloudflared` dials Cloudflare outbound and
+  proxies to the localhost socket, so ADR-0007's "don't expose ports / no firewall
+  change" stays literally true — what changes is that one authenticated surface is
+  reachable *through* Cloudflare.
+- The trust boundary is unchanged in kind (ADR-0008): a leaked bot token still
+  cannot forge `initData` past the user-ID check; the hostname being known is fine
+  because obscurity is not the control.
+- Services run under **systemd** (ADR-0001 already runs OpenCode this way): an
+  OpenCode unit, the Balam bot+server unit, and the tunnel unit. A quick
+  `trycloudflare` tunnel yields an ephemeral hostname, so a small refresh step
+  rewrites `BALAM_PUBLIC_URL` and restarts the bot on each tunnel start; a named
+  tunnel (stable hostname) removes that step.
+- If this ever broadens beyond the single owner, revisit alongside ADR-0007/0008
+  (the deployment stops being "local single-user").
+
+---
+
 ## Summary
 
 | ADR  | Decision                                                                    | Core reason                                                     |
@@ -523,3 +578,4 @@ context. Secrets never go in `config.yaml`.
 | 0010 | Telegram over Discord; one supergroup, context-per-topic, session-per-topic | Native streaming + Mini App + no archiving; two-level tree fits |
 | 0011 | Backend in Python (FastAPI + PTB), OpenCode over HTTP                       | Reference reuse (zog/open-shrimp); HTTP is the contract (0002)  |
 | 0012 | Workspace contexts in a required `config.yaml`                              | Per-project dir/model/effort/tools; structured config, not env  |
+| 0013 | Expose only the Mini App via an authenticated Cloudflare tunnel (amends 0007) | Mini App needs a public HTTPS origin; `initData` is the boundary |

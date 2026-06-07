@@ -1,0 +1,23 @@
+[Unit]
+Description=Balam bot + Mini App server (ADR-0011/0013)
+After=network-online.target balam-opencode.service
+Wants=network-online.target
+# The bot waits for OpenCode in its post_init; ordering after it avoids a slow start.
+Requires=balam-opencode.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/projects/balam/apps/backend
+# Secrets + config from the repo .env (read by pydantic-settings). The optional
+# deploy/balam.env (note the leading "-") overlays the public-mode settings the
+# tunnel needs — BALAM_PUBLIC_URL and BALAM_MINIAPP_SHORTNAME. Later EnvironmentFile
+# wins, and a real env var beats the repo .env (ADR-0008), so these take effect.
+EnvironmentFile=/home/ubuntu/projects/balam/.env
+EnvironmentFile=-/home/ubuntu/projects/balam/deploy/balam.env
+ExecStart=/home/ubuntu/.local/bin/uv run balam
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenCode server (Balam agent backend, ADR-0001)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+# OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME) come from the repo .env;
+# opencode serve reads them from its environment. Bound to localhost (ADR-0007).
+EnvironmentFile=/home/ubuntu/projects/balam/.env
+ExecStart=/home/ubuntu/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

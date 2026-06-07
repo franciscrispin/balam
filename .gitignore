@@ -37,3 +37,6 @@ __pycache__/
 
 # Claude Code local settings (personal; shared config and skills are tracked)
 .claude/settings.local.json
+
+# Generated public-mode overlay (holds the current tunnel URL; ADR-0013 deploy)
+deploy/balam.env

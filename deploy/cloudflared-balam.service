@@ -1,0 +1,18 @@
+[Unit]
+Description=Cloudflare named tunnel for the Balam Mini App (ADR-0013)
+After=network-online.target balam.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+# Named tunnel with a STABLE hostname (francis-balam.glintsintern.com), so the
+# BotFather Web App URL never churns. Ingress maps ONLY that host → 127.0.0.1:3000
+# (the FastAPI server). OpenCode (:4096) and VNC are never tunneled. The explicit
+# --config avoids cloudflared auto-loading ~/.cloudflared/config.yml (another app).
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /etc/cloudflared/balam.yml tunnel run balam
+Restart=on-failure
+RestartSec=6s
+
+[Install]
+WantedBy=multi-user.target
