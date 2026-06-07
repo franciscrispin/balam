@@ -1,6 +1,7 @@
 import asyncio
 
 from balam.approvals import Choice, PendingApprovals
+from balam.attachments import PromptFile
 from balam.streamer import DraftSession, stream_reply
 
 
@@ -301,11 +302,37 @@ async def test_stream_reply_forwards_context_to_prompt() -> None:
         "provider": "anthropic",
         "model": "claude-opus-4-8",
         "effort": "high",
+        "files": None,
     }
     # OpenCode scopes message/session events to the worktree, so the event
     # subscription must carry the same directory or only server.* events arrive
     # and the reply never finalizes (regression: subscribed without directory).
     assert oc.events_directory == "/work/proj"
+
+
+async def test_stream_reply_forwards_files_to_prompt() -> None:
+    bot = FakeBot()
+    oc = PromptGatedOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _text_part(AID, "got it"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    files = [PromptFile(mime="image/jpeg", url="data:image/jpeg;base64,AAAA")]
+
+    await stream_reply(
+        bot=bot,
+        opencode=oc,
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="see this",
+        files=files,
+        draft_interval=0.01,
+    )
+
+    assert oc.prompt_kwargs["files"] == files
 
 
 # --- permission.asked handling (interactive approval) -------------------------

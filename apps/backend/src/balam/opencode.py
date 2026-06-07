@@ -31,6 +31,7 @@ from typing import Any
 
 import httpx
 
+from balam.attachments import PromptFile
 from balam.opencode_tools import Permission
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ class OpenCode:
         provider: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        files: list[PromptFile] | None = None,
     ) -> None:
         """Send a user message and return immediately (``prompt_async``). The
         assistant's reply arrives over :meth:`events`, which is what lets us
@@ -148,8 +150,20 @@ class OpenCode:
         ``provider``/``model`` select the context's model (OpenCode wants
         ``{providerID, modelID}``); ``effort`` maps to the prompt ``variant``.
         Each is omitted when unset so the server applies its own default.
+
+        ``files`` become native OpenCode file parts (``FilePartInput``) appended
+        to the message ``parts`` — the agent sees them directly (image vision, PDF,
+        text) without a filesystem read (tier-1 plan §4).
         """
-        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
+        parts: list[dict[str, Any]] = []
+        if text:
+            parts.append({"type": "text", "text": text})
+        for file in files or []:
+            part: dict[str, Any] = {"type": "file", "mime": file.mime, "url": file.url}
+            if file.filename:
+                part["filename"] = file.filename
+            parts.append(part)
+        body: dict[str, Any] = {"parts": parts}
         if provider and model:
             body["model"] = {"providerID": provider, "modelID": model}
         if effort is not None:

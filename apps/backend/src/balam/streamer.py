@@ -35,6 +35,7 @@ from balam.approvals import (
     is_edit,
     request_target_paths,
 )
+from balam.attachments import PromptFile
 from balam.markdown import gfm_to_telegram
 from balam.opencode import OpenCode
 from balam.opencode_tools import Tool
@@ -374,6 +375,7 @@ async def stream_reply(
     effort: str | None = None,
     pending: PendingApprovals | None = None,
     allowed_dirs: list[str] | None = None,
+    files: list[PromptFile] | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
 ) -> None:
     """Prompt the agent and stream its reply into the topic.
@@ -612,6 +614,7 @@ async def stream_reply(
                     provider=provider,
                     model=model,
                     effort=effort,
+                    files=files,
                 )
                 await consume_task
         except Exception as exc:

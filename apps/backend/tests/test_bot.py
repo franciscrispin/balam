@@ -3,12 +3,16 @@ import contextlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+from telegram import Chat, Message, MessageEntity, PhotoSize, Update, User
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
+
 from balam.approvals import Choice, PendingApprovals
 from balam.bot import (
     BOT_COMMANDS,
     _handle_approval_callback,
     _handle_cancel,
     _handle_context,
+    _handle_message,
     _handle_new,
     _handle_status,
     _topic_link,
@@ -20,8 +24,6 @@ from balam.contexts import ContextConfig, ContextsConfig
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
 from balam.turns import TurnRegistry
-from telegram import Chat, Message, MessageEntity, Update, User
-from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
 OWNER = 424242
 SUPERGROUP = -1001234567890
@@ -56,10 +58,7 @@ def test_topic_link_for_private_supergroup() -> None:
 
 def test_topic_link_for_private_chat_uses_web_address() -> None:
     # Private chat with topics has no documented deep link → Telegram Web URL.
-    assert (
-        _topic_link(24320651, 42, bot_id=BOT_ID)
-        == f"https://web.telegram.org/a/#{BOT_ID}_42"
-    )
+    assert _topic_link(24320651, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
 
 
 def test_topic_link_none_for_private_chat_without_bot_id() -> None:
@@ -81,14 +80,10 @@ class _FakeOpenCode:
         self._n += 1
         return f"ses_{self._n}"
 
-    async def session_exists(
-        self, session_id: str, *, directory: str | None = None
-    ) -> bool:
+    async def session_exists(self, session_id: str, *, directory: str | None = None) -> bool:
         return True
 
-    async def abort_session(
-        self, session_id: str, *, directory: str | None = None
-    ) -> None:
+    async def abort_session(self, session_id: str, *, directory: str | None = None) -> None:
         self.aborted.append((session_id, directory))
 
 
@@ -133,9 +128,7 @@ class _FakeMessage:
         self.replies: list[str] = []
         self.reply_markups: list[object] = []
 
-    async def reply_text(
-        self, text: str, *, reply_markup: object = None, **_: object
-    ) -> None:
+    async def reply_text(self, text: str, *, reply_markup: object = None, **_: object) -> None:
         self.replies.append(text)
         self.reply_markups.append(reply_markup)
 
@@ -151,9 +144,7 @@ def _button_urls(message: _FakeMessage) -> list[str]:
     return urls
 
 
-def _update_context(
-    bot: _FakeBot, router: Router, message: _FakeMessage, args: list[str]
-):
+def _update_context(bot: _FakeBot, router: Router, message: _FakeMessage, args: list[str]):
     update = SimpleNamespace(message=message)
     context = SimpleNamespace(
         application=SimpleNamespace(bot_data={"router": router}),
@@ -247,9 +238,7 @@ def _session_cmd_env(message: _FakeMessage):
     return update, context, router, opencode, turns
 
 
-def _sleeping_turn(
-    turns: TurnRegistry, chat_id: int, thread_id: int | None, session_id: str
-):
+def _sleeping_turn(turns: TurnRegistry, chat_id: int, thread_id: int | None, session_id: str):
     """Register a never-finishing turn (a parked task) for a topic; return it."""
     task = asyncio.ensure_future(asyncio.Event().wait())
     turns.register(chat_id, thread_id, task, session_id, "/work/balam")
@@ -260,9 +249,7 @@ async def test_new_opens_a_new_topic_in_the_current_context() -> None:
     # /new mirrors /context <name>, but reuses the current topic's context.
     router = _router()
     bot = _FakeBot(new_thread_id=900)
-    await router.create_topic_session(
-        SUPERGROUP, 5, "scratch", "scratch"
-    )  # current topic
+    await router.create_topic_session(SUPERGROUP, 5, "scratch", "scratch")  # current topic
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, [])
 
@@ -382,18 +369,14 @@ def _message_handler(app) -> MessageHandler:
 def _command_handler(app) -> CommandHandler:
     # All command handlers share the same `allowed` filter; pick /context's.
     return next(
-        h
-        for h in app.handlers[0]
-        if isinstance(h, CommandHandler) and "context" in h.commands
+        h for h in app.handlers[0] if isinstance(h, CommandHandler) and "context" in h.commands
     )
 
 
 def _text_update(chat_id: int, user_id: int, text: str = "hello") -> Update:
     entities = []
     if text.startswith("/"):
-        entities = [
-            MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text))
-        ]
+        entities = [MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text))]
     message = Message(
         message_id=1,
         date=datetime(2026, 6, 5, tzinfo=UTC),
@@ -441,9 +424,7 @@ def test_command_handler_scoped_rejects_owner_in_other_chat() -> None:
 
 def test_command_handler_scoped_accepts_owner_in_target_chat() -> None:
     handler = _command_handler(_build(SUPERGROUP))
-    assert (
-        handler.check_update(_text_update(SUPERGROUP, OWNER, "/context")) is not False
-    )
+    assert handler.check_update(_text_update(SUPERGROUP, OWNER, "/context")) is not False
 
 
 # --- command registration (setMyCommands) makes /context work in groups -------
@@ -507,12 +488,8 @@ class _FakeQuery:
         self.answers.append(text)
 
 
-def _callback_env(
-    query: _FakeQuery, pending: PendingApprovals, *, chat_id: int | None = None
-):
-    config = SimpleNamespace(
-        allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id
-    )
+def _callback_env(query: _FakeQuery, pending: PendingApprovals, *, chat_id: int | None = None):
+    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id)
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
         application=SimpleNamespace(bot_data={"config": config, "pending": pending})
@@ -586,3 +563,93 @@ def _callback_handler(app) -> CallbackQueryHandler:
 def test_callback_handler_is_registered() -> None:
     # The approval keyboard is routed by a CallbackQueryHandler matching appr:*.
     assert _callback_handler(_build(SUPERGROUP)) is not None
+
+
+# --- inbound attachments (§4) -------------------------------------------------
+
+
+class _AttachmentBot:
+    """Serves attachment bytes via get_file → download_as_bytearray."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def get_file(self, file_id: str):
+        data = self._data
+
+        class _F:
+            async def download_as_bytearray(self) -> bytearray:
+                return bytearray(data)
+
+        return _F()
+
+
+def _message_env(message, bot):
+    opencode = _FakeOpenCode()
+    contexts = ContextsConfig(
+        default_context="balam",
+        contexts={"balam": ContextConfig(directory="/work/balam", description="Balam")},
+    )
+    router = Router(SessionStore(":memory:"), opencode, contexts)
+    turns = TurnRegistry()
+    update = SimpleNamespace(message=message)
+    context = SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={
+                "router": router,
+                "opencode": opencode,
+                "turns": turns,
+                "pending": PendingApprovals(),
+            }
+        ),
+        bot=bot,
+    )
+    return update, context, turns
+
+
+async def test_message_with_photo_forwards_file_part_and_caption(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    bot = _AttachmentBot(b"\xff\xd8jpeg")
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        photo=[SimpleNamespace(file_id="large")],
+        document=None,
+        text=None,
+        caption="what is this?",
+        reply_to_message=None,
+    )
+    update, context, turns = _message_env(message, bot)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task  # let the background turn run to completion
+
+    assert captured["prompt"] == "what is this?"
+    files = captured["files"]
+    assert [f.mime for f in files] == ["image/jpeg"]
+    assert files[0].url.startswith("data:image/jpeg;base64,")
+
+
+def _photo_update(chat_id: int, user_id: int) -> Update:
+    message = Message(
+        message_id=1,
+        date=datetime(2026, 6, 5, tzinfo=UTC),
+        chat=Chat(id=chat_id, type=Chat.SUPERGROUP),
+        from_user=User(id=user_id, is_bot=False, first_name="o"),
+        photo=(PhotoSize(file_id="f", file_unique_id="u", width=1, height=1),),
+    )
+    return Update(update_id=1, message=message)
+
+
+def test_message_handler_accepts_photo_from_owner() -> None:
+    # The broadened filter (§4) lets photos through, not just text.
+    handler = _message_handler(_build(SUPERGROUP))
+    assert handler.check_update(_photo_update(SUPERGROUP, OWNER)) is not False

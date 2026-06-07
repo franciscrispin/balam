@@ -26,7 +26,7 @@ reference, open-shrimp):
 1. /new, /status, /cancel   (independent; ship first)
 2. tool-call visibility      (adds a tool-part cache the approval step reuses)
 3. interactive approval      (needs #2's tool-part cache + a new approvals module)
-4. attachments               (registers its upload dir in #3's auto-approve set)
+4. attachments               (independent — native file parts, no #3 coupling)
 ```
 
 ---
@@ -146,36 +146,45 @@ hard-enforcement engine stays deferred (ADR-0012); human approval is the backsto
 
 ## 4. Inbound file attachments
 
-**Goal:** accept images / PDFs / text files and let the agent read them.
+**Goal:** accept images / PDFs / text files and let the agent see them.
 
-**Changes:**
+**Approach — native OpenCode file parts (not path-in-text).** The original draft
+mirrored open-shrimp: save each file to `/tmp/balam_uploads/...` and name the
+absolute path in the prompt so the agent's Read tool opens it. Verifying against the
+actual OpenCode API showed a cleaner, version-proof path: the
+`/session/{id}/prompt_async` body's `parts` array already accepts `FilePartInput`
+(`{type:"file", mime, url, filename?}`), and `url` may be a `data:` URL carrying the
+bytes inline (this is how OpenCode's own web app sends image attachments). File parts
+go straight to the model as a media/content block — bypassing the Read tool entirely
+— so there are **no temp files, no upload dir, no auto-approve wiring, and no
+dependency on #3.** It also future-proofs against the upcoming OpenCode change that
+restricts the Read tool to in-workspace paths (which would break path-in-text).
+
+**Changes (as built):**
 
 - New `attachments.py`:
-  - `UPLOAD_BASE = Path(tempfile.gettempdir()) / "balam_uploads"`.
-  - `save_attachments(files, thread_key) -> list[Path]`: write each to
-    `UPLOAD_BASE / str(thread_key) /` via `NamedTemporaryFile(delete=False, dir=…)`
-    with a `balam_<sanitized-name>_` prefix and a MIME-derived suffix. (Key by
-    **thread/topic**, not chat, to match Balam’s one-topic-one-session model.)
-  - `cleanup(paths)`: delete after the turn (call from a `finally`).
-  - Expose `UPLOAD_BASE` so `approvals.is_within` includes
-    `UPLOAD_BASE / str(thread_key)` in the auto-approve dirs (so reading an upload
-    needs no prompt — exactly how both reference apps wire it).
+  - `PromptFile(mime, url, filename)` — one attachment as a `FilePartInput`.
+  - `to_data_url(data, mime) -> str` → `data:<mime>;base64,<bytes>`.
+  - `async collect_attachments(message, bot) -> list[PromptFile]`: PTB `get_file` →
+    `download_as_bytearray` for the largest photo (`message.photo[-1]`, `image/jpeg`)
+    and the document (its own `mime_type`/`file_name`); `[]` for a text-only message.
+- `opencode.py` `prompt`: add a `files` param; append a `{type:"file", mime, url,
+  filename?}` part per `PromptFile` after the text part (text part omitted when empty,
+  e.g. an attachment with no caption).
+- `streamer.py` `stream_reply`: add a `files` param, forward it to `opencode.prompt`.
 - `bot.py` `_handle_message`:
   - Broaden the `MessageHandler` filter from `filters.TEXT` to
     `(filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & allowed`.
-  - Download the attachment bytes (PTB `get_file` → `download_as_bytearray`), save via
-    `save_attachments`, and build the prompt: the caption/text plus a line naming each
-    saved path so OpenCode reads it. Pass through to `stream_reply`; `cleanup` in
-    `finally`.
+  - `collect_attachments`, use `message.text or message.caption` as the prompt text,
+    return only if both empty, and pass `files=` to `stream_reply`. No cleanup needed
+    (no temp files).
 
-**OpenCode visibility:** Balam runs OpenCode locally on the same VM (ADR-0001/0007,
-un-sandboxed), so a `/tmp/balam_uploads/...` path is directly readable. If a future
-ADR sandboxes OpenCode, this dir must be mounted in — leave a comment at the
-definition site.
-
-**Tests:** `test_attachments.py` — save writes to the per-thread dir with the right
-suffix; `cleanup` removes it. `test_bot.py` — a photo message saves a file and the
-prompt references its path (fake OpenCode/bot).
+**Tests:** `test_attachments.py` — `to_data_url` round-trips; `collect_attachments`
+yields the right `PromptFile`s for a photo (largest rendition) / document (mime +
+name) and `[]` for text-only. `test_opencode.py` — `prompt` appends file parts after
+the text part and omits an empty text part. `test_streamer.py` / `test_bot.py` — a
+photo routes through `_handle_message` and the caption + `image/jpeg` data-URL file
+part reach `opencode.prompt`.
 
 ---
 
@@ -183,11 +192,11 @@ prompt references its path (fake OpenCode/bot).
 
 | File | New? | Purpose |
 | --- | --- | --- |
-| `opencode.py` | edit | `abort_session`, `reply_permission` |
+| `opencode.py` | edit | `abort_session`, `reply_permission`; `prompt` `files` → file parts |
 | `turns.py` | new | per-topic in-flight turn registry (for `/cancel`) |
 | `approvals.py` | new | category→tool map, `is_within`, decision, pending-future registry |
-| `attachments.py` | new | upload-dir storage + cleanup |
-| `streamer.py` | edit | tool-part cache + rendering; `permission.asked` handling |
+| `attachments.py` | new | `PromptFile` + `collect_attachments` (data-URL file parts) |
+| `streamer.py` | edit | tool-part cache + rendering; `permission.asked` handling; `files` passthrough |
 | `bot.py` | edit | `/new` `/status` `/cancel` handlers, callback handler, broadened message filter, `BOT_COMMANDS` |
 
 ## Open questions to resolve first
