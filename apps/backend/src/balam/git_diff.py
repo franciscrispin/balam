@@ -101,16 +101,16 @@ def detect_language(file_path: str) -> str:
     dot_idx = file_path.rfind(".")
     if dot_idx == -1:
         return "text"
-    return _EXT_TO_LANGUAGE.get(file_path[dot_idx:], "text")
+    # Lower-case the extension so e.g. README.MD / Main.PY still highlight.
+    return _EXT_TO_LANGUAGE.get(file_path[dot_idx:].lower(), "text")
 
 
 def _hunk_id(file_path: str, hunk_header: str, lines: list[HunkLine]) -> str:
     """Stable, deterministic id for a hunk — used as a React key, so it must be
     unique across the result and reproducible across requests."""
-    payload = file_path + "\n" + hunk_header + "\n"
-    for line in lines:
-        payload += f"{line.type}:{line.content}\n"
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+    parts = [file_path, "\n", hunk_header, "\n"]
+    parts.extend(f"{line.type}:{line.content}\n" for line in lines)
+    return hashlib.sha256("".join(parts).encode()).hexdigest()[:16]
 
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
@@ -286,27 +286,35 @@ def _is_binary_file(path: Path, sample: int = 8192) -> bool:
 
 _MAX_UNTRACKED_DIFF_SIZE = 1_000_000  # 1 MB
 
+#: Cap on concurrent ``git diff --no-index`` subprocesses. A working tree with a
+#: non-ignored ``node_modules``/``build`` dir can list thousands of untracked
+#: files; without a bound we'd fork one git process per file at once.
+_UNTRACKED_DIFF_CONCURRENCY = 16
 
-async def _diff_untracked(cwd: str, files: list[str]) -> str:
-    """Unified diff for untracked files, without touching the index.
 
-    Binary and oversized files get a synthetic header (so they show as a card,
-    not a wall of bytes); the rest are diffed via ``git diff --no-index``.
+def _classify_untracked(cwd: str, files: list[str]) -> tuple[list[str], list[str]]:
+    """Split untracked files into ``(text_files, synthetic_headers)``.
+
+    Pure blocking I/O (``stat`` + a binary sniff per file), so callers run it via
+    a thread to keep it off the event loop. Files that vanished between
+    ``ls-files`` and now (TOCTOU — the agent may be editing this very tree) are
+    skipped: a gone file has no diff.
     """
-    if not files:
-        return ""
-
     text_files: list[str] = []
     synthetic: list[str] = []
     for file_path in files:
         full = Path(cwd) / file_path
+        try:
+            size = full.stat().st_size
+        except OSError:
+            continue  # listed but gone now — skip
         if _is_binary_file(full):
             synthetic.append(
                 f"diff --git a/{file_path} b/{file_path}\n"
                 f"new file mode 100644\n"
                 f"Binary files /dev/null and b/{file_path} differ\n"
             )
-        elif (size := full.stat().st_size) > _MAX_UNTRACKED_DIFF_SIZE:
+        elif size > _MAX_UNTRACKED_DIFF_SIZE:
             synthetic.append(
                 f"diff --git a/{file_path} b/{file_path}\n"
                 f"new file mode 100644\n"
@@ -314,11 +322,30 @@ async def _diff_untracked(cwd: str, files: list[str]) -> str:
             )
         else:
             text_files.append(file_path)
+    return text_files, synthetic
+
+
+async def _diff_untracked(cwd: str, files: list[str]) -> str:
+    """Unified diff for untracked files, without touching the index.
+
+    Binary and oversized files get a synthetic header (so they show as a card,
+    not a wall of bytes); the rest are diffed via ``git diff --no-index``, capped
+    at :data:`_UNTRACKED_DIFF_CONCURRENCY` concurrent subprocesses.
+    """
+    if not files:
+        return ""
+
+    # Classification is blocking stat/read I/O — offload so it doesn't stall the
+    # shared event loop (bot, OpenCode SSE, other HTTP) on a big untracked tree.
+    text_files, synthetic = await asyncio.to_thread(_classify_untracked, cwd, files)
+
+    sem = asyncio.Semaphore(_UNTRACKED_DIFF_CONCURRENCY)
 
     async def _one(file_path: str) -> str:
-        stdout, _, rc = await _run_git(
-            cwd, "diff", "--no-index", "--no-color", "-U3", "--", "/dev/null", file_path
-        )
+        async with sem:
+            stdout, _, rc = await _run_git(
+                cwd, "diff", "--no-index", "--no-color", "-U3", "--", "/dev/null", file_path
+            )
         # --no-index exits 1 when files differ — that is the expected case here.
         if rc not in (0, 1):
             logger.warning("git diff --no-index failed for %s (rc=%d)", file_path, rc)

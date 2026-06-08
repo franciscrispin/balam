@@ -342,26 +342,77 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await message.reply_text("\n".join(lines))
 
 
-def _mini_app_url(config: Config, view: str, context_name: str) -> tuple[str, bool]:
-    """Build the Mini App URL for ``view`` bound to ``context_name``.
+def _mini_app_url(config: Config, view: str, context_name: str) -> str:
+    """Build the browser/``web_app`` Mini App URL for ``view`` bound to ``context_name``.
 
-    Returns ``(url, is_public)``. With a configured HTTPS base, the URL is public
-    and can back a native ``web_app`` button; otherwise it is the local
-    ``127.0.0.1`` address, which Telegram won't open in-app (ADR-0007) but the
-    owner can open in a browser.
+    Uses the public HTTPS base when configured (``BALAM_PUBLIC_URL``), else the
+    local ``127.0.0.1`` address — which Telegram won't open in-app (ADR-0007) but
+    the owner can open in a browser.
     """
     base = config.balam_public_url or f"http://127.0.0.1:{config.balam_port}"
+    return f"{base}/?view={view}&context={quote(context_name)}"
+
+
+def _mini_app_reply(
+    config: Config,
+    view: str,
+    context_name: str,
+    *,
+    bot_username: str | None,
+    is_private: bool,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """How to surface a Mini App ``view`` bound to ``context_name`` for this chat.
+
+    Returns ``(text, reply_markup)``. Single decision point for the transport, so
+    every Mini App command reuses the same fallbacks instead of re-deriving them.
+    Preference order (ADR-0013):
+
+    1. **Direct Mini App link** — opens in Telegram's webview (signed initData) in
+       ANY chat type, so it works in the workspace supergroup where ``web_app``
+       inline buttons are rejected. Needs a BotFather short name + the bot username;
+       ``start_param`` carries view+context as ``"view__context"``.
+    2. **``web_app`` button** — also opens in-Telegram (initData, ADR-0008), but
+       Telegram allows it ONLY in private chats.
+    3. **Plain URL** — opens in the external browser (HTTPS public base set).
+    4. **Local URL** — no public base; localhost link Telegram won't open in-app.
+    """
     is_public = config.balam_public_url is not None
-    return f"{base}/?view={view}&context={quote(context_name)}", is_public
+    shortname = config.balam_miniapp_shortname
+
+    if is_public and shortname and bot_username:
+        start_param = f"{view}__{context_name}"
+        link = f"https://t.me/{bot_username}/{shortname}?startapp={quote(start_param)}"
+        button = InlineKeyboardButton("View changes", url=link)
+        return f"Changes in {context_name}:", InlineKeyboardMarkup([[button]])
+
+    url = _mini_app_url(config, view, context_name)
+
+    if is_public and is_private:
+        button = InlineKeyboardButton("View changes", web_app=WebAppInfo(url=url))
+        return f"Changes in {context_name}:", InlineKeyboardMarkup([[button]])
+
+    if is_public:
+        # In groups a web_app inline button is rejected (Button_type_invalid); a
+        # plain URL button opens in the external browser instead (no initData
+        # there, so the Mini App relies on the owner's Telegram session).
+        button = InlineKeyboardButton("View changes", url=url)
+        text = (
+            f"Changes in {context_name}: {url}\n\n"
+            "Opens in your browser. (Telegram only allows the in-app Mini App button "
+            "in a private chat with the bot.)"
+        )
+        return text, InlineKeyboardMarkup([[button]])
+
+    text = (
+        f"Diff viewer for {context_name}:\n{url}\n\n"
+        "Opens in a browser. To open inside Telegram, serve the Mini App from "
+        "a public HTTPS URL and set BALAM_PUBLIC_URL (ADR-0013)."
+    )
+    return text, None
 
 
 async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/diff`` — open the Mini App git diff viewer for this topic's context.
-
-    With a public HTTPS base (``BALAM_PUBLIC_URL``) we attach a native ``web_app``
-    button that opens inside Telegram with ``initData`` auth; without one we reply
-    with the local URL to open in a browser, since Telegram requires HTTPS for
-    web_app buttons and the VM is localhost-only (ADR-0007)."""
+    """``/diff`` — open the Mini App git diff viewer for this topic's context."""
     message = update.message
     if message is None:
         return
@@ -374,48 +425,14 @@ async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         title=_topic_title(message, message.message_thread_id),
     )
     name = router.current_context_name(ref)
-    url, is_public = _mini_app_url(config, "diff", name)
-    is_private = getattr(message.chat, "type", None) == "private"
-
-    # Preferred path: a direct Mini App link (ADR-0013). It opens the app inside
-    # Telegram's webview — with signed initData — in ANY chat type, so it works in
-    # the workspace supergroup where web_app inline buttons are rejected. Needs a
-    # BotFather-registered short name and the bot's username. The start_param
-    # carries view+context as "view__context" (Telegram allows [A-Za-z0-9_-]).
-    shortname = config.balam_miniapp_shortname
-    bot_username = getattr(context.bot, "username", None)
-    if is_public and shortname and bot_username:
-        start_param = f"diff__{name}"
-        link = f"https://t.me/{bot_username}/{shortname}?startapp={quote(start_param)}"
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("View changes", url=link)]])
-        await message.reply_text(f"Changes in {name}:", reply_markup=keyboard)
-        return
-
-    if is_public and is_private:
-        # web_app inline buttons open the Mini App inside Telegram's webview (with
-        # initData, ADR-0008) — but Telegram allows them ONLY in private chats.
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("View changes", web_app=WebAppInfo(url=url))]]
-        )
-        await message.reply_text(f"Changes in {name}:", reply_markup=keyboard)
-    elif is_public:
-        # In groups/supergroups a web_app inline button is rejected
-        # (Button_type_invalid). Offer a plain URL button instead; it opens in the
-        # external browser (no initData there), so the Mini App needs the owner's
-        # Telegram session to authenticate — see the note.
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("View changes", url=url)]])
-        await message.reply_text(
-            f"Changes in {name}: {url}\n\n"
-            "Opens in your browser. (Telegram only allows the in-app Mini App button "
-            "in a private chat with the bot.)",
-            reply_markup=keyboard,
-        )
-    else:
-        await message.reply_text(
-            f"Diff viewer for {name}:\n{url}\n\n"
-            "Opens in a browser. To open inside Telegram, serve the Mini App from "
-            "a public HTTPS URL and set BALAM_PUBLIC_URL (ADR-0013)."
-        )
+    text, keyboard = _mini_app_reply(
+        config,
+        "diff",
+        name,
+        bot_username=getattr(context.bot, "username", None),
+        is_private=getattr(message.chat, "type", None) == "private",
+    )
+    await message.reply_text(text, reply_markup=keyboard)
 
 
 async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

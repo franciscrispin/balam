@@ -4,8 +4,9 @@
  * Requests go to same-origin `/api/*` — served by the FastAPI backend in
  * production, and Vite-proxied to it in dev (vite.config.ts). The Telegram
  * webview's signed `initData` is forwarded as `Authorization: tma <initData>`
- * (ADR-0008); when there is none (a plain browser), the header is omitted so the
- * backend's local dev-auth path can take over (BALAM_DEV_AUTH, ADR-0007).
+ * (ADR-0008). The API always requires valid `initData` — there is no auth bypass
+ * (ADR-0013), so it answers only requests made from inside Telegram's webview;
+ * a plain browser has no `initData` and is rejected with 401.
  */
 import type { DiffResponse } from "@balam/shared";
 
@@ -31,7 +32,8 @@ export class ApiError extends Error {
 async function apiFetch<T>(path: string): Promise<T> {
   const initData = getInitData();
   // Only send the header when we actually have initData: an empty `tma ` is
-  // malformed (401), whereas no header lets the dev-auth bypass through.
+  // malformed (401). Outside Telegram's webview there is none, so the request is
+  // rejected — the API has no unauthenticated path (ADR-0013).
   const headers: HeadersInit = initData ? { Authorization: `tma ${initData}` } : {};
 
   const res = await fetch(`/api${path}`, { headers });

@@ -87,13 +87,18 @@ def main() -> None:
         logger.info("Mini App server listening on http://127.0.0.1:%s", config.balam_port)
 
     async def _post_shutdown(application: Application) -> None:
-        if server is not None:
-            server.should_exit = True
-            task = application.bot_data.get("uvicorn_task")
-            if task is not None:
-                await task
-        await opencode.aclose()
-        store.close()
+        try:
+            if server is not None:
+                server.should_exit = True
+                task = application.bot_data.get("uvicorn_task")
+                if task is not None:
+                    await task
+        finally:
+            # Always release process resources, even if the server task raised
+            # (e.g. a bind failure surfacing here) — its exception must not skip
+            # OpenCode/SQLite teardown.
+            await opencode.aclose()
+            store.close()
 
     app = build_application(
         config, opencode, router, post_init=_post_init, post_shutdown=_post_shutdown

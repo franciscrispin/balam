@@ -27,13 +27,16 @@ export default function DiffView() {
       })
       .catch((err) => {
         if (cancelled) return;
-        // Auth failures are unrecoverable here (no Retry, per design-system §7) —
-        // re-fetching won't fix a bad/absent Mini App session.
-        const isAuth = err instanceof ApiError && err.isAuth;
+        const apiErr = err instanceof ApiError ? err : null;
+        const isAuth = apiErr?.isAuth ?? false;
+        // A 4xx won't change on an identical retry (bad/absent session, unknown
+        // context, not a git repo), so no Retry — per design-system §7. Only
+        // network failures and 5xx server errors are worth retrying.
+        const recoverable = !apiErr || apiErr.status >= 500;
         setState({
           status: "error",
           message: isAuth ? "Couldn't verify this Mini App session." : "Couldn't load changes.",
-          recoverable: !isAuth,
+          recoverable,
         });
       });
     return () => {
