@@ -9,6 +9,13 @@ User=ubuntu
 # OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME) come from the repo .env;
 # opencode serve reads them from its environment. Bound to localhost (ADR-0007).
 EnvironmentFile=/home/ubuntu/projects/balam/.env
+# Mirror the interactive zsh PATH so OpenCode's non-interactive tool shells can
+# find user-installed CLIs (glab, lark-cli, acli, iris, tolgee, figma, node,
+# bun, Go-installed binaries). systemd does not source .zshrc/.zshenv.
+# The nvm version is pinned because nvm.sh cannot run in a unit; bump it when
+# switching the default Node version.
+Environment=PATH=/home/ubuntu/.bun/bin:/home/ubuntu/.opencode/bin:/home/ubuntu/.local/bin:/home/ubuntu/.nvm/versions/node/v24.15.0/bin:/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/usr/local/go/bin:/home/ubuntu/go/bin
+Environment=GOPATH=/home/ubuntu/go
 ExecStart=/home/ubuntu/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
 Restart=on-failure
 RestartSec=5s
