@@ -40,6 +40,7 @@ class ResolvedSession:
     """Everything the streamer needs to prompt a topic's session in context."""
 
     session_id: str
+    context_name: str
     directory: str
     provider: str | None
     model: str | None
@@ -70,8 +71,22 @@ class Router:
         row = self._store.get_row(ref.chat_id, ref.thread_id)
         return row[0] if row else None
 
+    def topic_auto_named(self, ref: TopicRef) -> bool:
+        """Whether the topic has already been auto-named, or manually renamed."""
+        return self._store.is_auto_named(ref.chat_id, ref.thread_id)
+
+    def mark_topic_auto_named(self, ref: TopicRef) -> None:
+        """Prevent future first-message auto-renames for this topic."""
+        self._store.mark_auto_named(ref.chat_id, ref.thread_id)
+
     async def create_topic_session(
-        self, chat_id: int, thread_id: int | None, title: str, name: str
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        title: str,
+        name: str,
+        *,
+        auto_named: bool = False,
     ) -> str:
         """Provision a fresh session for a *newly created* topic bound to context
         ``name``.
@@ -87,7 +102,14 @@ class Router:
         session_id = await self._opencode.create_session(
             title, directory=ctx.directory, permission=build_ruleset(ctx)
         )
-        self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=name)
+        self._store.set(
+            chat_id,
+            thread_id,
+            session_id,
+            int(time.time() * 1000),
+            context=name,
+            auto_named=auto_named,
+        )
         return session_id
 
     async def resolve(self, ref: TopicRef) -> ResolvedSession:
@@ -102,6 +124,7 @@ class Router:
         if existing and await self._opencode.session_exists(existing, directory=ctx.directory):
             session_id = existing
         else:
+            auto_named = self._store.is_auto_named(ref.chat_id, ref.thread_id) if row else False
             if existing:
                 # Mapped session is gone server-side: clear the stale row, recreate.
                 self._store.delete(ref.chat_id, ref.thread_id)
@@ -114,11 +137,13 @@ class Router:
                 session_id,
                 int(time.time() * 1000),
                 context=context_name,
+                auto_named=auto_named,
             )
 
         provider, model = ctx.provider_model
         return ResolvedSession(
             session_id=session_id,
+            context_name=context_name,
             directory=ctx.directory,
             provider=provider,
             model=model,

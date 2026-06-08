@@ -74,3 +74,12 @@ def test_set_overwrites_context() -> None:
     store.set(100, 5, "ses_abc", 1, context="balam")
     store.set(100, 5, "ses_def", 2, context="scratch")
     assert store.get_row(100, 5) == ("ses_def", "scratch")
+
+
+def test_auto_named_marker_can_precede_session() -> None:
+    store = fresh_store()
+
+    store.mark_auto_named(100, 5)
+    store.set(100, 5, "ses_abc", 1, context="balam")
+
+    assert store.is_auto_named(100, 5) is True

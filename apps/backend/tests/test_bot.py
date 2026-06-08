@@ -14,8 +14,10 @@ from balam.bot import (
     _handle_context,
     _handle_message,
     _handle_new,
+    _handle_rename,
     _handle_status,
     _topic_link,
+    _topic_name,
     build_application,
     is_owner,
     register_commands,
@@ -103,6 +105,8 @@ class _FakeBot:
         self._new_thread_id = new_thread_id
         self.id = bot_id
         self.created_topics: list[tuple[int, str]] = []
+        self.deleted_topics: list[tuple[int, int]] = []
+        self.edited_topics: list[tuple[int, int, str]] = []
         self.sent: list[tuple[int, str, int | None]] = []
 
     async def create_forum_topic(self, *, chat_id: int, name: str) -> SimpleNamespace:
@@ -119,11 +123,18 @@ class _FakeBot:
     ) -> None:
         self.sent.append((chat_id, text, message_thread_id))
 
+    async def edit_forum_topic(self, *, chat_id: int, message_thread_id: int, name: str) -> None:
+        self.edited_topics.append((chat_id, message_thread_id, name))
+
+    async def delete_forum_topic(self, *, chat_id: int, message_thread_id: int) -> None:
+        self.deleted_topics.append((chat_id, message_thread_id))
+
 
 class _FakeMessage:
-    def __init__(self, chat_id: int, thread_id: int | None) -> None:
+    def __init__(self, chat_id: int, thread_id: int | None, *, is_forum: bool = False) -> None:
         self.chat_id = chat_id
         self.message_thread_id = thread_id
+        self.chat = SimpleNamespace(is_forum=is_forum)
         self.reply_to_message = None
         self.replies: list[str] = []
         self.reply_markups: list[object] = []
@@ -262,6 +273,149 @@ async def test_new_opens_a_new_topic_in_the_current_context() -> None:
     assert router.current_session_id(TopicRef(SUPERGROUP, 5, "t")) is not None
     # A one-tap link to the new topic is handed back.
     assert "https://t.me/c/1234567890/900" in _button_urls(message)
+
+
+# --- topic naming -------------------------------------------------------------
+
+
+async def test_first_message_auto_names_existing_topic(monkeypatch) -> None:
+    async def fake_stream_reply(**_: object) -> None:
+        return None
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    bot = _FakeBot()
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        chat=SimpleNamespace(is_forum=True),
+        photo=[],
+        document=None,
+        text="Please inspect the failing backend tests and fix them",
+        caption=None,
+        reply_to_message=None,
+    )
+    update, context, turns = _message_env(message, bot, router=router)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task
+
+    assert bot.edited_topics == [
+        (SUPERGROUP, 5, "balam: Please inspect the failing backend tests and fix them")
+    ]
+    assert router.topic_auto_named(TopicRef(SUPERGROUP, 5, "t")) is True
+
+
+async def test_first_message_does_not_auto_name_twice(monkeypatch) -> None:
+    async def fake_stream_reply(**_: object) -> None:
+        return None
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    bot = _FakeBot()
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        chat=SimpleNamespace(is_forum=True),
+        photo=[],
+        document=None,
+        text="first",
+        caption=None,
+        reply_to_message=None,
+    )
+    update, context, turns = _message_env(message, bot, router=router)
+
+    await _handle_message(update, context)
+    first_turn = turns.get(SUPERGROUP, 5)
+    assert first_turn is not None
+    await first_turn.task
+    message.text = "second"
+    await _handle_message(update, context)
+    second_turn = turns.get(SUPERGROUP, 5)
+    assert second_turn is not None
+    await second_turn.task
+
+    assert bot.edited_topics == [(SUPERGROUP, 5, "balam: first")]
+
+
+async def test_general_message_creates_named_topic_in_current_context(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    bot = _FakeBot(new_thread_id=901)
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=None,
+        chat=SimpleNamespace(is_forum=True),
+        photo=[],
+        document=None,
+        text="Start a focused topic from General",
+        caption=None,
+        reply_to_message=None,
+        replies=[],
+        reply_markups=[],
+    )
+
+    async def reply_text(text: str, *, reply_markup: object = None, **_: object) -> None:
+        message.replies.append(text)
+        message.reply_markups.append(reply_markup)
+
+    message.reply_text = reply_text
+    update, context, turns = _message_env(message, bot, router=router)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 901)
+    assert turn is not None
+    await turn.task
+
+    assert bot.created_topics == [(SUPERGROUP, "balam: Start a focused topic from General")]
+    assert router.current_context_name(TopicRef(SUPERGROUP, 901, "t")) == "balam"
+    assert router.topic_auto_named(TopicRef(SUPERGROUP, 901, "t")) is True
+    assert captured["thread_id"] == 901
+    assert "https://t.me/c/1234567890/901" in _button_urls(message)
+
+
+async def test_rename_changes_current_topic_and_blocks_auto_name() -> None:
+    router = _router()
+    bot = _FakeBot()
+    await router.create_topic_session(SUPERGROUP, 5, "balam", "balam")
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context = _update_context(bot, router, message, ["Build", "fix"])
+
+    await _handle_rename(update, context)
+
+    assert bot.edited_topics == [(SUPERGROUP, 5, "Build fix")]
+    assert router.topic_auto_named(TopicRef(SUPERGROUP, 5, "t")) is True
+    assert "Renamed topic" in message.replies[-1]
+
+
+async def test_rename_requires_name() -> None:
+    router = _router()
+    bot = _FakeBot()
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context = _update_context(bot, router, message, [])
+
+    await _handle_rename(update, context)
+
+    assert bot.edited_topics == []
+    assert "Usage" in message.replies[-1]
+
+
+def test_topic_name_truncates_to_telegram_limit() -> None:
+    name = _topic_name("balam", "x" * 200)
+
+    assert len(name) == 128
+    assert name.startswith("balam: ")
+    assert name.endswith("...")
 
 
 async def test_new_with_arg_opens_topic_in_named_context() -> None:
@@ -460,7 +614,7 @@ async def test_register_commands_adds_chat_scope_when_configured() -> None:
 
 def test_bot_commands_includes_all_commands() -> None:
     names = {c.command for c in BOT_COMMANDS}
-    assert {"new", "status", "cancel", "context"} <= names
+    assert {"new", "rename", "status", "cancel", "context"} <= names
 
 
 # --- approval inline-keyboard callback ----------------------------------------
@@ -584,13 +738,13 @@ class _AttachmentBot:
         return _F()
 
 
-def _message_env(message, bot):
+def _message_env(message, bot, *, router: Router | None = None):
     opencode = _FakeOpenCode()
     contexts = ContextsConfig(
         default_context="balam",
         contexts={"balam": ContextConfig(directory="/work/balam", description="Balam")},
     )
-    router = Router(SessionStore(":memory:"), opencode, contexts)
+    router = router or Router(SessionStore(":memory:"), opencode, contexts)
     turns = TurnRegistry()
     update = SimpleNamespace(message=message)
     context = SimpleNamespace(

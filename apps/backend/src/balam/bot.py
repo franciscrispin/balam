@@ -65,6 +65,28 @@ def _topic_title(message: Any, thread_id: int | None) -> str:
     return f"Topic {thread_id}"
 
 
+def _is_forum_general_message(message: Any) -> bool:
+    """True for the General channel of a forum supergroup, not plain DMs."""
+    chat = getattr(message, "chat", None)
+    return message.message_thread_id is None and bool(getattr(chat, "is_forum", False))
+
+
+def _topic_name(context_name: str, first_message: str, *, has_files: bool = False) -> str:
+    """Build a Bot-API-safe topic name: ``context: truncated first message``."""
+    summary = " ".join(first_message.split())
+    if not summary:
+        summary = "attachment" if has_files else "message"
+
+    prefix = f"{context_name}: "
+    max_len = 128
+    available = max_len - len(prefix)
+    if available < 4:
+        return f"{prefix}{summary}"[: max_len - 3] + "..."
+    if len(summary) > available:
+        summary = summary[: available - 3].rstrip() + "..."
+    return f"{prefix}{summary}"
+
+
 async def _notify_error(bot: Any, chat_id: int, thread_id: int | None, exc: Exception) -> None:
     """Post a short error notice into the topic (ADR-0009 edge), swallowing any
     delivery failure so it never masks the original error."""
@@ -72,6 +94,85 @@ async def _notify_error(bot: Any, chat_id: int, thread_id: int | None, exc: Exce
         await bot.send_message(chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs(thread_id))
     except Exception:
         logger.debug("failed to deliver error notice", exc_info=True)
+
+
+async def _rename_forum_topic(bot: Any, chat_id: int, thread_id: int, name: str) -> None:
+    """Rename a normal forum topic."""
+    await bot.edit_forum_topic(chat_id=chat_id, message_thread_id=thread_id, name=name)
+
+
+async def _auto_name_topic(
+    bot: Any,
+    router: Router,
+    ref: TopicRef,
+    context_name: str,
+    first_message: str,
+    *,
+    has_files: bool = False,
+) -> None:
+    if ref.thread_id is None or router.topic_auto_named(ref):
+        return
+    name = _topic_name(context_name, first_message, has_files=has_files)
+    try:
+        await _rename_forum_topic(bot, ref.chat_id, ref.thread_id, name)
+    except Exception:
+        logger.debug("failed to auto-name topic", exc_info=True)
+        return
+    router.mark_topic_auto_named(ref)
+
+
+async def _create_topic_from_general(
+    message: Any,
+    bot: Any,
+    router: Router,
+    text: str,
+    *,
+    has_files: bool = False,
+) -> int | None:
+    """Let a message in General open a new topic in General's current context."""
+    general_ref = TopicRef(
+        chat_id=message.chat_id,
+        thread_id=None,
+        title=_topic_title(message, None),
+    )
+    context_name = router.current_context_name(general_ref)
+    name = _topic_name(context_name, text, has_files=has_files)
+    try:
+        topic = await bot.create_forum_topic(chat_id=message.chat_id, name=name)
+    except Exception as exc:
+        logger.exception("failed to create topic from General message")
+        await message.reply_text(
+            f"⚠️ Couldn't create a topic for this message: {exc}\n"
+            "This chat must be a forum supergroup and the bot an admin with "
+            "the 'Manage Topics' permission."
+        )
+        return None
+
+    thread_id = topic.message_thread_id
+    try:
+        await router.create_topic_session(
+            message.chat_id,
+            thread_id,
+            name,
+            context_name,
+            auto_named=True,
+        )
+    except Exception as exc:
+        logger.exception("failed to start session for General-created topic")
+        try:
+            await bot.delete_forum_topic(chat_id=message.chat_id, message_thread_id=thread_id)
+        except Exception:
+            logger.debug("failed to delete orphan topic after session failure", exc_info=True)
+        await message.reply_text(f"⚠️ Couldn't start a session for {context_name!r}: {exc}")
+        return None
+
+    link = _topic_link(message.chat_id, thread_id, bot_id=getattr(bot, "id", None))
+    if link:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Go to topic", url=link)]])
+        await message.reply_text(f"Opened {name}.", reply_markup=keyboard)
+    else:
+        await message.reply_text(f"Opened {name} — pick it from the topic list.")
+    return thread_id
 
 
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -99,13 +200,32 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     turns: TurnRegistry = context.application.bot_data["turns"]
     pending: PendingApprovals = context.application.bot_data["pending"]
 
+    if _is_forum_general_message(message):
+        created_thread_id = await _create_topic_from_general(
+            message,
+            context.bot,
+            router,
+            text,
+            has_files=bool(files),
+        )
+        if created_thread_id is None:
+            return
+        thread_id = created_thread_id
+
     try:
-        resolved = await router.resolve(
-            TopicRef(
-                chat_id=chat_id,
-                thread_id=thread_id,
-                title=_topic_title(message, thread_id),
-            )
+        ref = TopicRef(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            title=_topic_title(message, thread_id),
+        )
+        resolved = await router.resolve(ref)
+        await _auto_name_topic(
+            context.bot,
+            router,
+            ref,
+            resolved.context_name,
+            text,
+            has_files=bool(files),
         )
     except Exception as exc:
         # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
@@ -342,6 +462,41 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await message.reply_text("\n".join(lines))
 
 
+async def _handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/rename <name>`` — rename the current forum topic."""
+    message = update.message
+    if message is None:
+        return
+
+    new_name = " ".join(context.args or []).strip()
+    if not new_name:
+        await message.reply_text("Usage: /rename <topic name>")
+        return
+    if len(new_name) > 128:
+        await message.reply_text("Topic names must be 128 characters or fewer.")
+        return
+    if message.message_thread_id is None:
+        await message.reply_text("Use /rename inside the topic you want to rename.")
+        return
+
+    try:
+        await _rename_forum_topic(context.bot, message.chat_id, message.message_thread_id, new_name)
+    except Exception as exc:
+        logger.exception("failed to rename forum topic")
+        await message.reply_text(f"⚠️ Couldn't rename this topic: {exc}")
+        return
+
+    router: Router = context.application.bot_data["router"]
+    router.mark_topic_auto_named(
+        TopicRef(
+            chat_id=message.chat_id,
+            thread_id=message.message_thread_id,
+            title=_topic_title(message, message.message_thread_id),
+        )
+    )
+    await message.reply_text(f"Renamed topic to {new_name}.")
+
+
 def _mini_app_url(config: Config, view: str, context_name: str) -> str:
     """Build the browser/``web_app`` Mini App URL for ``view`` bound to ``context_name``.
 
@@ -537,6 +692,7 @@ async def _clear_keyboard(query: Any, note: str | None = None) -> None:
 #: clients dispatch slash commands by the bot's registered list.
 BOT_COMMANDS = [
     BotCommand("new", "Open a new topic (this context, or /new <name> for another)"),
+    BotCommand("rename", "Rename the current topic"),
     BotCommand("status", "Show this topic's context, session, and turn state"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
@@ -597,6 +753,7 @@ def build_application(
         allowed = allowed & filters.Chat(chat_id=config.allowed_telegram_chat_id)
 
     app.add_handler(CommandHandler("new", _handle_new, filters=allowed))
+    app.add_handler(CommandHandler("rename", _handle_rename, filters=allowed))
     app.add_handler(CommandHandler("status", _handle_status, filters=allowed))
     app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))

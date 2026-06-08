@@ -33,6 +33,25 @@ class SessionStore:
                 session_id TEXT    NOT NULL,
                 created_at INTEGER NOT NULL,
                 context    TEXT,
+                auto_named INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (chat_id, thread_id)
+            );
+            """
+        )
+        columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(topic_sessions)").fetchall()
+        }
+        if "auto_named" not in columns:
+            # Existing topics predate auto-naming; treat them as already named so
+            # the next message after upgrade does not unexpectedly retitle them.
+            self._db.execute(
+                "ALTER TABLE topic_sessions ADD COLUMN auto_named INTEGER NOT NULL DEFAULT 1"
+            )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topic_auto_names (
+                chat_id   INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
                 PRIMARY KEY (chat_id, thread_id)
             );
             """
@@ -62,21 +81,63 @@ class SessionStore:
         session_id: str,
         created_at: int,
         context: str | None = None,
+        auto_named: bool = False,
     ) -> None:
         """Map a topic to a session (and the context it was created in),
         overwriting any existing mapping — used both for first creation and for
         recreating a session that vanished server-side."""
+        auto_named = auto_named or self.is_auto_named(chat_id, thread_id)
         self._db.execute(
             """
-            INSERT INTO topic_sessions (chat_id, thread_id, session_id, created_at, context)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO topic_sessions (
+                chat_id, thread_id, session_id, created_at, context, auto_named
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (chat_id, thread_id)
             DO UPDATE SET
                 session_id = excluded.session_id,
                 created_at = excluded.created_at,
-                context = excluded.context
+                context = excluded.context,
+                auto_named = excluded.auto_named
             """,
-            (chat_id, self.thread_key(thread_id), session_id, created_at, context),
+            (
+                chat_id,
+                self.thread_key(thread_id),
+                session_id,
+                created_at,
+                context,
+                1 if auto_named else 0,
+            ),
+        )
+        self._db.commit()
+
+    def is_auto_named(self, chat_id: int, thread_id: int | None) -> bool:
+        """Whether automatic topic naming has already been applied or skipped."""
+        marker = self._db.execute(
+            "SELECT 1 FROM topic_auto_names WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, self.thread_key(thread_id)),
+        ).fetchone()
+        if marker:
+            return True
+        row = self._db.execute(
+            "SELECT auto_named FROM topic_sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, self.thread_key(thread_id)),
+        ).fetchone()
+        return bool(row[0]) if row else False
+
+    def mark_auto_named(self, chat_id: int, thread_id: int | None) -> None:
+        """Record that this topic should not be auto-renamed again."""
+        self._db.execute(
+            """
+            INSERT INTO topic_auto_names (chat_id, thread_id)
+            VALUES (?, ?)
+            ON CONFLICT (chat_id, thread_id) DO NOTHING
+            """,
+            (chat_id, self.thread_key(thread_id)),
+        )
+        self._db.execute(
+            "UPDATE topic_sessions SET auto_named = 1 WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, self.thread_key(thread_id)),
         )
         self._db.commit()
 
