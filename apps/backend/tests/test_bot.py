@@ -25,7 +25,7 @@ from balam.bot import (
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
-from balam.turns import TurnRegistry
+from balam.turns import TurnJob, TurnRegistry
 
 OWNER = 424242
 SUPERGROUP = -1001234567890
@@ -502,6 +502,169 @@ async def test_cancel_aborts_running_turn() -> None:
     assert task.cancelled()
     assert opencode.aborted == [("ses_running", "/work/balam")]
     assert any("Cancelled" in r for r in message.replies)
+
+
+# --- one-turn-per-topic queueing (ADR-0009) -----------------------------------
+
+
+def _job(prompt: str) -> TurnJob:
+    return TurnJob(
+        prompt=prompt,
+        session_id="ses_x",
+        directory="/work/balam",
+        provider=None,
+        model=None,
+        effort=None,
+        allowed_dirs=["/work/balam"],
+        files=[],
+    )
+
+
+def _text_msg(chat_id: int, thread_id: int | None, text: str) -> _FakeMessage:
+    """A forum text message that ``_handle_message`` can consume end to end."""
+    msg = _FakeMessage(chat_id, thread_id, is_forum=True)
+    msg.photo = []
+    msg.document = None
+    msg.text = text
+    msg.caption = None
+    return msg
+
+
+def test_turn_registry_queue_is_fifo_and_per_topic() -> None:
+    turns = TurnRegistry()
+    assert turns.queue_len(SUPERGROUP, 5) == 0
+    assert turns.pop_next(SUPERGROUP, 5) is None
+
+    assert turns.enqueue(SUPERGROUP, 5, _job("a")) == 1
+    assert turns.enqueue(SUPERGROUP, 5, _job("b")) == 2
+    assert turns.enqueue(SUPERGROUP, 6, _job("other")) == 1  # different topic, own queue
+
+    assert turns.queue_len(SUPERGROUP, 5) == 2
+    assert turns.pop_next(SUPERGROUP, 5).prompt == "a"
+    assert turns.pop_next(SUPERGROUP, 5).prompt == "b"
+    assert turns.pop_next(SUPERGROUP, 5) is None
+    assert turns.queue_len(SUPERGROUP, 6) == 1
+
+    assert turns.clear_queue(SUPERGROUP, 6) == 1
+    assert turns.clear_queue(SUPERGROUP, 6) == 0
+
+
+async def test_message_during_running_turn_is_queued_then_drains(monkeypatch) -> None:
+    prompts: list[str] = []
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+
+    async def fake_stream_reply(*, prompt: str, **_: object) -> None:
+        prompts.append(prompt)
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    # The first message starts a turn straight away.
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    first_task = turns.get(SUPERGROUP, 5).task
+
+    # A second message arriving mid-turn is queued, not run, and acknowledged.
+    message.text = "second"
+    await _handle_message(update, context)
+    assert prompts == ["first"]
+    assert turns.queue_len(SUPERGROUP, 5) == 1
+    assert any("Queued" in r for r in message.replies)
+
+    # Finishing the first turn drains the queued message onto the same session.
+    gate.set()
+    await first_task
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task
+    assert prompts == ["first", "second"]
+    assert turns.queue_len(SUPERGROUP, 5) == 0
+
+
+async def test_queued_messages_drain_in_fifo_order(monkeypatch) -> None:
+    prompts: list[str] = []
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+
+    async def fake_stream_reply(*, prompt: str, **_: object) -> None:
+        prompts.append(prompt)
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    first_task = turns.get(SUPERGROUP, 5).task
+
+    message.text = "second"
+    await _handle_message(update, context)
+    message.text = "third"
+    await _handle_message(update, context)
+    assert turns.queue_len(SUPERGROUP, 5) == 2
+
+    gate.set()
+    await first_task
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task  # each finished turn hands the slot to the next
+    assert prompts == ["first", "second", "third"]
+
+
+async def test_cancel_drops_queued_messages(monkeypatch) -> None:
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+
+    async def fake_stream_reply(*, prompt: str, **_: object) -> None:
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    first_task = turns.get(SUPERGROUP, 5).task
+    message.text = "second"
+    await _handle_message(update, context)
+    assert turns.queue_len(SUPERGROUP, 5) == 1
+
+    # /cancel stops the running turn AND clears anything queued behind it.
+    await _handle_cancel(update, context)
+    await asyncio.sleep(0)  # let the cancellation propagate
+    with contextlib.suppress(asyncio.CancelledError):
+        await first_task
+
+    assert turns.queue_len(SUPERGROUP, 5) == 0
+    assert turns.get(SUPERGROUP, 5) is None  # nothing drained after cancel
+    assert any("queued" in r.lower() for r in message.replies)
+
+
+async def test_status_reports_queue_depth() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, _router, _opencode, turns = _session_cmd_env(message)
+    task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
+    turns.enqueue(SUPERGROUP, 5, _job("queued one"))
+    turns.enqueue(SUPERGROUP, 5, _job("queued two"))
+
+    await _handle_status(update, context)
+
+    assert "Queued: 2" in message.replies[-1]
+    task.cancel()
 
 
 # --- chat scoping (ADR-0010): the bot acts only in the workspace supergroup -----

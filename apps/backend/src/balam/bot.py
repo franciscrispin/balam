@@ -43,7 +43,7 @@ from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
 from balam.streamer import stream_reply
 from balam.telegram_utils import thread_kwargs
-from balam.turns import TurnRegistry
+from balam.turns import TurnJob, TurnRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -196,9 +196,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     router: Router = context.application.bot_data["router"]
-    opencode: OpenCode = context.application.bot_data["opencode"]
     turns: TurnRegistry = context.application.bot_data["turns"]
-    pending: PendingApprovals = context.application.bot_data["pending"]
 
     if _is_forum_general_message(message):
         created_thread_id = await _create_topic_from_general(
@@ -233,36 +231,87 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _notify_error(context.bot, chat_id, thread_id, exc)
         return
 
-    # Run the turn as a background task registered in the turn registry, so the
-    # handler returns immediately and a concurrent /cancel update can interrupt it
-    # (PTB processes updates sequentially, so awaiting here would block /cancel).
+    job = TurnJob(
+        prompt=text,
+        session_id=resolved.session_id,
+        directory=resolved.directory,
+        provider=resolved.provider,
+        model=resolved.model,
+        effort=resolved.effort,
+        allowed_dirs=[resolved.directory, *resolved.additional_directories],
+        files=files,
+    )
+
+    # One turn per topic at a time (ADR-0009). OpenCode runs a single turn per
+    # session, so a message that lands while a turn is still streaming must not
+    # fire a second prompt — that collides and the message is silently dropped.
+    # Queue it instead; the running turn drains it when it finishes. The check and
+    # the enqueue run with no ``await`` between them, so the running turn's drain
+    # can't race in and miss this message.
+    if turns.get(chat_id, thread_id) is not None:
+        position = turns.enqueue(chat_id, thread_id, job)
+        await message.reply_text(
+            f"⏳ Queued (#{position}) — I'll run this after the current turn finishes."
+        )
+        return
+
+    _start_turn(context, chat_id, thread_id, job)
+
+
+def _start_turn(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: int | None,
+    job: TurnJob,
+) -> None:
+    """Run ``job`` as the topic's turn in a background task, then hand the running
+    slot to the next queued message when it finishes.
+
+    The turn runs as a background task registered in the turn registry, so the
+    message handler returns immediately and a concurrent ``/cancel`` update can
+    interrupt it (PTB processes updates sequentially, so awaiting in the handler
+    would block ``/cancel``).
+    """
+    opencode: OpenCode = context.application.bot_data["opencode"]
+    turns: TurnRegistry = context.application.bot_data["turns"]
+    pending: PendingApprovals = context.application.bot_data["pending"]
+
     async def run() -> None:
+        cancelled = False
         try:
             await stream_reply(
                 bot=context.bot,
                 opencode=opencode,
-                session_id=resolved.session_id,
+                session_id=job.session_id,
                 chat_id=chat_id,
                 thread_id=thread_id,
-                prompt=text,
-                directory=resolved.directory,
-                provider=resolved.provider,
-                model=resolved.model,
-                effort=resolved.effort,
+                prompt=job.prompt,
+                directory=job.directory,
+                provider=job.provider,
+                model=job.model,
+                effort=job.effort,
                 pending=pending,
-                allowed_dirs=[resolved.directory, *resolved.additional_directories],
-                files=files,
+                allowed_dirs=job.allowed_dirs,
+                files=job.files,
             )
         except asyncio.CancelledError:
-            raise  # /cancel aborted the turn; let the task settle as cancelled.
+            cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
+            raise
         except Exception as exc:
             logger.exception("failed to handle message")
             await _notify_error(context.bot, chat_id, thread_id, exc)
         finally:
+            # Release the slot and hand it straight to the next queued message.
+            # clear → pop → _start_turn run without an ``await`` between them, so
+            # the slot never blinks empty and a concurrent message can't slip a
+            # second turn onto the same session.
             turns.clear(chat_id, thread_id, task)
+            next_job = None if cancelled else turns.pop_next(chat_id, thread_id)
+            if next_job is not None:
+                _start_turn(context, chat_id, thread_id, next_job)
 
     task = asyncio.create_task(run())
-    turns.register(chat_id, thread_id, task, resolved.session_id, resolved.directory)
+    turns.register(chat_id, thread_id, task, job.session_id, job.directory)
 
 
 def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str | None:
@@ -450,6 +499,7 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ctx = router.contexts.get(name)
     session_id = router.current_session_id(ref)
     running = turns.get(ref.chat_id, ref.thread_id) is not None
+    queued = turns.queue_len(ref.chat_id, ref.thread_id)
 
     lines = [
         f"Context: {name}",
@@ -458,6 +508,7 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Effort: {ctx.effort or '(server default)'}",
         f"Session: {session_id or '(none yet — send a message to start)'}",
         f"Turn: {'running' if running else 'idle'}",
+        f"Queued: {queued}",
     ]
     await message.reply_text("\n".join(lines))
 
@@ -600,15 +651,26 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     turns: TurnRegistry = context.application.bot_data["turns"]
 
     turn = turns.get(message.chat_id, message.message_thread_id)
+    # Drop anything queued behind the turn too — otherwise it would auto-run right
+    # after the cancelled turn settles, which is not what /cancel means.
+    dropped = turns.clear_queue(message.chat_id, message.message_thread_id)
     if turn is None:
-        await message.reply_text("No running turn.")
+        if dropped:
+            await message.reply_text(
+                f"🛑 Cleared {dropped} queued message(s); no turn was running."
+            )
+        else:
+            await message.reply_text("No running turn.")
         return
 
     tasks: set[asyncio.Task[None]] = context.application.bot_data.setdefault(
         "background_tasks", set()
     )
     _abort_turn(turn, opencode, tasks)
-    await message.reply_text("🛑 Cancelled.")
+    if dropped:
+        await message.reply_text(f"🛑 Cancelled. Also cleared {dropped} queued message(s).")
+    else:
+        await message.reply_text("🛑 Cancelled.")
 
 
 #: Per approval choice: ``(inline note appended to the prompt — already
