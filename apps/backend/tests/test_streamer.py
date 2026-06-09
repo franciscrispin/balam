@@ -248,6 +248,29 @@ def _text_part(mid: str, text: str, pid: str = "prt_1") -> dict[str, object]:
     )
 
 
+def _reasoning_part(mid: str, text: str, pid: str = "prt_reasoning") -> dict[str, object]:
+    return _ev(
+        "message.part.updated",
+        part={"type": "reasoning", "sessionID": SID, "messageID": mid, "id": pid, "text": text},
+    )
+
+
+def _metadata_reasoning_text_part(
+    mid: str, text: str, pid: str = "prt_metadata_reasoning"
+) -> dict[str, object]:
+    return _ev(
+        "message.part.updated",
+        part={
+            "type": "text",
+            "sessionID": SID,
+            "messageID": mid,
+            "id": pid,
+            "text": text,
+            "metadata": {"type": "reasoning"},
+        },
+    )
+
+
 def _tool_part(
     call_id: str, tool: str, state: dict[str, object], pid: str = "prt_tool"
 ) -> dict[str, object]:
@@ -334,7 +357,31 @@ async def test_stream_reply_captures_assistant_text_and_skips_user_echo() -> Non
     assert bot.messages == ["hey there"]
 
 
-async def test_stream_reply_renders_tool_line_interleaved_with_text() -> None:
+async def test_stream_reply_sends_reasoning_separately_from_answer() -> None:
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _reasoning_part(AID, "I should be sent as reasoning."),
+            _text_part(AID, "the answer"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    assert bot.messages == [r"I should be sent as reasoning\.", "the answer"]
+
+
+async def test_stream_reply_sends_metadata_reasoning_separately_from_answer() -> None:
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _metadata_reasoning_text_part(AID, "I should be sent as reasoning."),
+            _text_part(AID, "the answer"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    assert bot.messages == [r"I should be sent as reasoning\.", "the answer"]
+
+
+async def test_stream_reply_renders_tool_line_separately_from_answer() -> None:
     fpath = "/work/proj/src/foo.py"
     bot = await _run(
         [
@@ -352,14 +399,14 @@ async def test_stream_reply_renders_tool_line_interleaved_with_text() -> None:
         ],
         directory="/work/proj",
     )
-    assert len(bot.messages) == 1
-    final = bot.messages[0]
-    # Tool line, path shown relative to the context directory, interleaved
-    # between the two prose fragments in arrival order.
-    assert "🔧 Read" in final
-    assert "src/foo.py" in final
-    assert "/work/proj" not in final
-    assert final.index("look") < final.index("Read") < final.index("Done")
+    assert len(bot.messages) == 2
+    reasoning, answer = bot.messages
+    # Tool line is progress/reasoning, not part of the answer message. Path is
+    # still shown relative to the context directory.
+    assert "🔧 Read" in reasoning
+    assert "src/foo.py" in reasoning
+    assert "/work/proj" not in reasoning
+    assert answer == r"Let me look\.Done\."
 
 
 async def test_stream_reply_truncates_bash_output() -> None:

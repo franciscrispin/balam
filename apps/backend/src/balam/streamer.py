@@ -241,6 +241,43 @@ def _join_stream(parts: dict[str, StreamPart]) -> str:
     return out
 
 
+def _is_answer_text_part(part: dict[str, Any]) -> bool:
+    """Whether an OpenCode text part should be shown to the user.
+
+    OpenCode exposes model reasoning as its own ``type: "reasoning"`` part in
+    v1.15.x. This also rejects defensive legacy/future shapes where a text part is
+    explicitly marked ignored or reasoning-like in metadata.
+    """
+    if part.get("type") != "text" or part.get("ignored") is True:
+        return False
+    metadata = part.get("metadata")
+    if not isinstance(metadata, dict):
+        return True
+    return not (
+        metadata.get("reasoning") is True
+        or metadata.get("thinking") is True
+        or metadata.get("kind") in {"reasoning", "thinking"}
+        or metadata.get("type") in {"reasoning", "thinking"}
+    )
+
+
+def _is_reasoning_part(part: dict[str, Any]) -> bool:
+    """Whether an OpenCode part is model reasoning/thinking text."""
+    if part.get("type") == "reasoning":
+        return True
+    if part.get("type") != "text":
+        return False
+    metadata = part.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get("reasoning") is True
+        or metadata.get("thinking") is True
+        or metadata.get("kind") in {"reasoning", "thinking"}
+        or metadata.get("type") in {"reasoning", "thinking"}
+    )
+
+
 def _relpath(path: str, directory: str | None) -> str:
     """Show *path* relative to the context *directory* when it lives under it;
     otherwise return it unchanged (e.g. an absolute path outside the workspace)."""
@@ -477,7 +514,8 @@ async def stream_reply(
     ignored (e.g. unit tests of the text/tool path).
     """
     transport = _make_transport(bot, chat_id, thread_id)
-    draft = DraftSession(transport)
+    reasoning_draft = DraftSession(transport)
+    answer_draft = DraftSession(transport)
     topic_kwargs = thread_kwargs(thread_id)
 
     streaming = True
@@ -487,13 +525,16 @@ async def stream_reply(
             await asyncio.sleep(draft_interval)
             if not streaming:
                 break
-            await draft.flush_draft()
+            await reasoning_draft.flush_draft()
+            await answer_draft.flush_draft()
 
     flush_task = asyncio.create_task(flush_loop())
 
     assistant_message_ids: set[str] = set()
-    # Interleaved text + tool fragments, keyed by part id / ``tool:<callID>``.
-    stream_parts: dict[str, StreamPart] = {}
+    # Reasoning/progress and answer text are delivered as separate messages.
+    # Tool calls are progress, so they live with the reasoning stream.
+    reasoning_parts: dict[str, StreamPart] = {}
+    answer_parts: dict[str, StreamPart] = {}
     # Latest ``(tool, input, status)`` per tool callID. Built here so the
     # interactive-approval step (#3) can recover a call's input by callID.
     tool_parts: dict[str, tuple[str, dict[str, Any], str | None]] = {}
@@ -616,7 +657,7 @@ async def stream_reply(
                 if part.get("sessionID") != session_id:
                     continue
                 ptype = part.get("type")
-                if ptype == "text":
+                if _is_answer_text_part(part):
                     # Render only assistant text. Subscribing before prompting
                     # guarantees we see the assistant's message.updated before its
                     # parts, so this set is populated by the time they arrive.
@@ -624,12 +665,23 @@ async def stream_reply(
                         continue
                     part_id = part.get("id")
                     text = part.get("text", "")
-                    if part_id in stream_parts:
-                        stream_parts[part_id] = (stream_parts[part_id][0], "text", text)
+                    if part_id in answer_parts:
+                        answer_parts[part_id] = (answer_parts[part_id][0], "text", text)
                     else:
-                        stream_parts[part_id] = (order, "text", text)
+                        answer_parts[part_id] = (order, "text", text)
                         order += 1
-                    draft.set_text(_join_stream(stream_parts))
+                    answer_draft.set_text(_join_stream(answer_parts))
+                elif _is_reasoning_part(part):
+                    if part.get("messageID") not in assistant_message_ids:
+                        continue
+                    part_id = part.get("id")
+                    text = part.get("text", "")
+                    if part_id in reasoning_parts:
+                        reasoning_parts[part_id] = (reasoning_parts[part_id][0], "text", text)
+                    else:
+                        reasoning_parts[part_id] = (order, "text", text)
+                        order += 1
+                    reasoning_draft.set_text(_join_stream(reasoning_parts))
                 elif ptype == "tool":
                     call_id = part.get("callID")
                     if not call_id:
@@ -647,13 +699,13 @@ async def stream_reply(
                     # line interleaves before any later text), but only render
                     # once the call finishes.
                     key = f"tool:{call_id}"
-                    if key not in stream_parts:
-                        stream_parts[key] = (order, "tool", "")
+                    if key not in reasoning_parts:
+                        reasoning_parts[key] = (order, "tool", "")
                         order += 1
                     if status in ("completed", "error"):
                         rendered = _render_tool_part(tool, tool_input, state, directory)
-                        stream_parts[key] = (stream_parts[key][0], "tool", rendered)
-                        draft.set_text(_join_stream(stream_parts))
+                        reasoning_parts[key] = (reasoning_parts[key][0], "tool", rendered)
+                        reasoning_draft.set_text(_join_stream(reasoning_parts))
 
             elif etype == "permission.asked":
                 # ``props`` is the PermissionRequest. Handle in a child task so a
@@ -706,9 +758,9 @@ async def stream_reply(
             error_text = error_text or str(exc) or exc.__class__.__name__
 
         if error_text:
-            base = _join_stream(stream_parts)
+            base = _join_stream(answer_parts)
             prefix = f"{base}\n\n" if base.strip() else ""
-            draft.set_text(f"{prefix}⚠️ {error_text}")
+            answer_draft.set_text(f"{prefix}⚠️ {error_text}")
     finally:
         # Stop the flusher and the consumer before finalizing so neither races the
         # real message, and so a leftover task can't outlive the turn. Pending
@@ -722,6 +774,10 @@ async def stream_reply(
                 ptask.cancel()
         await asyncio.gather(flush_task, consume_task, *permission_tasks, return_exceptions=True)
 
-    # Replace the ephemeral draft with the real, persistent message(s) — always,
-    # even on error, so accumulated text and any error notice are delivered.
-    await draft.finalize()
+    # Replace ephemeral drafts with real, persistent messages. Reasoning/progress
+    # is intentionally separate from the answer; only emit the answer fallback if
+    # the turn produced nothing visible at all.
+    if reasoning_draft.text.strip():
+        await reasoning_draft.finalize()
+    if answer_draft.text.strip() or not reasoning_draft.text.strip():
+        await answer_draft.finalize()
