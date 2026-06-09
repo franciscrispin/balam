@@ -586,6 +586,7 @@ async def stream_reply(
     tool_parts: dict[str, tuple[str, dict[str, Any], str | None]] = {}
     order = 0
     error_text: str | None = None
+    retry_noticed = False
     stream_ready = asyncio.Event()
     dirs = allowed_dirs or ([directory] if directory else [])
     # Per-request approval tasks, so the SSE loop isn't blocked while the user
@@ -741,6 +742,34 @@ async def stream_reply(
             return
         await opencode.reply_question(request["id"], answers, directory=directory)
 
+    async def note_retry(status: dict[str, Any]) -> None:
+        """Tell the user the turn is being retried (e.g. provider rate limit).
+
+        OpenCode retries some failures (rate limits, transient 5xx) internally
+        without emitting ``session.error``, so the turn can stall for minutes with
+        no visible output. Surface a single notice per turn — enough to explain
+        the silence and point at ``/cancel`` — without spamming one per attempt.
+        """
+        nonlocal retry_noticed
+        if retry_noticed:
+            return
+        retry_noticed = True
+        action = status.get("action") if isinstance(status.get("action"), dict) else None
+        detail = ""
+        if action and isinstance(action.get("message"), str):
+            detail = action["message"]
+        elif isinstance(status.get("message"), str):
+            detail = status["message"]
+        detail = detail.strip().splitlines()[0][:300] if detail.strip() else ""
+        body = "⏳ The model provider is rate-limited — retrying…"
+        if detail:
+            body += f"\n{detail}"
+        body += "\nThis can take a while; send /cancel to stop waiting."
+        try:
+            await bot.send_message(chat_id=chat_id, text=body, **topic_kwargs)
+        except Exception:
+            logger.debug("failed to post retry notice", exc_info=True)
+
     async def consume() -> None:
         nonlocal order, error_text
         async for event in opencode.events(directory=directory, ready=stream_ready):
@@ -823,6 +852,11 @@ async def stream_reply(
                 qtask = asyncio.create_task(request_questions(props))
                 question_tasks.add(qtask)
                 qtask.add_done_callback(question_tasks.discard)
+
+            elif etype == "session.status" and props.get("sessionID") == session_id:
+                status = props.get("status")
+                if isinstance(status, dict) and status.get("type") == "retry":
+                    await note_retry(status)
 
             elif etype == "session.error" and props.get("sessionID") == session_id:
                 error_text = _describe_error(props.get("error"))

@@ -357,6 +357,45 @@ async def test_stream_reply_captures_assistant_text_and_skips_user_echo() -> Non
     assert bot.messages == ["hey there"]
 
 
+def _retry_status(attempt: int, message: str) -> dict[str, object]:
+    return _ev(
+        "session.status",
+        sessionID=SID,
+        status={"type": "retry", "attempt": attempt, "message": message, "next": 0},
+    )
+
+
+async def test_stream_reply_posts_single_retry_notice() -> None:
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _retry_status(1, "Too Many Requests: the usage limit has been reached"),
+            _retry_status(2, "Too Many Requests: the usage limit has been reached"),
+            _text_part(AID, "recovered"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    notices = [m for m in bot.messages if "rate-limited" in m]
+    # One notice per turn even across multiple retry attempts; points at /cancel.
+    assert len(notices) == 1
+    assert "/cancel" in notices[0]
+    assert "the usage limit has been reached" in notices[0]
+    # The retry notice is separate from the finalized answer.
+    assert "recovered" in bot.messages
+
+
+async def test_stream_reply_ignores_non_retry_status() -> None:
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _ev("session.status", sessionID=SID, status={"type": "busy"}),
+            _text_part(AID, "hello"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    assert not any("rate-limited" in m for m in bot.messages)
+
+
 async def test_stream_reply_sends_reasoning_separately_from_answer() -> None:
     bot = await _run(
         [
