@@ -47,6 +47,8 @@ from balam.turns import TurnJob, TurnRegistry
 
 logger = logging.getLogger(__name__)
 
+APPROVAL_DELETE_DELAY_S = 2.0
+
 
 def is_owner(from_id: int | None, allowed_user_id: int) -> bool:
     """The allowlist check, isolated for testing (ADR-0008)."""
@@ -687,9 +689,9 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 #: Per approval choice: ``(inline note appended to the prompt — already
 #: MarkdownV2-escaped, toast shown on the callback answer)``.
 _CHOICE_FEEDBACK = {
-    Choice.ALLOW: ("✅ Allowed\\.", "Allowed."),
+    Choice.ALLOW: ("✅ Approved\\.", "Approved."),
     Choice.ALL: (
-        "✅ Allowed — accepting all edits this session\\.",
+        "✅ Approved — accepting all edits this session\\.",
         "Accepting all edits.",
     ),
     Choice.DENY: ("❌ Denied\\.", "Denied."),
@@ -739,7 +741,9 @@ async def _handle_approval_callback(update: Update, context: ContextTypes.DEFAUL
 
     note, toast = _CHOICE_FEEDBACK[choice]
     await query.answer(toast)
-    await _clear_keyboard(query, note=note)
+    updated = await _clear_keyboard(query, note=note)
+    if updated and choice is not Choice.DENY:
+        _schedule_approval_cleanup(context, query.message)
 
 
 async def _handle_question_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -823,7 +827,7 @@ async def _handle_question_custom_callback(
     await _clear_keyboard(query, note=r"Reply with your answer\.")
 
 
-async def _clear_keyboard(query: Any, note: str | None = None) -> None:
+async def _clear_keyboard(query: Any, note: str | None = None) -> bool:
     """Strip a spent approval keyboard, appending a one-line outcome when given.
 
     ``note`` (when set) must already be MarkdownV2-escaped. Best-effort: a failed
@@ -832,13 +836,33 @@ async def _clear_keyboard(query: Any, note: str | None = None) -> None:
     """
     message = getattr(query, "message", None)
     if message is None:
-        return
+        return False
     original = message.text_markdown_v2 or message.text or ""
     text = f"{original}\n\n{note}" if note else original
     try:
         await message.edit_text(text=text, parse_mode="MarkdownV2", reply_markup=None)
+        return True
     except Exception:
         logger.debug("failed to update spent approval message", exc_info=True)
+        return False
+
+
+def _schedule_approval_cleanup(context: ContextTypes.DEFAULT_TYPE, message: Any) -> None:
+    """Delete approved approval prompts after Telegram has shown the edit."""
+    bot_data = context.application.bot_data
+    delay_s = bot_data.get("approval_delete_delay_s", APPROVAL_DELETE_DELAY_S)
+    task = asyncio.create_task(_delete_message_after_delay(message, delay_s))
+    background_tasks = bot_data.setdefault("background_tasks", set())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+async def _delete_message_after_delay(message: Any, delay_s: float) -> None:
+    await asyncio.sleep(delay_s)
+    try:
+        await message.delete()
+    except Exception:
+        logger.debug("failed to delete approved approval message", exc_info=True)
 
 
 #: The slash commands Balam exposes. Registering them via ``setMyCommands`` is

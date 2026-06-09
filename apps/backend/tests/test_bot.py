@@ -801,9 +801,13 @@ class _FakeCBMessage:
         self.chat = SimpleNamespace(id=chat_id)
         self.message_thread_id = thread_id
         self.edited: list[str] = []
+        self.deleted = 0
 
     async def edit_text(self, *, text: str, reply_markup=None, **_: object) -> None:
         self.edited.append(text)
+
+    async def delete(self) -> None:
+        self.deleted += 1
 
 
 class _FakeQuery:
@@ -821,7 +825,14 @@ def _callback_env(query: _FakeQuery, pending: PendingApprovals, *, chat_id: int 
     config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id)
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
-        application=SimpleNamespace(bot_data={"config": config, "pending": pending})
+        application=SimpleNamespace(
+            bot_data={
+                "config": config,
+                "pending": pending,
+                "background_tasks": set(),
+                "approval_delete_delay_s": 0,
+            }
+        )
     )
     return update, context
 
@@ -849,6 +860,23 @@ async def test_approval_callback_owner_allow_resolves_future() -> None:
 
     assert future.done() and future.result() is Choice.ALLOW
     assert query.message.edited  # outcome annotated, keyboard removed
+    assert "Approved" in query.message.edited[-1]
+
+
+async def test_approval_callback_owner_allow_deletes_prompt_after_edit() -> None:
+    pending = PendingApprovals()
+    token, future = pending.register("ses_x")
+    message = _FakeCBMessage()
+    query = _FakeQuery(f"appr:allow:{token}", OWNER, message)
+    update, context = _callback_env(query, pending)
+
+    await _handle_approval_callback(update, context)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert future.result() is Choice.ALLOW
+    assert message.edited and "Approved" in message.edited[-1]
+    assert message.deleted == 1
 
 
 async def test_approval_callback_all_sets_accept_all_edits() -> None:
@@ -861,6 +889,24 @@ async def test_approval_callback_all_sets_accept_all_edits() -> None:
 
     assert future.result() is Choice.ALL
     assert pending.is_accept_all_edits("ses_y") is True
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+
+async def test_approval_callback_deny_does_not_delete_prompt() -> None:
+    pending = PendingApprovals()
+    token, future = pending.register("ses_x")
+    message = _FakeCBMessage()
+    query = _FakeQuery(f"appr:deny:{token}", OWNER, message)
+    update, context = _callback_env(query, pending)
+
+    await _handle_approval_callback(update, context)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert future.result() is Choice.DENY
+    assert message.edited and "Denied" in message.edited[-1]
+    assert message.deleted == 0
 
 
 async def test_approval_callback_ignores_stranger() -> None:
