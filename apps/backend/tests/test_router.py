@@ -10,6 +10,7 @@ class FakeOpenCode:
         self.existing = existing or set()
         self.created: list[tuple[str, str | None]] = []
         self.permissions: list[list[dict[str, str]] | None] = []
+        self.updated_permissions: list[tuple[str, str | None, list[dict[str, str]]]] = []
         self.mcps: list[dict | None] = []
         self.exists_calls: list[tuple[str, str | None]] = []
         self._counter = 0
@@ -33,6 +34,15 @@ class FakeOpenCode:
         self.permissions.append(permission)
         self.mcps.append(mcp)
         return sid
+
+    async def update_session_permission(
+        self,
+        session_id: str,
+        *,
+        directory: str | None = None,
+        permission: list[dict[str, str]],
+    ) -> None:
+        self.updated_permissions.append((session_id, directory, permission))
 
 
 def _contexts() -> ContextsConfig:
@@ -83,6 +93,17 @@ async def test_reuses_live_session_and_its_bound_context() -> None:
     assert resolved.provider is None and resolved.model is None and resolved.effort is None
     assert oc.created == []  # reused, not recreated
     assert oc.exists_calls == [("ses_live", "/work/scratch")]
+    assert oc.updated_permissions == [
+        (
+            "ses_live",
+            "/work/scratch",
+            [
+                {"permission": "*", "pattern": "*", "action": "ask"},
+                {"permission": "todowrite", "pattern": "*", "action": "allow"},
+                {"permission": "question", "pattern": "*", "action": "allow"},
+            ],
+        )
+    ]
 
 
 async def test_recreates_vanished_session_preserving_context() -> None:
@@ -144,6 +165,28 @@ async def test_create_session_passes_context_ruleset() -> None:
     assert ruleset is not None
     assert ruleset[0] == {"permission": "*", "pattern": "*", "action": "ask"}
     assert {"permission": "lsp", "pattern": "*", "action": "allow"} in ruleset
+    assert {"permission": "bash", "pattern": "git *", "action": "allow"} in ruleset
+
+
+async def test_reused_session_syncs_context_ruleset() -> None:
+    store, oc = _store(), FakeOpenCode(existing={"ses_live"})
+    contexts = ContextsConfig(
+        default_context="balam",
+        contexts={
+            "balam": ContextConfig(
+                directory="/work/balam",
+                description="Balam",
+                allowed_tools=["Bash(git *)"],
+            )
+        },
+    )
+    router = Router(store, oc, contexts)
+    store.set(1, 5, "ses_live", 1, context="balam")
+
+    await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    assert oc.updated_permissions
+    _, _, ruleset = oc.updated_permissions[0]
     assert {"permission": "bash", "pattern": "git *", "action": "allow"} in ruleset
 
 

@@ -36,10 +36,10 @@ from __future__ import annotations
 from balam.contexts import ContextConfig
 from balam.opencode_tools import Permission, Tool
 
-#: Internal bookkeeping tools that are never user-visible and always allowed, so
-#: they don't generate approval noise. Kept deliberately minimal (matches the
-#: legacy ``ASK_ALL_PERMISSIONS`` baseline).
-ALWAYS_ALLOWED_PERMS: tuple[Permission, ...] = (Permission.TODOWRITE,)
+#: Permissions that should never generate Balam approval noise. ``todowrite`` is
+#: internal bookkeeping; ``question`` is OpenCode's own interactive question flow
+#: and should be handled by OpenCode rather than Balam's tool-approval keyboard.
+ALWAYS_ALLOWED_PERMS: tuple[Permission, ...] = (Permission.TODOWRITE, Permission.QUESTION)
 
 #: ``allowed_tools`` names that mean "let the model edit files". OpenCode folds
 #: the edit/write/apply_patch *tools* into one ``edit`` *permission* category, so

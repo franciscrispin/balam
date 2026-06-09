@@ -41,12 +41,12 @@ logger = logging.getLogger(__name__)
 #: rather than run it unattended. The real per-context ruleset is built by
 #: :func:`balam.permissions.build_ruleset` and passed to :meth:`OpenCode.create_session`;
 #: this baseline is its zero-opt-in case. OpenCode evaluates the LAST matching
-#: rule, so the ask-all baseline goes first and the ``todowrite`` allow (internal
-#: bookkeeping, never user-visible) follows it. See ADR-0012 and the open-shrimp
-#: reference.
+#: rule, so the ask-all baseline goes first and the always-allowed baseline tools
+#: follow it. See ADR-0012 and the open-shrimp reference.
 ASK_ALL_PERMISSIONS: list[dict[str, str]] = [
     {"permission": "*", "pattern": "*", "action": "ask"},
     {"permission": Permission.TODOWRITE, "pattern": "*", "action": "allow"},
+    {"permission": Permission.QUESTION, "pattern": "*", "action": "allow"},
 ]
 
 
@@ -242,6 +242,21 @@ class OpenCode:
         )
         return response.status_code == 200
 
+    async def update_session_permission(
+        self, session_id: str, *, directory: str, permission: list[dict[str, str]]
+    ) -> None:
+        """Replace an existing session's permission ruleset.
+
+        Session permissions are stored by OpenCode at creation time. Syncing them
+        on reuse makes ``config.yaml`` changes effective for existing topics too.
+        """
+        response = await self._client.patch(
+            f"/session/{session_id}",
+            params={"directory": directory},
+            json={"permission": permission},
+        )
+        response.raise_for_status()
+
     async def prompt(
         self,
         session_id: str,
@@ -329,6 +344,31 @@ class OpenCode:
             response.raise_for_status()
         except httpx.HTTPError:
             logger.warning("failed to reply to permission %s", request_id, exc_info=True)
+
+    async def reply_question(
+        self,
+        request_id: str,
+        answers: list[list[str]],
+        *,
+        directory: str | None = None,
+    ) -> None:
+        """Answer a ``question.asked`` request (``POST /question/{id}/reply``)."""
+        params = {"directory": directory} if directory else None
+        response = await self._client.post(
+            f"/question/{request_id}/reply",
+            params=params,
+            json={"answers": answers},
+        )
+        response.raise_for_status()
+
+    async def reject_question(self, request_id: str, *, directory: str | None = None) -> None:
+        """Reject a ``question.asked`` request (``POST /question/{id}/reject``)."""
+        params = {"directory": directory} if directory else None
+        try:
+            response = await self._client.post(f"/question/{request_id}/reject", params=params)
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.warning("failed to reject question %s", request_id, exc_info=True)
 
     async def events(
         self, *, directory: str | None = None, ready: asyncio.Event | None = None

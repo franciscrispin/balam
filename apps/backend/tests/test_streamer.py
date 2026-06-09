@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from balam.approvals import Choice, PendingApprovals
+from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile
 from balam.streamer import DraftSession, _make_transport, stream_reply
 
@@ -537,7 +537,10 @@ class PermissionOpenCode(FakeOpenCode):
         super().__init__([])
         self._script = events
         self.replies: list[tuple[str, str, str | None]] = []
+        self.question_replies: list[tuple[str, list[list[str]]]] = []
+        self.question_rejections: list[str] = []
         self._replied = asyncio.Event()
+        self._question_replied = asyncio.Event()
 
     async def reply_permission(
         self,
@@ -550,6 +553,16 @@ class PermissionOpenCode(FakeOpenCode):
         self.replies.append((request_id, reply, message))
         self._replied.set()
 
+    async def reply_question(
+        self, request_id: str, answers: list[list[str]], *, directory: str | None = None
+    ) -> None:
+        self.question_replies.append((request_id, answers))
+        self._question_replied.set()
+
+    async def reject_question(self, request_id: str, *, directory: str | None = None) -> None:
+        self.question_rejections.append(request_id)
+        self._question_replied.set()
+
     async def events(self, *, directory: str | None = None, ready: asyncio.Event | None = None):
         self.events_directory = directory
         if ready is not None:
@@ -557,6 +570,9 @@ class PermissionOpenCode(FakeOpenCode):
         for event in self._script:
             if event == "WAIT_REPLY":
                 await self._replied.wait()
+                continue
+            if event == "WAIT_QUESTION_REPLY":
+                await self._question_replied.wait()
                 continue
             yield event
 
@@ -567,6 +583,41 @@ def _token_from_keyboard(markup: object) -> str:
             if button.callback_data and button.callback_data.startswith("appr:"):
                 return button.callback_data.split(":", 2)[2]
     raise AssertionError("no approval button found")
+
+
+def _question_callback(markup: object, label: str) -> str:
+    for row in markup.inline_keyboard:  # type: ignore[attr-defined]
+        for button in row:
+            if button.text == label:
+                return button.callback_data
+    raise AssertionError(f"no question button {label!r} found")
+
+
+def _question(request_id: str) -> dict[str, object]:
+    return _ev(
+        "question.asked",
+        id=request_id,
+        sessionID=SID,
+        questions=[
+            {
+                "question": "Pick a weather.",
+                "header": "Weather",
+                "options": [
+                    {"label": "Sunny", "description": "Bright."},
+                    {"label": "Rainy", "description": "Cozy."},
+                ],
+            },
+            {
+                "question": "Pick a snack.",
+                "header": "Snack",
+                "options": [
+                    {"label": "Fruit", "description": "Fresh."},
+                    {"label": "Chips", "description": "Salty."},
+                ],
+            },
+        ],
+        tool={"messageID": AID, "callID": "cq"},
+    )
 
 
 async def test_permission_auto_allows_read_in_workspace() -> None:
@@ -638,6 +689,51 @@ async def test_permission_asks_and_denies_out_of_scope_read() -> None:
     assert oc.replies == [("per_1", "reject", "Denied by the user.")]
 
 
+async def test_permission_prompt_includes_category_when_different_from_tool() -> None:
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "c1",
+                "bash",
+                {
+                    "status": "running",
+                    "input": {"command": "git status --short", "workdir": "/work/other"},
+                },
+            ),
+            _permission("per_1", "c1", category="external_directory"),
+            "WAIT_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    task = asyncio.create_task(
+        stream_reply(
+            bot=bot,
+            opencode=oc,
+            session_id=SID,
+            chat_id=1,
+            thread_id=99,
+            prompt="x",
+            directory="/work/proj",
+            pending=pending,
+            allowed_dirs=["/work/proj"],
+            draft_interval=0.01,
+        )
+    )
+    for _ in range(200):
+        if bot.keyboards:
+            break
+        await asyncio.sleep(0.01)
+    assert bot.keyboards, "expected an approval keyboard"
+    assert "Permission:" in bot.messages[0]
+    assert "external_directory" in bot.messages[0]
+    token = _token_from_keyboard(bot.keyboards[0])
+    assert pending.resolve(token, Choice.DENY) is True
+    await task
+
+
 async def test_permission_accept_all_edits_unblocks_session() -> None:
     pending = PendingApprovals()
     oc = PermissionOpenCode(
@@ -678,6 +774,79 @@ async def test_permission_accept_all_edits_unblocks_session() -> None:
     # next in-workspace edit auto-allows.
     assert oc.replies == [("per_1", "once", None)]
     assert pending.is_accept_all_edits(SID) is True
+
+
+async def test_question_permission_auto_allows_without_keyboard() -> None:
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _permission("per_q", "cq", category="question"),
+            "WAIT_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+
+    await stream_reply(
+        bot=bot,
+        opencode=oc,
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="x",
+        directory="/work/proj",
+        pending=pending,
+        allowed_dirs=["/work/proj"],
+        draft_interval=0.01,
+    )
+
+    assert oc.replies == [("per_q", "once", None)]
+    assert bot.keyboards == []
+
+
+async def test_question_asked_sends_inline_questions_and_replies() -> None:
+    pending_questions = PendingQuestions()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _question("q_1"),
+            "WAIT_QUESTION_REPLY",
+            _text_part(AID, "thanks"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    task = asyncio.create_task(
+        stream_reply(
+            bot=bot,
+            opencode=oc,
+            session_id=SID,
+            chat_id=1,
+            thread_id=99,
+            prompt="x",
+            directory="/work/proj",
+            pending_questions=pending_questions,
+            draft_interval=0.01,
+        )
+    )
+
+    for _ in range(200):
+        if len(bot.keyboards) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    assert len(bot.keyboards) == 2
+    assert _question_callback(bot.keyboards[0], "Type your own answer").startswith("qstc:")
+    first = _question_callback(bot.keyboards[0], "Sunny")
+    second = _question_callback(bot.keyboards[1], "Chips")
+    _, token, q_index, o_index = first.split(":")
+    assert pending_questions.resolve(token, int(q_index), int(o_index)) is True
+    _, token, q_index, o_index = second.split(":")
+    assert pending_questions.resolve(token, int(q_index), int(o_index)) is True
+
+    await task
+    assert oc.question_replies == [("q_1", [["Sunny"], ["Chips"]])]
+    assert oc.question_rejections == []
 
 
 async def test_stream_reply_subscribes_before_prompting() -> None:

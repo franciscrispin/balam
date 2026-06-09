@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from telegram import Chat, Message, MessageEntity, PhotoSize, Update, User
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
-from balam.approvals import Choice, PendingApprovals
+from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.bot import (
     BOT_COMMANDS,
     _handle_approval_callback,
@@ -14,6 +14,7 @@ from balam.bot import (
     _handle_context,
     _handle_message,
     _handle_new,
+    _handle_question_custom_callback,
     _handle_rename,
     _handle_status,
     _topic_link,
@@ -85,6 +86,15 @@ class _FakeOpenCode:
 
     async def session_exists(self, session_id: str, *, directory: str | None = None) -> bool:
         return True
+
+    async def update_session_permission(
+        self,
+        session_id: str,
+        *,
+        directory: str | None = None,
+        permission: list[dict[str, str]],
+    ) -> None:
+        return None
 
     async def abort_session(self, session_id: str, *, directory: str | None = None) -> None:
         self.aborted.append((session_id, directory))
@@ -785,10 +795,11 @@ def test_bot_commands_includes_all_commands() -> None:
 
 
 class _FakeCBMessage:
-    def __init__(self, chat_id: int = SUPERGROUP) -> None:
+    def __init__(self, chat_id: int = SUPERGROUP, thread_id: int | None = None) -> None:
         self.text = "🔐 Allow Edit?"
         self.text_markdown_v2 = "🔐 Allow Edit?"
         self.chat = SimpleNamespace(id=chat_id)
+        self.message_thread_id = thread_id
         self.edited: list[str] = []
 
     async def edit_text(self, *, text: str, reply_markup=None, **_: object) -> None:
@@ -811,6 +822,19 @@ def _callback_env(query: _FakeQuery, pending: PendingApprovals, *, chat_id: int 
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
         application=SimpleNamespace(bot_data={"config": config, "pending": pending})
+    )
+    return update, context
+
+
+def _question_callback_env(
+    query: _FakeQuery, pending_questions: PendingQuestions, *, chat_id: int | None = None
+):
+    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id)
+    update = SimpleNamespace(callback_query=query)
+    context = SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={"config": config, "pending_questions": pending_questions}
+        )
     )
     return update, context
 
@@ -881,6 +905,56 @@ def _callback_handler(app) -> CallbackQueryHandler:
 def test_callback_handler_is_registered() -> None:
     # The approval keyboard is routed by a CallbackQueryHandler matching appr:*.
     assert _callback_handler(_build(SUPERGROUP)) is not None
+
+
+# --- question custom-answer callback ------------------------------------------
+
+
+async def test_question_custom_callback_arms_next_topic_message() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Preset"]], chat_id=SUPERGROUP, thread_id=7
+    )
+    query = _FakeQuery(f"qstc:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_custom_callback(update, context)
+
+    assert not futures[0].done()
+    assert query.message.edited
+    assert any("next message" in (answer or "") for answer in query.answers)
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer") is True
+    assert futures[0].result() == ["typed answer"]
+
+
+async def test_message_resolves_pending_custom_answer_without_starting_turn() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Preset"]], chat_id=SUPERGROUP, thread_id=5
+    )
+    assert pending_questions.await_custom(token, 0, SUPERGROUP, 5)
+
+    replies: list[str] = []
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        text="my typed answer",
+        caption=None,
+        reply_text=lambda text: replies.append(text),
+    )
+
+    async def reply_text(text: str) -> None:
+        replies.append(text)
+
+    message.reply_text = reply_text
+    update, context, turns = _message_env(message, SimpleNamespace())
+    context.application.bot_data["pending_questions"] = pending_questions
+
+    await _handle_message(update, context)
+
+    assert futures[0].result() == ["my typed answer"]
+    assert replies == ["✅ Answer sent."]
+    assert turns.get(SUPERGROUP, 5) is None
 
 
 # --- inbound attachments (§4) -------------------------------------------------

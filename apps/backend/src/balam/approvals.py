@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
 
@@ -218,3 +218,98 @@ class PendingApprovals:
             self._accept_all_edits.add(pending.session_id)
         pending.future.set_result(choice)
         return True
+
+
+@dataclass
+class _PendingQuestion:
+    futures: list[asyncio.Future[list[str]]]
+    labels: list[list[str]]
+    session_id: str
+    chat_id: int | None = None
+    thread_id: int | None = None
+    awaiting_custom: set[int] = field(default_factory=set)
+
+
+class PendingQuestions:
+    """Outstanding OpenCode question-tool prompts.
+
+    OpenCode's ``question`` tool is not a permission approval. It emits a
+    ``question.asked`` event and expects answers via ``/question/{id}/reply``.
+    This registry lets Telegram inline button callbacks resolve each question's
+    future while the streamer waits to reply to OpenCode.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[str, _PendingQuestion] = {}
+
+    def register(
+        self,
+        session_id: str,
+        questions: list[list[str]],
+        *,
+        chat_id: int | None = None,
+        thread_id: int | None = None,
+    ) -> tuple[str, list[asyncio.Future[list[str]]]]:
+        token = uuid.uuid4().hex[:16]
+        futures = [asyncio.get_event_loop().create_future() for _ in questions]
+        self._pending[token] = _PendingQuestion(
+            futures=futures,
+            labels=questions,
+            session_id=session_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        return token, futures
+
+    def discard(self, token: str) -> None:
+        self._pending.pop(token, None)
+
+    def resolve(self, token: str, question_index: int, option_index: int) -> bool:
+        pending = self._pending.get(token)
+        if pending is None:
+            return False
+        if question_index < 0 or question_index >= len(pending.futures):
+            return False
+        labels = pending.labels[question_index]
+        if option_index < 0 or option_index >= len(labels):
+            return False
+        future = pending.futures[question_index]
+        if future.done():
+            return False
+        future.set_result([labels[option_index]])
+        if all(f.done() for f in pending.futures):
+            self.discard(token)
+        return True
+
+    def await_custom(
+        self, token: str, question_index: int, chat_id: int, thread_id: int | None
+    ) -> bool:
+        pending = self._pending.get(token)
+        if pending is None:
+            return False
+        if pending.chat_id is not None and pending.chat_id != chat_id:
+            return False
+        if pending.thread_id != thread_id:
+            return False
+        if question_index < 0 or question_index >= len(pending.futures):
+            return False
+        if pending.futures[question_index].done():
+            return False
+        pending.awaiting_custom.add(question_index)
+        return True
+
+    def resolve_custom(self, chat_id: int, thread_id: int | None, answer: str) -> bool:
+        for token, pending in list(self._pending.items()):
+            if pending.chat_id != chat_id or pending.thread_id != thread_id:
+                continue
+            for question_index in sorted(pending.awaiting_custom):
+                future = pending.futures[question_index]
+                if future.done():
+                    pending.awaiting_custom.discard(question_index)
+                    continue
+                future.set_result([answer])
+                pending.awaiting_custom.discard(question_index)
+                if all(f.done() for f in pending.futures):
+                    self.discard(token)
+                return True
+        return False

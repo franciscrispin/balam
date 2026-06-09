@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
 )
 
-from balam.approvals import Choice, PendingApprovals
+from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import collect_attachments
 from balam.config import Config
 from balam.opencode import OpenCode
@@ -182,6 +182,15 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     chat_id = message.chat_id
     thread_id = message.message_thread_id
+    text = message.text or message.caption or ""
+
+    pending_questions: PendingQuestions | None = context.application.bot_data.get(
+        "pending_questions"
+    )
+    if text and pending_questions is not None:
+        if pending_questions.resolve_custom(chat_id, thread_id, text):
+            await message.reply_text("✅ Answer sent.")
+            return
 
     # Download any image/document attachments as native file parts (tier-1 plan §4);
     # the text is the message text or an attachment's caption.
@@ -191,7 +200,6 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("failed to download attachment")
         await _notify_error(context.bot, chat_id, thread_id, exc)
         return
-    text = message.text or message.caption or ""
     if not text and not files:
         return
 
@@ -291,6 +299,9 @@ def _start_turn(
                 model=job.model,
                 effort=job.effort,
                 pending=pending,
+                pending_questions=context.application.bot_data.setdefault(
+                    "pending_questions", PendingQuestions()
+                ),
                 allowed_dirs=job.allowed_dirs,
                 files=job.files,
             )
@@ -731,6 +742,87 @@ async def _handle_approval_callback(update: Update, context: ContextTypes.DEFAUL
     await _clear_keyboard(query, note=note)
 
 
+async def _handle_question_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resolve an OpenCode question-tool inline keyboard (``qst:<token>:i:j``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("qst:"):
+        return
+
+    config: Config = context.application.bot_data["config"]
+    user = query.from_user
+    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+        await query.answer()
+        return
+    if config.allowed_telegram_chat_id is not None:
+        chat = query.message.chat if query.message else None
+        if chat is None or chat.id != config.allowed_telegram_chat_id:
+            await query.answer()
+            return
+
+    parts = (query.data or "").split(":", 3)
+    if len(parts) != 4:
+        await query.answer("Malformed question answer.")
+        return
+    _, token, question_index, option_index = parts
+    try:
+        q_index = int(question_index)
+        o_index = int(option_index)
+    except ValueError:
+        await query.answer("Malformed question answer.")
+        return
+
+    pending_questions: PendingQuestions = context.application.bot_data["pending_questions"]
+    if not pending_questions.resolve(token, q_index, o_index):
+        await query.answer("This question has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer("Answered.")
+    await _clear_keyboard(query, note=r"✅ Answered\.")
+
+
+async def _handle_question_custom_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Arm an OpenCode question prompt to use the owner's next topic message."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("qstc:"):
+        return
+
+    config: Config = context.application.bot_data["config"]
+    user = query.from_user
+    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+        await query.answer()
+        return
+    chat = query.message.chat if query.message else None
+    if config.allowed_telegram_chat_id is not None:
+        if chat is None or chat.id != config.allowed_telegram_chat_id:
+            await query.answer()
+            return
+    if chat is None:
+        await query.answer("Malformed question answer.")
+        return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed question answer.")
+        return
+    _, token, question_index = parts
+    try:
+        q_index = int(question_index)
+    except ValueError:
+        await query.answer("Malformed question answer.")
+        return
+
+    thread_id = getattr(query.message, "message_thread_id", None)
+    pending_questions: PendingQuestions = context.application.bot_data["pending_questions"]
+    if not pending_questions.await_custom(token, q_index, chat.id, thread_id):
+        await query.answer("This question has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer("Send your answer as the next message in this topic.")
+    await _clear_keyboard(query, note=r"Reply with your answer\.")
+
+
 async def _clear_keyboard(query: Any, note: str | None = None) -> None:
     """Strip a spent approval keyboard, appending a one-line outcome when given.
 
@@ -801,6 +893,8 @@ def build_application(
     app.bot_data["turns"] = TurnRegistry()
     # Outstanding tool-approval prompts + per-session "accept all edits" state.
     app.bot_data["pending"] = PendingApprovals()
+    # Outstanding OpenCode question-tool prompts.
+    app.bot_data["pending_questions"] = PendingQuestions()
     # Anchors fire-and-forget background tasks (e.g. /cancel's server-side abort)
     # so the loop's weak task references can't let them be GC'd mid-flight.
     app.bot_data["background_tasks"] = set()
@@ -829,5 +923,7 @@ def build_application(
     # CallbackQueryHandler takes no filter; the handler re-checks the trust
     # boundary (ADR-0008) itself before resolving an approval.
     app.add_handler(CallbackQueryHandler(_handle_approval_callback, pattern=r"^appr:"))
+    app.add_handler(CallbackQueryHandler(_handle_question_callback, pattern=r"^qst:"))
+    app.add_handler(CallbackQueryHandler(_handle_question_custom_callback, pattern=r"^qstc:"))
 
     return app

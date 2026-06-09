@@ -17,6 +17,10 @@ class _FakePostClient:
         self.calls.append({"url": url, "params": params, "json": json})
         return SimpleNamespace(raise_for_status=lambda: None)
 
+    async def patch(self, url: str, *, params: Any = None, json: Any = None) -> Any:
+        self.calls.append({"url": url, "params": params, "json": json})
+        return SimpleNamespace(raise_for_status=lambda: None)
+
 
 def _client() -> tuple[OpenCode, _FakePostClient]:
     oc = OpenCode(base_url="http://x", username="u", password=None)
@@ -67,6 +71,21 @@ async def test_prompt_text_only_unchanged() -> None:
     await oc.prompt("ses_1", "hello", directory="/work")
 
     assert fake.calls[0]["json"]["parts"] == [{"type": "text", "text": "hello"}]
+
+
+async def test_update_session_permission_patches_ruleset() -> None:
+    oc, fake = _client()
+    ruleset = [{"permission": "bash", "pattern": "git *", "action": "allow"}]
+
+    await oc.update_session_permission("ses_1", directory="/work", permission=ruleset)
+
+    assert fake.calls == [
+        {
+            "url": "/session/ses_1",
+            "params": {"directory": "/work"},
+            "json": {"permission": ruleset},
+        }
+    ]
 
 
 # --- MCP config coercion ---

@@ -38,6 +38,7 @@ def test_baseline_when_no_opt_ins() -> None:
     assert rules == [
         {"permission": "*", "pattern": "*", "action": "ask"},
         {"permission": "todowrite", "pattern": "*", "action": "allow"},
+        {"permission": "question", "pattern": "*", "action": "allow"},
     ]
 
 

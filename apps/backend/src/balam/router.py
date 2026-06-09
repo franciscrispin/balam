@@ -119,17 +119,21 @@ class Router:
         bound_name = row[1] if row else None
         ctx = self._contexts.get(bound_name)
         context_name = self._contexts.resolve_name(bound_name)
+        permission = build_ruleset(ctx)
 
         existing = row[0] if row else None
         if existing and await self._opencode.session_exists(existing, directory=ctx.directory):
             session_id = existing
+            await self._opencode.update_session_permission(
+                session_id, directory=ctx.directory, permission=permission
+            )
         else:
             auto_named = self._store.is_auto_named(ref.chat_id, ref.thread_id) if row else False
             if existing:
                 # Mapped session is gone server-side: clear the stale row, recreate.
                 self._store.delete(ref.chat_id, ref.thread_id)
             session_id = await self._opencode.create_session(
-                ref.title, directory=ctx.directory, permission=build_ruleset(ctx), mcp=ctx.mcp
+                ref.title, directory=ctx.directory, permission=permission, mcp=ctx.mcp
             )
             self._store.set(
                 ref.chat_id,

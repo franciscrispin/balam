@@ -34,6 +34,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from balam.approvals import (
     Choice,
     PendingApprovals,
+    PendingQuestions,
     Verdict,
     decide,
     is_edit,
@@ -42,7 +43,7 @@ from balam.approvals import (
 from balam.attachments import PromptFile
 from balam.markdown import gfm_to_telegram
 from balam.opencode import OpenCode
-from balam.opencode_tools import Tool
+from balam.opencode_tools import Permission, Tool
 from balam.telegram_utils import thread_kwargs
 
 logger = logging.getLogger(__name__)
@@ -394,7 +395,9 @@ def _render_tool_part(
     return line
 
 
-def _format_approval_request(tool: str, tool_input: dict[str, Any], directory: str | None) -> str:
+def _format_approval_request(
+    tool: str, tool_input: dict[str, Any], directory: str | None, category: str | None = None
+) -> str:
     """A GFM prompt asking the user to approve one tool call.
 
     Bash shows the command; file tools show the (workspace-relative) path; other
@@ -403,6 +406,8 @@ def _format_approval_request(tool: str, tool_input: dict[str, Any], directory: s
     """
     display = _TOOL_DISPLAY.get(tool, tool)
     header = f"🔐 Allow **{display}**?"
+    if category and category != tool:
+        header += f"\nPermission: `{category}`"
     if tool == Tool.BASH:
         command = tool_input.get("command", "")
         return f"{header}\n```\n{command}\n```" if command else header
@@ -429,6 +434,46 @@ def _approval_keyboard(token: str, category: str) -> InlineKeyboardMarkup:
             ]
         )
     return InlineKeyboardMarkup(rows)
+
+
+def _question_keyboard(
+    token: str, question_index: int, options: list[dict[str, Any]], *, custom: bool = True
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for option_index, option in enumerate(options):
+        label = str(option.get("label") or f"Option {option_index + 1}")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label[:64], callback_data=f"qst:{token}:{question_index}:{option_index}"
+                )
+            ]
+        )
+    if custom:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Type your own answer", callback_data=f"qstc:{token}:{question_index}"
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_question(question: dict[str, Any]) -> str:
+    header = str(question.get("header") or "Question")
+    prompt = str(question.get("question") or "Choose one option.")
+    lines = [f"❓ **{header}**", prompt]
+    options = question.get("options")
+    if isinstance(options, list) and options:
+        lines.append("")
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            label = str(option.get("label") or "Option")
+            description = str(option.get("description") or "")
+            lines.append(f"- **{label}** — {description}" if description else f"- **{label}**")
+    return "\n".join(lines)
 
 
 def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTransport:
@@ -492,6 +537,7 @@ async def stream_reply(
     model: str | None = None,
     effort: str | None = None,
     pending: PendingApprovals | None = None,
+    pending_questions: PendingQuestions | None = None,
     allowed_dirs: list[str] | None = None,
     files: list[PromptFile] | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
@@ -545,6 +591,7 @@ async def stream_reply(
     # Per-request approval tasks, so the SSE loop isn't blocked while the user
     # decides. Torn down with the consumer.
     permission_tasks: set[asyncio.Task[None]] = set()
+    question_tasks: set[asyncio.Task[None]] = set()
 
     async def await_tool_input(call_id: str) -> tuple[str | None, dict[str, Any]]:
         """Recover a call's ``(tool, input)`` from the tool-part cache, briefly
@@ -570,7 +617,7 @@ async def stream_reply(
         keyboard (whether to offer "accept all edits"); ``tool`` is display-only."""
         assert pending is not None
         token, future = pending.register(session_id)
-        gfm = _format_approval_request(tool, tool_input, directory)
+        gfm = _format_approval_request(tool, tool_input, directory, category)
         keyboard = _approval_keyboard(token, category)
         chunks = gfm_to_telegram(gfm)
         text = chunks[0] if chunks else f"🔐 Allow {tool}?"
@@ -621,6 +668,9 @@ async def stream_reply(
         if not request_id:
             return
         category = request.get("permission") or ""
+        if category == Permission.QUESTION:
+            await opencode.reply_permission(request_id, "once", directory=directory)
+            return
         metadata = request.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
         tool_ref = request.get("tool")
@@ -640,6 +690,56 @@ async def stream_reply(
             await opencode.reply_permission(request_id, "once", directory=directory)
             return
         await request_approval(request_id, category, cached_tool or category, tool_input)
+
+    async def request_questions(request: dict[str, Any]) -> None:
+        if pending_questions is None:
+            await opencode.reject_question(request["id"], directory=directory)
+            return
+        raw_questions = request.get("questions")
+        if not isinstance(raw_questions, list) or not raw_questions:
+            await opencode.reject_question(request["id"], directory=directory)
+            return
+
+        questions = [q for q in raw_questions if isinstance(q, dict)]
+        labels: list[list[str]] = []
+        for question in questions:
+            options = question.get("options")
+            if not isinstance(options, list) or not options:
+                await opencode.reject_question(request["id"], directory=directory)
+                return
+            labels.append([str(o.get("label") or "") for o in options if isinstance(o, dict)])
+        if any(not question_labels for question_labels in labels):
+            await opencode.reject_question(request["id"], directory=directory)
+            return
+
+        token, futures = pending_questions.register(
+            session_id, labels, chat_id=chat_id, thread_id=thread_id
+        )
+        try:
+            for index, question in enumerate(questions):
+                chunks = gfm_to_telegram(_format_question(question))
+                text = chunks[0] if chunks else "❓ Question"
+                custom = question.get("custom", True) is not False
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="MarkdownV2",
+                    reply_markup=_question_keyboard(
+                        token, index, question["options"], custom=custom
+                    ),
+                    **topic_kwargs,
+                )
+            answers = await asyncio.gather(*futures)
+        except asyncio.CancelledError:
+            pending_questions.discard(token)
+            await opencode.reject_question(request["id"], directory=directory)
+            raise
+        except Exception:
+            logger.exception("failed to ask OpenCode question in Telegram")
+            pending_questions.discard(token)
+            await opencode.reject_question(request["id"], directory=directory)
+            return
+        await opencode.reply_question(request["id"], answers, directory=directory)
 
     async def consume() -> None:
         nonlocal order, error_text
@@ -717,6 +817,13 @@ async def stream_reply(
                 permission_tasks.add(ptask)
                 ptask.add_done_callback(permission_tasks.discard)
 
+            elif etype == "question.asked":
+                if props.get("sessionID") != session_id:
+                    continue
+                qtask = asyncio.create_task(request_questions(props))
+                question_tasks.add(qtask)
+                qtask.add_done_callback(question_tasks.discard)
+
             elif etype == "session.error" and props.get("sessionID") == session_id:
                 error_text = _describe_error(props.get("error"))
                 break
@@ -772,7 +879,12 @@ async def stream_reply(
         for ptask in list(permission_tasks):
             if not ptask.done():
                 ptask.cancel()
-        await asyncio.gather(flush_task, consume_task, *permission_tasks, return_exceptions=True)
+        for qtask in list(question_tasks):
+            if not qtask.done():
+                qtask.cancel()
+        await asyncio.gather(
+            flush_task, consume_task, *permission_tasks, *question_tasks, return_exceptions=True
+        )
 
     # Replace ephemeral drafts with real, persistent messages. Reasoning/progress
     # is intentionally separate from the answer; only emit the answer fallback if
