@@ -100,7 +100,7 @@ class Router:
         """
         ctx = self._contexts.contexts[name]
         session_id = await self._opencode.create_session(
-            title, directory=ctx.directory, permission=build_ruleset(ctx)
+            title, directory=ctx.directory, permission=build_ruleset(ctx), mcp=ctx.mcp
         )
         self._store.set(
             chat_id,
@@ -129,7 +129,7 @@ class Router:
                 # Mapped session is gone server-side: clear the stale row, recreate.
                 self._store.delete(ref.chat_id, ref.thread_id)
             session_id = await self._opencode.create_session(
-                ref.title, directory=ctx.directory, permission=build_ruleset(ctx)
+                ref.title, directory=ctx.directory, permission=build_ruleset(ctx), mcp=ctx.mcp
             )
             self._store.set(
                 ref.chat_id,

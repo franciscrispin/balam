@@ -10,6 +10,7 @@ class FakeOpenCode:
         self.existing = existing or set()
         self.created: list[tuple[str, str | None]] = []
         self.permissions: list[list[dict[str, str]] | None] = []
+        self.mcps: list[dict | None] = []
         self.exists_calls: list[tuple[str, str | None]] = []
         self._counter = 0
 
@@ -23,12 +24,14 @@ class FakeOpenCode:
         *,
         directory: str | None = None,
         permission: list[dict[str, str]] | None = None,
+        mcp: dict | None = None,
     ) -> str:
         self._counter += 1
         sid = f"ses_{self._counter}"
         self.existing.add(sid)
         self.created.append((sid, directory))
         self.permissions.append(permission)
+        self.mcps.append(mcp)
         return sid
 
 

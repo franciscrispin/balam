@@ -26,6 +26,21 @@ contexts:
       # the per-edit approval prompt.
     # additional_directories:            # extra dirs the agent may read/edit
     #   - /home/ubuntu/projects/open-shrimp
+    # mcp:                               # optional per-context MCP servers
+    #   # Local (stdio) server — OpenCode spawns the command:
+    #   my-db:
+    #     type: local
+    #     command: ["postgres-mcp", "--access-mode=restricted"]
+    #     environment:
+    #       DATABASE_URI: ${MY_DATABASE_URI}   # ${VAR} is filled from .env
+    #   # Remote (http/sse) server:
+    #   my-api:
+    #     type: remote
+    #     url: https://internal.example.com/mcp
+    #     headers:
+    #       Authorization: Bearer ${MY_API_TOKEN}
+    # Secrets stay in .env (never here); reference them with ${VAR}. Servers
+    # are registered with OpenCode before each of this context's sessions.
 
   # Add more workspaces as needed:
   # zog:

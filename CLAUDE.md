@@ -83,8 +83,10 @@ topics are addressed by `message_thread_id`. Bot API ref:
 https://core.telegram.org/bots/api.
 
 **Workspace contexts** (ADR-0012, adapted from open-shrimp). A _context_ bundles
-a working `directory` with optional `model`/`effort` and an `allowed_tools` list,
-so one bot drives several projects. Defined in the **required** `config.yaml`
+a working `directory` with optional `model`/`effort`, an `allowed_tools` list, and
+optional `mcp` servers (local stdio or remote http/sse; registered with OpenCode
+before each session — `${VAR}` in values is filled from `.env`), so one bot drives
+several projects. Defined in the **required** `config.yaml`
 (see `config.example.yaml`). Each topic binds to one context for its lifetime
 (`default_context` for unbound topics like General). `/context` lists contexts +
 the current binding; `/context <name>` **creates a new topic** bound to `<name>`

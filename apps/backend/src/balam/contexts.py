@@ -21,13 +21,52 @@ symlink-safe approval layer (:mod:`balam.approvals`).
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from balam.opencode import coerce_mcp_config
+
 #: Thinking-effort levels OpenCode accepts (sent as the ``variant`` on a prompt).
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+
+#: ``${VAR}`` references expanded inside ``mcp`` config values, so secrets (DB
+#: URIs, bearer tokens) live in ``.env`` and never in ``config.yaml`` — matching
+#: Balam's secrets-in-``.env`` rule (:mod:`balam.config`). Names follow the usual
+#: env-var spelling.
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env(value: Any, *, where: str) -> Any:
+    """Recursively expand ``${VAR}`` references in ``value`` from the environment.
+
+    Strings have every ``${VAR}`` replaced with ``os.environ[VAR]``; dicts and
+    lists are walked; everything else is returned unchanged. An unset variable
+    raises :class:`ValueError` so a missing secret fails fast at boot rather than
+    silently registering a broken MCP server. Under systemd the backend's ``.env``
+    is loaded into the environment via ``EnvironmentFile``, so these resolve there.
+    """
+    if isinstance(value, str):
+
+        def _replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            try:
+                return os.environ[name]
+            except KeyError:
+                raise ValueError(
+                    f"{where}: environment variable ${{{name}}} is not set (define it in .env)"
+                ) from None
+
+        return _ENV_REF.sub(_replace, value)
+    if isinstance(value, dict):
+        return {k: _expand_env(v, where=where) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env(v, where=where) for v in value]
+    return value
 
 
 def split_provider_model(model: str | None) -> tuple[str | None, str | None]:
@@ -57,6 +96,22 @@ class ContextConfig(BaseModel):
     model: str | None = None
     effort: str | None = None
     additional_directories: list[str] = Field(default_factory=list)
+    #: MCP servers exposed to this context's sessions, keyed by server name.
+    #: Each value is a local (stdio) or remote (http/sse) server config in
+    #: OpenCode's shape; ``${VAR}`` references in values are filled from the
+    #: environment. Registered with OpenCode before each session is created
+    #: (:meth:`balam.opencode.OpenCode.register_mcp`).
+    mcp: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("mcp", mode="after")
+    @classmethod
+    def _mcp_resolved_and_valid(cls, value: dict[str, Any]) -> dict[str, Any]:
+        # Expand ${VAR} secrets first, then validate the resolved shape against
+        # OpenCode's wire format so a malformed server fails fast at boot.
+        expanded = _expand_env(value, where="mcp")
+        for name, server in expanded.items():
+            coerce_mcp_config(name, server)  # raises ValueError on a bad entry
+        return expanded
 
     @field_validator("model")
     @classmethod

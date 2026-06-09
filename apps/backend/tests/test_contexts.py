@@ -111,3 +111,53 @@ def test_unknown_field_rejected(tmp_path) -> None:
 def test_construct_requires_nonempty_contexts() -> None:
     with pytest.raises(ValueError):
         ContextsConfig(default_context="x", contexts={})
+
+
+MCP_CONFIG = """
+default_context: a
+contexts:
+  a:
+    directory: /a
+    description: A
+    mcp:
+      db:
+        type: local
+        command: ["postgres-mcp", "--restricted"]
+        environment:
+          DATABASE_URI: ${TEST_DB_URI}
+      api:
+        type: remote
+        url: https://x/mcp
+        headers:
+          Authorization: Bearer ${TEST_API_TOKEN}
+"""
+
+
+def test_mcp_parsed_and_env_expanded(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TEST_DB_URI", "postgres://secret")
+    monkeypatch.setenv("TEST_API_TOKEN", "tok123")
+    cfg = load_contexts(_write(tmp_path, MCP_CONFIG))
+    mcp = cfg.get("a").mcp
+    assert mcp["db"]["environment"]["DATABASE_URI"] == "postgres://secret"
+    assert mcp["api"]["headers"]["Authorization"] == "Bearer tok123"
+
+
+def test_mcp_missing_env_var_rejected(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("TEST_DB_URI", raising=False)
+    monkeypatch.delenv("TEST_API_TOKEN", raising=False)
+    with pytest.raises(ContextsConfigError):
+        load_contexts(_write(tmp_path, MCP_CONFIG))
+
+
+def test_mcp_bad_shape_rejected(tmp_path) -> None:
+    bad = (
+        "default_context: a\ncontexts:\n  a:\n    directory: /a\n"
+        "    description: A\n    mcp:\n      broken:\n        type: remote\n"
+    )  # remote with no url
+    with pytest.raises(ContextsConfigError):
+        load_contexts(_write(tmp_path, bad))
+
+
+def test_mcp_defaults_to_empty(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG))
+    assert cfg.get("balam").mcp == {}

@@ -78,6 +78,7 @@ class _FakeOpenCode:
         *,
         directory: str | None = None,
         permission: list[dict[str, str]] | None = None,
+        mcp: dict | None = None,
     ) -> str:
         self._n += 1
         return f"ses_{self._n}"

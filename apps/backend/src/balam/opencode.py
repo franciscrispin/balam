@@ -50,6 +50,84 @@ ASK_ALL_PERMISSIONS: list[dict[str, str]] = [
 ]
 
 
+def coerce_mcp_config(name: str, raw_config: Any) -> dict[str, Any]:
+    """Normalise one context MCP server entry into OpenCode's ``/mcp`` wire format.
+
+    A *context*'s ``mcp`` map (see :mod:`balam.contexts`) is registered with the
+    OpenCode server before its session is created (:meth:`OpenCode.register_mcp`).
+    OpenCode wants one of two shapes:
+
+      * **local** (stdio) — ``{"type": "local", "command": [...], "environment": {...}}``
+      * **remote** (http/sse) — ``{"type": "remote", "url": ..., "headers": {...}}``
+
+    To keep ``config.yaml`` friendly we also accept the looser ``opencode.json``
+    spellings and convert them: a bare ``command`` *string* with ``args``/``env``
+    becomes a local ``command`` list, and ``type: http``/``sse`` collapse to
+    ``remote``. A malformed entry raises :class:`ValueError`, which the context
+    loader turns into a fatal, fail-fast boot error (so a bad server is caught at
+    startup, never silently mid-conversation). Adapted from the open-shrimp client.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("MCP server name must be a non-empty string")
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"MCP server {name!r} config must be a mapping")
+    config = dict(raw_config)
+
+    # `command: "uvx"` + `args: [...]` shorthand → a single local command list.
+    if "command" in config and config.get("type") not in {"local", "remote", "http", "sse"}:
+        command = config.pop("command")
+        if not isinstance(command, str) or not command:
+            raise ValueError(f"MCP server {name!r} command must be a non-empty string")
+        args = config.pop("args", [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError(f"MCP server {name!r} args must be a list of strings")
+        env = config.pop("env", config.pop("environment", None))
+        out: dict[str, Any] = {"type": "local", "command": [command, *args]}
+        if env is not None:
+            if not isinstance(env, dict):
+                raise ValueError(f"MCP server {name!r} environment must be a mapping")
+            out["environment"] = {str(k): str(v) for k, v in env.items()}
+        if "enabled" in config:
+            out["enabled"] = bool(config["enabled"])
+        return out
+
+    cfg_type = config.get("type")
+    if cfg_type in {"remote", "http", "sse"}:
+        url = config.get("url")
+        if not isinstance(url, str) or not url:
+            raise ValueError(f"MCP server {name!r} remote config requires a url")
+        out = {"type": "remote", "url": url}
+        if "headers" in config:
+            headers = config["headers"]
+            if not isinstance(headers, dict):
+                raise ValueError(f"MCP server {name!r} headers must be a mapping")
+            out["headers"] = {str(k): str(v) for k, v in headers.items()}
+        if "oauth" in config:
+            out["oauth"] = bool(config["oauth"])
+        if "enabled" in config:
+            out["enabled"] = bool(config["enabled"])
+        return out
+
+    if cfg_type == "local":
+        command = config.get("command")
+        if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
+            raise ValueError(f"MCP server {name!r} local command must be a list of strings")
+        out = {"type": "local", "command": command}
+        env = config.get("environment", config.get("env"))
+        if env is not None:
+            if not isinstance(env, dict):
+                raise ValueError(f"MCP server {name!r} environment must be a mapping")
+            out["environment"] = {str(k): str(v) for k, v in env.items()}
+        if "enabled" in config:
+            out["enabled"] = bool(config["enabled"])
+        return out
+
+    raise ValueError(
+        f"MCP server {name!r} must be a local server (command) or a remote server "
+        f"(type: remote/http/sse + url); got {raw_config!r}"
+    )
+
+
 class OpenCode:
     def __init__(self, *, base_url: str, username: str, password: str | None) -> None:
         self._base_url = base_url.rstrip("/")
@@ -99,12 +177,38 @@ class OpenCode:
                 )
             await asyncio.sleep(interval)
 
+    async def register_mcp(self, name: str, config: dict[str, Any], *, directory: str) -> None:
+        """Register one MCP server with the OpenCode server, scoped to ``directory``.
+
+        OpenCode keys MCP servers by ``directory`` (the worktree), not by session,
+        so registering the same context's servers again before each session in that
+        directory is idempotent. ``config`` is the raw context entry; it is coerced
+        to OpenCode's wire shape by :func:`coerce_mcp_config`.
+
+        Best-effort, like :meth:`abort_session` / :meth:`reply_permission`: a
+        registration failure (e.g. the server is briefly unreachable) is logged, not
+        raised, so one bad server never tears down session creation. Config-shape
+        errors are already caught at boot by the context loader, so they don't reach
+        here.
+        """
+        try:
+            coerced = coerce_mcp_config(name, config)
+            response = await self._client.post(
+                "/mcp",
+                params={"directory": directory},
+                json={"name": name, "config": coerced},
+            )
+            response.raise_for_status()
+        except (httpx.HTTPError, ValueError):
+            logger.warning("failed to register MCP server %r in %s", name, directory, exc_info=True)
+
     async def create_session(
         self,
         title: str,
         *,
         directory: str,
         permission: list[dict[str, str]] | None = None,
+        mcp: dict[str, Any] | None = None,
     ) -> str:
         """Create a new session in ``directory`` (a context's workspace); return
         its id.
@@ -112,7 +216,13 @@ class OpenCode:
         ``permission`` is the session's native ruleset (see
         :mod:`balam.permissions`); it defaults to :data:`ASK_ALL_PERMISSIONS` so a
         caller that doesn't compute one still gets the ask-everything baseline.
+
+        ``mcp`` is the context's MCP server map (:mod:`balam.contexts`); each server
+        is registered with OpenCode (scoped to ``directory``) *before* the session
+        is created, so its tools are available to the very first turn.
         """
+        for server_name, server_config in (mcp or {}).items():
+            await self.register_mcp(server_name, server_config, directory=directory)
         response = await self._client.post(
             "/session",
             params={"directory": directory},
