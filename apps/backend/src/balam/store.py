@@ -33,20 +33,14 @@ class SessionStore:
                 session_id TEXT    NOT NULL,
                 created_at INTEGER NOT NULL,
                 context    TEXT,
-                auto_named INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (chat_id, thread_id)
             );
             """
         )
-        columns = {
-            row[1] for row in self._db.execute("PRAGMA table_info(topic_sessions)").fetchall()
-        }
-        if "auto_named" not in columns:
-            # Existing topics predate auto-naming; treat them as already named so
-            # the next message after upgrade does not unexpectedly retitle them.
-            self._db.execute(
-                "ALTER TABLE topic_sessions ADD COLUMN auto_named INTEGER NOT NULL DEFAULT 1"
-            )
+        # Auto-naming state lives in its own table — the single source of truth.
+        # It is keyed independently of ``topic_sessions`` so a topic can be marked
+        # (e.g. manually renamed via ``/rename``) before it has a session, and so
+        # the flag survives a session being recreated (``delete`` leaves it alone).
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS topic_auto_names (
@@ -56,7 +50,32 @@ class SessionStore:
             );
             """
         )
+        self._migrate_auto_named()
         self._db.commit()
+
+    def _migrate_auto_named(self) -> None:
+        """One-time backfill of :class:`topic_auto_names` from earlier schemas.
+
+        Older databases tracked auto-naming on a now-removed ``topic_sessions``
+        column (or not at all). Run once, guarded by ``PRAGMA user_version``, to
+        seed the marker table so the next message after an upgrade does not
+        unexpectedly retitle topics that were already named:
+
+          * a DB that predates auto-naming entirely (no column) → treat every
+            existing topic as already named;
+          * a DB with the legacy ``auto_named`` column → carry over the rows it
+            marked named (``auto_named = 1``).
+        """
+        if self._db.execute("PRAGMA user_version").fetchone()[0] >= 1:
+            return
+        columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(topic_sessions)").fetchall()
+        }
+        select = "SELECT chat_id, thread_id FROM topic_sessions"
+        if "auto_named" in columns:
+            select += " WHERE auto_named = 1"
+        self._db.execute(f"INSERT OR IGNORE INTO topic_auto_names (chat_id, thread_id) {select}")
+        self._db.execute("PRAGMA user_version = 1")
 
     @staticmethod
     def thread_key(thread_id: int | None) -> int:
@@ -81,33 +100,25 @@ class SessionStore:
         session_id: str,
         created_at: int,
         context: str | None = None,
-        auto_named: bool = False,
     ) -> None:
         """Map a topic to a session (and the context it was created in),
         overwriting any existing mapping — used both for first creation and for
-        recreating a session that vanished server-side."""
-        auto_named = auto_named or self.is_auto_named(chat_id, thread_id)
+        recreating a session that vanished server-side.
+
+        Auto-naming state is tracked separately (:meth:`mark_auto_named`) and is
+        deliberately untouched here, so recreating a vanished session keeps a
+        topic's existing name."""
         self._db.execute(
             """
-            INSERT INTO topic_sessions (
-                chat_id, thread_id, session_id, created_at, context, auto_named
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO topic_sessions (chat_id, thread_id, session_id, created_at, context)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (chat_id, thread_id)
             DO UPDATE SET
                 session_id = excluded.session_id,
                 created_at = excluded.created_at,
-                context = excluded.context,
-                auto_named = excluded.auto_named
+                context = excluded.context
             """,
-            (
-                chat_id,
-                self.thread_key(thread_id),
-                session_id,
-                created_at,
-                context,
-                1 if auto_named else 0,
-            ),
+            (chat_id, self.thread_key(thread_id), session_id, created_at, context),
         )
         self._db.commit()
 
@@ -117,13 +128,7 @@ class SessionStore:
             "SELECT 1 FROM topic_auto_names WHERE chat_id = ? AND thread_id = ?",
             (chat_id, self.thread_key(thread_id)),
         ).fetchone()
-        if marker:
-            return True
-        row = self._db.execute(
-            "SELECT auto_named FROM topic_sessions WHERE chat_id = ? AND thread_id = ?",
-            (chat_id, self.thread_key(thread_id)),
-        ).fetchone()
-        return bool(row[0]) if row else False
+        return marker is not None
 
     def mark_auto_named(self, chat_id: int, thread_id: int | None) -> None:
         """Record that this topic should not be auto-renamed again."""
@@ -133,10 +138,6 @@ class SessionStore:
             VALUES (?, ?)
             ON CONFLICT (chat_id, thread_id) DO NOTHING
             """,
-            (chat_id, self.thread_key(thread_id)),
-        )
-        self._db.execute(
-            "UPDATE topic_sessions SET auto_named = 1 WHERE chat_id = ? AND thread_id = ?",
             (chat_id, self.thread_key(thread_id)),
         )
         self._db.commit()

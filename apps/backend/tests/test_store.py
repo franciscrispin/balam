@@ -1,3 +1,5 @@
+import sqlite3
+
 from balam.store import GENERAL_THREAD_ID, SessionStore
 
 
@@ -83,3 +85,65 @@ def test_auto_named_marker_can_precede_session() -> None:
     store.set(100, 5, "ses_abc", 1, context="balam")
 
     assert store.is_auto_named(100, 5) is True
+
+
+def test_auto_named_survives_session_recreation() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_old", 1, context="balam")
+    store.mark_auto_named(100, 5)
+
+    # A vanished session is cleared and recreated; the name must carry across.
+    store.delete(100, 5)
+    store.set(100, 5, "ses_new", 2, context="balam")
+
+    assert store.is_auto_named(100, 5) is True
+
+
+def test_migrates_legacy_auto_named_column(tmp_path) -> None:
+    # A DB written by the earlier schema, with auto-naming on a topic_sessions
+    # column, is carried over into the marker table for the named rows only.
+    path = str(tmp_path / "legacy.db")
+    db = sqlite3.connect(path)
+    db.execute(
+        """
+        CREATE TABLE topic_sessions (
+            chat_id INTEGER, thread_id INTEGER, session_id TEXT, created_at INTEGER,
+            context TEXT, auto_named INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (chat_id, thread_id)
+        )
+        """
+    )
+    db.execute("INSERT INTO topic_sessions VALUES (100, 5, 'ses_named', 1, 'balam', 1)")
+    db.execute("INSERT INTO topic_sessions VALUES (100, 6, 'ses_fresh', 1, 'balam', 0)")
+    db.commit()
+    db.close()
+
+    store = SessionStore(path)
+    assert store.is_auto_named(100, 5) is True
+    assert store.is_auto_named(100, 6) is False
+
+
+def test_migrates_pre_auto_naming_schema(tmp_path) -> None:
+    # A DB predating auto-naming has no column; every existing topic is treated
+    # as already named so the upgrade doesn't unexpectedly retitle it.
+    path = str(tmp_path / "old.db")
+    db = sqlite3.connect(path)
+    db.execute(
+        """
+        CREATE TABLE topic_sessions (
+            chat_id INTEGER, thread_id INTEGER, session_id TEXT, created_at INTEGER,
+            context TEXT, PRIMARY KEY (chat_id, thread_id)
+        )
+        """
+    )
+    db.execute("INSERT INTO topic_sessions VALUES (100, 5, 'ses_old', 1, 'balam')")
+    db.commit()
+    db.close()
+
+    store = SessionStore(path)
+    assert store.is_auto_named(100, 5) is True
+
+    # The backfill is one-time: a topic later marked nameable stays nameable
+    # across a reopen (the migration does not re-run and re-mark it).
+    store.close()
+    store = SessionStore(path)
+    assert store.is_auto_named(100, 6) is False

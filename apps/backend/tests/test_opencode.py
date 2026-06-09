@@ -88,6 +88,21 @@ async def test_update_session_permission_patches_ruleset() -> None:
     ]
 
 
+async def test_update_session_permission_swallows_http_errors() -> None:
+    import httpx
+
+    oc, _ = _client()
+
+    async def boom(*a: Any, **k: Any) -> Any:
+        raise httpx.ConnectError("down")
+
+    oc._client.patch = boom  # type: ignore[assignment]
+
+    # Best-effort: it runs on every message to a live session, so a transient
+    # PATCH failure must not raise (which would drop the user's message).
+    await oc.update_session_permission("ses_1", directory="/work", permission=[])
+
+
 # --- MCP config coercion ---
 
 

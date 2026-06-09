@@ -249,13 +249,22 @@ class OpenCode:
 
         Session permissions are stored by OpenCode at creation time. Syncing them
         on reuse makes ``config.yaml`` changes effective for existing topics too.
+
+        Best-effort, like :meth:`register_mcp` / :meth:`abort_session`: this runs
+        in :meth:`balam.router.Router.resolve`'s hot path on *every* message to a
+        live session, so a transient PATCH failure must not abort the turn and
+        drop the message. A failure is logged and the session keeps its existing
+        (stale-but-working) ruleset.
         """
-        response = await self._client.patch(
-            f"/session/{session_id}",
-            params={"directory": directory},
-            json={"permission": permission},
-        )
-        response.raise_for_status()
+        try:
+            response = await self._client.patch(
+                f"/session/{session_id}",
+                params={"directory": directory},
+                json={"permission": permission},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.warning("failed to sync permissions for session %s", session_id, exc_info=True)
 
     async def prompt(
         self,

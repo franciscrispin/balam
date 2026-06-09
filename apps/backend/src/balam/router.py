@@ -102,14 +102,11 @@ class Router:
         session_id = await self._opencode.create_session(
             title, directory=ctx.directory, permission=build_ruleset(ctx), mcp=ctx.mcp
         )
-        self._store.set(
-            chat_id,
-            thread_id,
-            session_id,
-            int(time.time() * 1000),
-            context=name,
-            auto_named=auto_named,
-        )
+        self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=name)
+        if auto_named:
+            # The topic is created already carrying its name, so its first message
+            # must not trigger a first-message auto-rename.
+            self._store.mark_auto_named(chat_id, thread_id)
         return session_id
 
     async def resolve(self, ref: TopicRef) -> ResolvedSession:
@@ -128,9 +125,10 @@ class Router:
                 session_id, directory=ctx.directory, permission=permission
             )
         else:
-            auto_named = self._store.is_auto_named(ref.chat_id, ref.thread_id) if row else False
             if existing:
                 # Mapped session is gone server-side: clear the stale row, recreate.
+                # The auto-naming marker is kept (it lives in its own table), so the
+                # topic's name carries across the recreate.
                 self._store.delete(ref.chat_id, ref.thread_id)
             session_id = await self._opencode.create_session(
                 ref.title, directory=ctx.directory, permission=permission, mcp=ctx.mcp
@@ -141,7 +139,6 @@ class Router:
                 session_id,
                 int(time.time() * 1000),
                 context=context_name,
-                auto_named=auto_named,
             )
 
         provider, model = ctx.provider_model
