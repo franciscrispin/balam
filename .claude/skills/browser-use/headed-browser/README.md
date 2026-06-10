@@ -8,10 +8,10 @@ machine, no SSH `-X`.
 ## Architecture
 
 ```
-  agent ─── DISPLAY=:99 ───▶  Xvfb :99  ◀── x11vnc :5900 (localhost) ◀── websockify :6080 + noVNC
+  agent ─── DISPLAY=:99 ───▶  Xvfb :99  ◀── x11vnc :5900 (localhost) ◀── websockify :6081 + noVNC
                                                                                     ▲
-                                                                     user's browser (port 6080 forwarded)
-                                                                http://localhost:6080/vnc.html
+                                                                     user's browser (port 6081 forwarded)
+                                                                http://localhost:6081/vnc.html
 ```
 
 Xvfb paints to a virtual framebuffer. x11vnc exports it as a VNC server on
@@ -95,11 +95,11 @@ prints the noVNC URL and the `DISPLAY=:99` prefix to use.
 
 ### View it from your browser
 
-Forward VM port **6080** the same way you forward other dev ports (SSH `-L`,
+Forward VM port **6081** the same way you forward other dev ports (SSH `-L`,
 VS Code remote, whatever you use), then open:
 
 ```
-http://localhost:6080/vnc.html
+http://localhost:6081/vnc.html
 ```
 
 Click **Connect** (no password). You will see whatever is running on
@@ -130,7 +130,7 @@ Environment variables read by `start.sh` (all optional, with defaults):
 | ------------- | ------- | --------------------------------- |
 | `DISPLAY_NUM` | `99`    | X display number                  |
 | `VNC_PORT`    | `5900`  | x11vnc RFB port (localhost-bound) |
-| `NOVNC_PORT`  | `6080`  | websockify/noVNC HTTP port        |
+| `NOVNC_PORT`  | `6081`  | websockify/noVNC HTTP port        |
 | `WIDTH`       | `1440`  | Framebuffer width                 |
 | `HEIGHT`      | `900`   | Framebuffer height                |
 | `DEPTH`       | `24`    | Color depth                       |
@@ -157,31 +157,31 @@ To make a different size the default, change `WIDTH`/`HEIGHT` here in
 
 - **x11vnc binds to `localhost` only** (`-localhost` flag). VNC auth is
   disabled (`-nopw`) because the port is not reachable from outside the VM.
-- **websockify binds to `0.0.0.0:6080`** so the user can reach it through
+- **websockify binds to `0.0.0.0:6081`** so the user can reach it through
   port forwarding. Anything else on the VM's network that can reach this VM
-  on port 6080 can also view the noVNC session. If the VM is on an untrusted
-  network, firewall 6080 or switch websockify to `--listen 127.0.0.1` and
+  on port 6081 can also view the noVNC session. If the VM is on an untrusted
+  network, firewall 6081 or switch websockify to `--listen 127.0.0.1` and
   forward that.
 - The scripts do not start on boot. Re-run `start.sh` after a reboot.
 
 ## SSH port-forward drops ("Broken pipe", "closed by remote host")
 
-The `ssh -L 6080:...` forward is **only your viewport** into noVNC. The
+The `ssh -L 6081:...` forward is **only your viewport** into noVNC. The
 browser, Xvfb, x11vnc and websockify all run on the VM and keep running when
 the forward dies — so does whatever agent is driving them. You lose the
 *picture*, not the work. Recover by re-running the forward and refreshing
-`http://localhost:6080/vnc.html`.
+`http://localhost:6081/vnc.html`.
 
 To stop the forward from dropping (idle timeouts, flaky links):
 
 ```sh
 # keepalives + bail out if forwarding fails, instead of a half-open tunnel
 ssh -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
-  -L 6080:localhost:6080 ubuntu@<vm-host>
+  -L 6081:localhost:6081 ubuntu@<vm-host>
 
 # or, auto-reconnect forever (install autossh on the client):
 autossh -M 0 -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-  -L 6080:localhost:6080 ubuntu@<vm-host>
+  -L 6081:localhost:6081 ubuntu@<vm-host>
 ```
 
 Or put it in `~/.ssh/config` once:
@@ -190,7 +190,7 @@ Or put it in `~/.ssh/config` once:
 Host vm-vnc
     HostName <vm-host>
     User ubuntu
-    LocalForward 6080 localhost:6080
+    LocalForward 6081 localhost:6081
     ServerAliveInterval 30
     ServerAliveCountMax 3
     ExitOnForwardFailure yes
@@ -210,7 +210,7 @@ inside `tmux`/`screen` so an SSH drop never takes them down.
   — the stack is not running, or `DISPLAY=:99` is not set. Run `ensure.sh` and
   prefix the command with `DISPLAY=:99`.
 - **noVNC tab says "Failed to connect"** — websockify is not running, port
-  6080 is not forwarded (the SSH tunnel dropped — see above), or x11vnc died.
+  6081 is not forwarded (the SSH tunnel dropped — see above), or x11vnc died.
   Check `~/.cache/headed-browser/*.log`; `ensure.sh` restarts what is missing.
 - **Black screen in noVNC after connect** — no X client is running. That is
   expected until an agent launches a browser. Quick sanity check:

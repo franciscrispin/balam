@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 if DISPLAY=":${DISPLAY_NUM}" xdpyinfo >/dev/null 2>&1; then
-  echo "headed-browser: stack already running on :${DISPLAY_NUM} — noVNC at http://localhost:${NOVNC_PORT:-6080}/vnc.html"
+  echo "headed-browser: stack already running on :${DISPLAY_NUM} — noVNC at http://localhost:${NOVNC_PORT:-6081}/vnc.html"
 else
   echo "headed-browser: stack not running — starting it"
   "$SCRIPT_DIR/start.sh"

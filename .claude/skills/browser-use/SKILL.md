@@ -28,7 +28,7 @@ backing processes, send a message, confirm the agent answers.
                      Xvfb ─ x11vnc ─ noVNC                          Balam backend (apps/backend, Bun)
                               ▲                                                      │ HTTP + SSE
                    user watches at                                          OpenCode server (opencode serve)
-              http://localhost:6080/vnc.html
+              http://localhost:6081/vnc.html
 ```
 
 You send a message in Telegram Web → Telegram delivers it to the bot → the Balam
@@ -36,7 +36,7 @@ backend routes the topic to an OpenCode session and prompts the agent → the
 reply streams back into the same topic as an animated draft, then a final
 message. **The test passes when you see that reply appear.**
 
-- The headed-browser stack (Xvfb on `:99`, x11vnc, websockify/noVNC on `:6080`)
+- The headed-browser stack (Xvfb on `:99`, x11vnc, websockify/noVNC on `:6081`)
   is bundled in `headed-browser/`. `headed-browser/ensure.sh` starts it if it is
   not already up (idempotent, prompt-free when allowlisted);
   `headed-browser/README.md` has one-time install and troubleshooting.
@@ -118,7 +118,7 @@ traceback.
 
 Idempotent — starts Xvfb/x11vnc/noVNC only if not already up, and writes
 `.playwright/cli.config.json` so the browser fills the noVNC view. Tell the user
-to watch at **http://localhost:6080/vnc.html** (port 6080 forwarded).
+to watch at **http://localhost:6081/vnc.html** (port 6081 forwarded).
 
 Telegram Web keeps its login in **IndexedDB**, so you must use a **persistent
 profile** — a throwaway browser cannot stay logged in. Open it with:

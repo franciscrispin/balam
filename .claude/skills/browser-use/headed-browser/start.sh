@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Start Xvfb + x11vnc + websockify/noVNC so agents can run a headed browser
-# on this VM while the user watches from a browser via http://localhost:6080.
+# on this VM while the user watches from a browser via http://localhost:6081.
 # Idempotent: re-running cleanly restarts everything.
 set -euo pipefail
 
 DISPLAY_NUM=${DISPLAY_NUM:-99}
 DISPLAY_VAL=":${DISPLAY_NUM}"
 VNC_PORT=${VNC_PORT:-5900}
-NOVNC_PORT=${NOVNC_PORT:-6080}
+NOVNC_PORT=${NOVNC_PORT:-6081}
 WIDTH=${WIDTH:-1440}
 HEIGHT=${HEIGHT:-900}
 DEPTH=${DEPTH:-24}
