@@ -52,7 +52,9 @@ function getHighlighter(): Promise<HighlighterCore> {
 /** Load `lang`'s grammar if supported + not yet loaded; returns the resolved
  * language id ("text" when unsupported). */
 async function ensureLanguage(highlighter: HighlighterCore, lang: string): Promise<string> {
-  const loader = LANG_LOADERS[lang];
+  // Object.hasOwn, not `in`/indexing: a fence like ```constructor would
+  // otherwise resolve to an inherited Object.prototype member and crash.
+  const loader = Object.hasOwn(LANG_LOADERS, lang) ? LANG_LOADERS[lang] : undefined;
   if (!loader) {
     return "text";
   }
@@ -78,7 +80,7 @@ export function fenceLanguages(markdown: string): string[] {
   const langs = new Set<string>();
   for (const match of markdown.matchAll(/^[ \t]*(?:```|~~~)[ \t]*([\w-]+)/gm)) {
     const lang = match[1]?.toLowerCase();
-    if (lang && lang in LANG_LOADERS) langs.add(lang);
+    if (lang && Object.hasOwn(LANG_LOADERS, lang)) langs.add(lang);
   }
   return [...langs];
 }
