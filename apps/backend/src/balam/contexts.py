@@ -40,6 +40,17 @@ EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 #: env-var spelling.
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+#: Context names travel inside Telegram Mini App ``start_param`` tokens
+#: (``"<view>__<context>"``, :mod:`balam.miniapp`), which Telegram caps at 64
+#: chars of ``[A-Za-z0-9_-]`` — anything else is silently dropped and the Mini
+#: App opens on the default view/context. Hence: charset restricted, no ``__``
+#: (the view/param separator), nothing shaped like the ``c_<hex>`` content-id
+#: marker the frontend's ``resolveLaunch`` strips, and short enough to fit the
+#: budget behind the longest view prefix (``markdown__``).
+_CONTEXT_NAME = re.compile(r"[A-Za-z0-9_-]+")
+_CONTENT_ID_MARKER = re.compile(r"c_[0-9a-f]{6,}")
+_CONTEXT_NAME_MAX = 64 - len("markdown__")
+
 
 def _expand_env(value: Any, *, where: str) -> Any:
     """Recursively expand ``${VAR}`` references in ``value`` from the environment.
@@ -139,6 +150,34 @@ class ContextsConfig(BaseModel):
 
     default_context: str
     contexts: dict[str, ContextConfig]
+
+    @field_validator("contexts")
+    @classmethod
+    def _names_fit_start_param(cls, value: dict[str, ContextConfig]) -> dict[str, ContextConfig]:
+        for name in value:
+            if not _CONTEXT_NAME.fullmatch(name):
+                raise ValueError(
+                    f"context name {name!r} must use only letters, digits, '-' and '_' "
+                    "(it travels in a Telegram Mini App start_param, which silently "
+                    "drops anything else)"
+                )
+            if "__" in name:
+                raise ValueError(
+                    f"context name {name!r} must not contain '__' (the Mini App "
+                    "start_param separator)"
+                )
+            if _CONTENT_ID_MARKER.fullmatch(name):
+                raise ValueError(
+                    f"context name {name!r} collides with the Mini App 'c_<hex>' "
+                    "content-id marker — pick a name that isn't 'c_' plus hex digits"
+                )
+            if len(name) > _CONTEXT_NAME_MAX:
+                raise ValueError(
+                    f"context name {name!r} is too long ({len(name)} > "
+                    f"{_CONTEXT_NAME_MAX}): it must fit Telegram's 64-char "
+                    "start_param budget"
+                )
+        return value
 
     @model_validator(mode="after")
     def _check(self) -> ContextsConfig:

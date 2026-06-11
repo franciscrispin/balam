@@ -113,6 +113,31 @@ def test_construct_requires_nonempty_contexts() -> None:
         ContextsConfig(default_context="x", contexts={})
 
 
+def _named(name: str) -> str:
+    return f"default_context: {name}\ncontexts:\n  {name}:\n    directory: /a\n    description: A\n"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "my.proj",  # '.' survives URL-quoting but Telegram drops the start_param
+        "has space",
+        "a__b",  # the start_param view/context separator
+        "c_decade",  # 'decade' is all hex → parsed as a content id by the frontend
+        "x" * 55,  # blows the 64-char start_param budget behind "markdown__"
+    ],
+)
+def test_context_name_breaking_start_param_rejected(tmp_path, name) -> None:
+    with pytest.raises(ContextsConfigError):
+        load_contexts(_write(tmp_path, _named(name)))
+
+
+def test_context_name_within_start_param_contract_accepted(tmp_path) -> None:
+    # 'c_compose' is fine: 'ompose' is not hex, so it can't be a content id.
+    cfg = load_contexts(_write(tmp_path, _named("c_compose")))
+    assert "c_compose" in cfg.contexts
+
+
 MCP_CONFIG = """
 default_context: a
 contexts:
