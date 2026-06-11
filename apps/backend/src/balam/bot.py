@@ -683,6 +683,30 @@ async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await message.reply_text(text, reply_markup=keyboard)
 
 
+async def _handle_browser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/browser`` — open the Mini App live view of the agent's Chrome (ADR-0006).
+
+    The view is global (one X display on the VM), not per-context: the start
+    param's second token is the placeholder ``live``, which the frontend parses
+    as a context name the browser view ignores.
+    """
+    message = update.message
+    if message is None:
+        return
+
+    config: Config = context.application.bot_data["config"]
+    text, keyboard = mini_app_reply(
+        config,
+        "browser",
+        "live",
+        bot_username=getattr(context.bot, "username", None),
+        is_private=getattr(message.chat, "type", None) == "private",
+        label="Watch live",
+        heading="Live browser view:",
+    )
+    await message.reply_text(text, reply_markup=keyboard)
+
+
 async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/cancel`` — abort the turn running in the current topic, if any."""
     message = update.message
@@ -992,6 +1016,7 @@ BOT_COMMANDS = [
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
     BotCommand("plan", "Plan mode for this topic (/plan [request], /plan off)"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
+    BotCommand("browser", "Watch the agent's live browser (Mini App)"),
 ]
 
 
@@ -1056,6 +1081,7 @@ def build_application(
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
     app.add_handler(CommandHandler("plan", _handle_plan, filters=allowed))
     app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
+    app.add_handler(CommandHandler("browser", _handle_browser, filters=allowed))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & allowed,

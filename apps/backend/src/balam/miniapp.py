@@ -42,10 +42,14 @@ def mini_app_reply(
     *,
     bot_username: str | None,
     is_private: bool,
+    label: str = "View changes",
+    heading: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """How to surface a Mini App ``view`` bound to ``context_name`` for this chat.
 
-    Returns ``(text, reply_markup)``. Preference order (ADR-0013):
+    ``label`` is the button text and ``heading`` the message line (defaults fit
+    the diff view, the original caller). Returns ``(text, reply_markup)``.
+    Preference order (ADR-0013):
 
     1. **Direct Mini App link** — opens in Telegram's webview (signed initData) in
        ANY chat type, so it works in the workspace supergroup where ``web_app``
@@ -58,33 +62,34 @@ def mini_app_reply(
     """
     is_public = config.balam_public_url is not None
     shortname = config.balam_miniapp_shortname
+    heading = heading if heading is not None else f"Changes in {context_name}:"
 
     if is_public and shortname and bot_username:
         start_param = f"{view}__{context_name}"
         link = f"https://t.me/{bot_username}/{shortname}?startapp={quote(start_param)}"
-        button = InlineKeyboardButton("View changes", url=link)
-        return f"Changes in {context_name}:", InlineKeyboardMarkup([[button]])
+        button = InlineKeyboardButton(label, url=link)
+        return heading, InlineKeyboardMarkup([[button]])
 
     url = mini_app_url(config, view, f"context={quote(context_name)}")
 
     if is_public and is_private:
-        button = InlineKeyboardButton("View changes", web_app=WebAppInfo(url=url))
-        return f"Changes in {context_name}:", InlineKeyboardMarkup([[button]])
+        button = InlineKeyboardButton(label, web_app=WebAppInfo(url=url))
+        return heading, InlineKeyboardMarkup([[button]])
 
     if is_public:
         # In groups a web_app inline button is rejected (Button_type_invalid); a
         # plain URL button opens in the external browser instead (no initData
         # there, so the Mini App relies on the owner's Telegram session).
-        button = InlineKeyboardButton("View changes", url=url)
+        button = InlineKeyboardButton(label, url=url)
         text = (
-            f"Changes in {context_name}: {url}\n\n"
+            f"{heading} {url}\n\n"
             "Opens in your browser. (Telegram only allows the in-app Mini App button "
             "in a private chat with the bot.)"
         )
         return text, InlineKeyboardMarkup([[button]])
 
     text = (
-        f"Diff viewer for {context_name}:\n{url}\n\n"
+        f"{heading}\n{url}\n\n"
         "Opens in a browser. To open inside Telegram, serve the Mini App from "
         "a public HTTPS URL and set BALAM_PUBLIC_URL (ADR-0013)."
     )
