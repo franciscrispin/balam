@@ -253,9 +253,6 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         effort=resolved.effort,
         allowed_dirs=[resolved.directory, *resolved.additional_directories],
         files=files,
-        # Sticky plan mode (/plan): OpenCode's agent selection is per-prompt, so
-        # every prompt while the flag is set must request the plan agent.
-        agent="plan" if router.plan_mode(chat_id, thread_id) else None,
     )
 
     # One turn per topic at a time (ADR-0009). OpenCode runs a single turn per
@@ -312,6 +309,11 @@ def _start_turn(
     async def run() -> None:
         cancelled = False
         try:
+            # Sticky plan mode (/plan): OpenCode's agent selection is per-prompt,
+            # so every prompt while the flag is set must request the plan agent.
+            # Read at turn start — not at enqueue — so a job that waited in the
+            # queue respects a plan approval or /plan off issued in the meantime.
+            agent = "plan" if router.plan_mode(chat_id, thread_id) else None
             await stream_reply(
                 bot=context.bot,
                 opencode=opencode,
@@ -329,7 +331,7 @@ def _start_turn(
                 ),
                 allowed_dirs=job.allowed_dirs,
                 files=job.files,
-                agent=job.agent,
+                agent=agent,
                 plan_view=plan_view,
                 on_plan_approved=_on_plan_approved,
             )
@@ -580,7 +582,6 @@ async def _handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         effort=resolved.effort,
         allowed_dirs=[resolved.directory, *resolved.additional_directories],
         files=[],
-        agent="plan",
     )
     if turns.get(chat_id, thread_id) is not None:
         position = turns.enqueue(chat_id, thread_id, job)

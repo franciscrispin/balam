@@ -634,6 +634,45 @@ async def test_queued_messages_drain_in_fifo_order(monkeypatch) -> None:
     assert prompts == ["first", "second", "third"]
 
 
+async def test_queued_message_reads_plan_mode_at_drain_time(monkeypatch) -> None:
+    # The plan agent must be derived when a job actually runs, not when it was
+    # enqueued: a message queued during a planning turn would otherwise drag the
+    # session back into plan mode after the plan was approved mid-turn.
+    agents: list[tuple[str, object]] = []
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+
+    async def fake_stream_reply(*, prompt: str, agent: object = None, **_: object) -> None:
+        agents.append((prompt, agent))
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    router.set_plan_mode(SUPERGROUP, 5, True)
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    first_task = turns.get(SUPERGROUP, 5).task
+
+    # Queue a second message mid-turn, then clear the flag (what on_plan_approved
+    # does when the plan_exit question is answered "Yes") before the queue drains.
+    message.text = "second"
+    await _handle_message(update, context)
+    router.set_plan_mode(SUPERGROUP, 5, False)
+
+    gate.set()
+    await first_task
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task
+
+    assert agents == [("first", "plan"), ("second", None)]
+
+
 async def test_cancel_drops_queued_messages(monkeypatch) -> None:
     gate = asyncio.Event()
     first_started = asyncio.Event()

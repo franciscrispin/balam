@@ -43,7 +43,12 @@ class TurnJob:
     is captured at enqueue time (the session is already resolved) so draining the
     queue is synchronous — the running slot is handed to the next job without an
     ``await`` in between, leaving no window for a concurrent message to slip a
-    second turn onto the same session."""
+    second turn onto the same session.
+
+    Deliberately *not* captured: the plan-agent choice. ``_start_turn`` derives it
+    from the topic's plan-mode flag when the job actually runs, so a message
+    queued behind a turn respects a plan approval or ``/plan off`` that happened
+    while it waited."""
 
     prompt: str
     session_id: str
@@ -53,9 +58,6 @@ class TurnJob:
     effort: str | None
     allowed_dirs: list[str]
     files: list[PromptFile]
-    #: OpenCode agent override for this turn (``"plan"`` while the topic is in
-    #: plan mode); ``None`` lets the server pick its default (build).
-    agent: str | None = None
 
 
 class TurnRegistry:
