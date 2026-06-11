@@ -53,7 +53,7 @@ def test_does_not_treat_zero_as_wildcard() -> None:
 # --- /context opens a new topic -----------------------------------------------
 
 
-BOT_ID = 8761754586
+BOT_ID = 7000000042
 
 
 def test_topic_link_for_private_supergroup() -> None:
@@ -63,11 +63,11 @@ def test_topic_link_for_private_supergroup() -> None:
 
 def test_topic_link_for_private_chat_uses_web_address() -> None:
     # Private chat with topics has no documented deep link → Telegram Web URL.
-    assert _topic_link(24320651, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
+    assert _topic_link(55555555, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
 
 
 def test_topic_link_none_for_private_chat_without_bot_id() -> None:
-    assert _topic_link(24320651, 42) is None
+    assert _topic_link(55555555, 42) is None
 
 
 class _FakeOpenCode:
@@ -201,12 +201,12 @@ async def test_context_switch_in_private_chat_links_via_web() -> None:
     # one-tap link is the Telegram Web address built from the bot's id.
     router = _router()
     bot = _FakeBot(new_thread_id=723639, bot_id=BOT_ID)
-    message = _FakeMessage(24320651, thread_id=723626)  # owner's user id
+    message = _FakeMessage(55555555, thread_id=723626)  # fake owner user id
     update, context = _update_context(bot, router, message, ["scratch"])
 
     await _handle_context(update, context)
 
-    assert bot.created_topics == [(24320651, "scratch")]
+    assert bot.created_topics == [(55555555, "scratch")]
     assert f"https://web.telegram.org/a/#{BOT_ID}_723639" in _button_urls(message)
 
 
