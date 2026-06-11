@@ -49,7 +49,10 @@ x11vnc -display "$DISPLAY_VAL" -rfbport "$VNC_PORT" \
 sleep 0.3
 pgrep -f "x11vnc -display ${DISPLAY_VAL} " | head -1 > "$STATE_DIR/x11vnc.pid"
 
-nohup websockify --web "$NOVNC_DIR" "$NOVNC_PORT" "localhost:${VNC_PORT}" \
+# Loopback-only (ADR-0006 "lock the endpoint"): the Mini App reaches the VNC
+# server through Balam's authenticated /api/vnc/ws bridge, so websockify/noVNC
+# is a local dev convenience and must not listen on all interfaces.
+nohup websockify --web "$NOVNC_DIR" "127.0.0.1:${NOVNC_PORT}" "localhost:${VNC_PORT}" \
   > "$STATE_DIR/websockify.log" 2>&1 < /dev/null &
 echo $! > "$STATE_DIR/websockify.pid"
 
