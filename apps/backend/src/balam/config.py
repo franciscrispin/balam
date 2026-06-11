@@ -69,6 +69,14 @@ class Config(BaseSettings):
     # inline button, which Telegram permits only in private chats.
     balam_miniapp_shortname: str | None = None
 
+    # --- noVNC live browser view (ADR-0006) ---
+    # The x11vnc server exposing the agent's headed Chrome (started on demand by
+    # the browser-use skill, .claude/skills/browser-use/headed-browser/). The
+    # backend bridges /api/vnc/ws straight to this TCP endpoint; it never starts
+    # the stack itself.
+    balam_vnc_host: str = "127.0.0.1"
+    balam_vnc_port: int = 5900
+
     @field_validator(
         "opencode_server_password",
         "balam_db_path",

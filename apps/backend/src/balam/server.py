@@ -10,8 +10,9 @@ Runs in the same process as the bot (mounted from :mod:`balam.app`), bound to
   3. Emit the OpenAPI schema (``/openapi.json``) the frontend generates its
      TypeScript types from (ADR-0003).
 
-Ships the **git diff viewer** and **markdown viewer** endpoints; the noVNC
-live-Chrome proxy comes later (Tier 3 / ADR-0006).
+Ships the **git diff viewer** and **markdown viewer** endpoints, plus the
+**noVNC live-Chrome bridge** (``/api/vnc/ws`` + ``/api/browser/status``,
+ADR-0006 — the WebSocket↔TCP bridge itself lives in :mod:`balam.vnc`).
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -31,6 +32,7 @@ from balam.config import Config
 from balam.content_store import ContentStore
 from balam.git_diff import DiffHunk, NotAGitRepo, get_hunks
 from balam.router import Router
+from balam.vnc import probe_vnc, vnc_websocket
 from balam.webapp_auth import RequireOwner
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,12 @@ class MarkdownContentResponse(BaseModel):
 
     title: str
     content: str
+
+
+class BrowserStatus(BaseModel):
+    """Whether the live browser stack (x11vnc) is reachable on the VM (ADR-0006)."""
+
+    running: bool
 
 
 def create_app(
@@ -128,6 +136,24 @@ def create_app(
         if entry is None:
             raise HTTPException(status_code=404, detail="content not found or expired")
         return MarkdownContentResponse(title=entry.title, content=entry.content)
+
+    @app.get("/api/browser/status", response_model=BrowserStatus)
+    async def browser_status(_owner: int = Depends(require_owner)) -> BrowserStatus:
+        return BrowserStatus(running=await probe_vnc(config.balam_vnc_host, config.balam_vnc_port))
+
+    # The RFB byte stream for the live browser view. Not in the OpenAPI schema
+    # (WebSocket routes never are): the contract is the client's initData as the
+    # first text frame, then raw RFB bytes (a browser can't set an Authorization
+    # header on a WebSocket, and a query param would leak into uvicorn's log).
+    @app.websocket("/api/vnc/ws")
+    async def vnc_ws(websocket: WebSocket) -> None:
+        await vnc_websocket(
+            websocket,
+            bot_token=config.telegram_bot_token,
+            allowed_user_id=config.allowed_telegram_user_id,
+            host=config.balam_vnc_host,
+            port=config.balam_vnc_port,
+        )
 
     if tool_scopes is not None and bot is not None:
         # Balam's own MCP server (balam.agent_tools): OpenCode calls this over

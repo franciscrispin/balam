@@ -86,6 +86,25 @@ def validate_init_data(
     return user
 
 
+def is_owner_init_data(
+    init_data: str, *, bot_token: str, allowed_user_id: int, now: int | None = None
+) -> bool:
+    """True iff ``init_data`` is HMAC-valid, fresh, and embeds the allowed owner.
+
+    The WebSocket route's auth (ADR-0006): a browser cannot set an
+    ``Authorization`` header on a WebSocket, so the noVNC client sends its
+    ``initData`` as the first text frame and the route checks it with this
+    instead of :class:`RequireOwner`.
+    """
+    try:
+        user = validate_init_data(
+            init_data, bot_token, now=now if now is not None else int(time.time())
+        )
+    except InitDataError:
+        return False
+    return int(user["id"]) == allowed_user_id
+
+
 class RequireOwner:
     """FastAPI dependency: authenticate a Mini App request as the allowed owner.
 

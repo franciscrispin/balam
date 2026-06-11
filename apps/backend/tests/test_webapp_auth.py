@@ -7,7 +7,7 @@ import time
 import pytest
 from fastapi import HTTPException
 
-from balam.webapp_auth import InitDataError, RequireOwner, validate_init_data
+from balam.webapp_auth import InitDataError, RequireOwner, is_owner_init_data, validate_init_data
 from conftest import BOT_TOKEN, OWNER_ID, make_init_data
 
 _NOW = 1_700_000_000
@@ -82,3 +82,30 @@ def test_realistic_now_path() -> None:
     # Exercise the RequireOwner path that uses the real wall clock internally.
     init = make_init_data(auth_date=int(time.time()))
     assert _owner()(authorization=f"tma {init}") == OWNER_ID
+
+
+def test_is_owner_init_data_accepts_owner() -> None:
+    init = make_init_data(auth_date=_NOW)
+    assert is_owner_init_data(init, bot_token=BOT_TOKEN, allowed_user_id=OWNER_ID, now=_NOW)
+
+
+def test_is_owner_init_data_rejects_other_user() -> None:
+    init = make_init_data(user_id=OWNER_ID + 1, auth_date=_NOW)
+    assert not is_owner_init_data(init, bot_token=BOT_TOKEN, allowed_user_id=OWNER_ID, now=_NOW)
+
+
+def test_is_owner_init_data_rejects_expired() -> None:
+    init = make_init_data(auth_date=_NOW)
+    assert not is_owner_init_data(
+        init, bot_token=BOT_TOKEN, allowed_user_id=OWNER_ID, now=_NOW + 48 * 3600
+    )
+
+
+def test_is_owner_init_data_rejects_garbage() -> None:
+    assert not is_owner_init_data("not-init-data", bot_token=BOT_TOKEN, allowed_user_id=OWNER_ID)
+
+
+def test_is_owner_init_data_realistic_now_path() -> None:
+    # Exercise the default wall-clock branch (now=None), as the WS route uses it.
+    init = make_init_data(auth_date=int(time.time()))
+    assert is_owner_init_data(init, bot_token=BOT_TOKEN, allowed_user_id=OWNER_ID)

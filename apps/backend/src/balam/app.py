@@ -11,8 +11,8 @@ Boot sequence:
   6. Stop the Mini App server, close OpenCode + SQLite on shutdown
      (``post_shutdown``).
 
-TODO(ADR-0006): a later slice reverse-proxies the noVNC WebSocket through this
-same server for the live-Chrome view.
+The same FastAPI server also bridges the noVNC WebSocket for the live-Chrome
+view (ADR-0006, :mod:`balam.vnc`).
 """
 
 from __future__ import annotations
