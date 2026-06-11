@@ -1,7 +1,7 @@
 # Balam — Core Feature Recommendations
 
 Prioritized tiers for what to build next, drawn from the
-[zog vs. open-shrimp feature comparison](./zog-vs-open-shrimp-features.md).
+[Telegram coding-bots feature comparison](./telegram-coding-bots-comparison.md).
 Principle: finish the daily-driver **chat loop** before the Mini App; prefer
 features proven in *both* reference apps; reuse their implementations (ADR-0011).
 
