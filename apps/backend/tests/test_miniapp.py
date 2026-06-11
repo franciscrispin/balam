@@ -77,3 +77,29 @@ def test_mini_app_reply_localhost_text_only(make_config: Callable[..., Config]) 
     )
     assert keyboard is None
     assert "BALAM_PUBLIC_URL" in text
+
+
+def test_mini_app_reply_context_free_direct_link(make_config: Callable[..., Config]) -> None:
+    # A context-free view (/browser) sends the bare view as start_param: a
+    # placeholder would land in the frontend's shared launch context and break
+    # the other views (the diff view 404s on an unknown context name).
+    config = make_config(
+        balam_public_url="https://balam.example.com", balam_miniapp_shortname="balamapp"
+    )
+    text, keyboard = mini_app_reply(
+        config, "browser", None, bot_username="balam_bot", is_private=False, heading="Live:"
+    )
+    assert text == "Live:"
+    button = keyboard.inline_keyboard[0][0]
+    assert button.url == "https://t.me/balam_bot/balamapp?startapp=browser"
+
+
+def test_mini_app_reply_context_free_url_has_no_context_param(
+    make_config: Callable[..., Config],
+) -> None:
+    config = make_config(balam_public_url="https://balam.example.com")
+    _text, keyboard = mini_app_reply(
+        config, "browser", None, bot_username=None, is_private=True, heading="Live:"
+    )
+    button = keyboard.inline_keyboard[0][0]
+    assert button.web_app.url == "https://balam.example.com/?view=browser"

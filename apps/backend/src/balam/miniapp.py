@@ -24,7 +24,7 @@ from balam.content_store import ContentStore
 logger = logging.getLogger(__name__)
 
 
-def mini_app_url(config: Config, view: str, query: str) -> str:
+def mini_app_url(config: Config, view: str, query: str = "") -> str:
     """The browser/``web_app`` URL for ``view`` with a pre-encoded ``query`` tail.
 
     Uses the public HTTPS base when configured (``BALAM_PUBLIC_URL``), else the
@@ -32,13 +32,14 @@ def mini_app_url(config: Config, view: str, query: str) -> str:
     the owner can open in a browser.
     """
     base = config.balam_public_url or f"http://127.0.0.1:{config.balam_port}"
-    return f"{base}/?view={view}&{query}"
+    tail = f"&{query}" if query else ""
+    return f"{base}/?view={view}{tail}"
 
 
 def mini_app_reply(
     config: Config,
     view: str,
-    context_name: str,
+    context_name: str | None,
     *,
     bot_username: str | None,
     is_private: bool,
@@ -47,6 +48,11 @@ def mini_app_reply(
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """How to surface a Mini App ``view`` bound to ``context_name`` for this chat.
 
+    ``context_name`` is ``None`` for context-free views (the live browser view is
+    global — one X display on the VM): the launch then carries no context at all,
+    so the frontend's other views keep falling back to the backend default
+    instead of choking on a placeholder name.
+
     ``label`` is the button text and ``heading`` the message line (defaults fit
     the diff view, the original caller). Returns ``(text, reply_markup)``.
     Preference order (ADR-0013):
@@ -54,7 +60,8 @@ def mini_app_reply(
     1. **Direct Mini App link** — opens in Telegram's webview (signed initData) in
        ANY chat type, so it works in the workspace supergroup where ``web_app``
        inline buttons are rejected. Needs a BotFather short name + the bot username;
-       ``start_param`` carries view+context as ``"view__context"``.
+       ``start_param`` carries view+context as ``"view__context"`` (bare ``view``
+       when context-free).
     2. **``web_app`` button** — also opens in-Telegram (initData, ADR-0008), but
        Telegram allows it ONLY in private chats.
     3. **Plain URL** — opens in the external browser (HTTPS public base set).
@@ -65,12 +72,12 @@ def mini_app_reply(
     heading = heading if heading is not None else f"Changes in {context_name}:"
 
     if is_public and shortname and bot_username:
-        start_param = f"{view}__{context_name}"
+        start_param = f"{view}__{context_name}" if context_name else view
         link = f"https://t.me/{bot_username}/{shortname}?startapp={quote(start_param)}"
         button = InlineKeyboardButton(label, url=link)
         return heading, InlineKeyboardMarkup([[button]])
 
-    url = mini_app_url(config, view, f"context={quote(context_name)}")
+    url = mini_app_url(config, view, f"context={quote(context_name)}" if context_name else "")
 
     if is_public and is_private:
         button = InlineKeyboardButton(label, web_app=WebAppInfo(url=url))

@@ -693,9 +693,10 @@ async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _handle_browser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/browser`` — open the Mini App live view of the agent's Chrome (ADR-0006).
 
-    The view is global (one X display on the VM), not per-context: the start
-    param's second token is the placeholder ``live``, which the frontend parses
-    as a context name the browser view ignores.
+    The view is global (one X display on the VM), not per-context, so the launch
+    carries no context: a placeholder would leak into the app shell's shared
+    launch context and break the other views (e.g. the diff view 404s on an
+    unknown context name).
     """
     message = update.message
     if message is None:
@@ -705,7 +706,7 @@ async def _handle_browser(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text, keyboard = mini_app_reply(
         config,
         "browser",
-        "live",
+        None,
         bot_username=getattr(context.bot, "username", None),
         is_private=getattr(message.chat, "type", None) == "private",
         label="Watch live",
