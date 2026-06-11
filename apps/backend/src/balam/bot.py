@@ -37,10 +37,10 @@ from telegram.ext import (
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import collect_attachments
 from balam.config import Config
-from balam.miniapp import mini_app_reply
+from balam.miniapp import make_plan_view_button, mini_app_reply
 from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
-from balam.streamer import stream_reply
+from balam.streamer import _question_keyboard, stream_reply
 from balam.telegram_utils import thread_kwargs
 from balam.turns import TurnJob, TurnRegistry
 
@@ -189,8 +189,12 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "pending_questions"
     )
     if text and pending_questions is not None:
-        if pending_questions.resolve_custom(chat_id, thread_id, text):
+        custom_result = pending_questions.resolve_custom(chat_id, thread_id, text)
+        if custom_result == "resolved":
             await message.reply_text("✅ Answer sent.")
+            return
+        if custom_result == "added":
+            await message.reply_text("✅ Custom answer added. Select more options or tap Done.")
             return
 
     # Download any image/document attachments as native file parts (tier-1 plan §4);
@@ -249,6 +253,9 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         effort=resolved.effort,
         allowed_dirs=[resolved.directory, *resolved.additional_directories],
         files=files,
+        # Sticky plan mode (/plan): OpenCode's agent selection is per-prompt, so
+        # every prompt while the flag is set must request the plan agent.
+        agent="plan" if router.plan_mode(chat_id, thread_id) else None,
     )
 
     # One turn per topic at a time (ADR-0009). OpenCode runs a single turn per
@@ -284,6 +291,23 @@ def _start_turn(
     opencode: OpenCode = context.application.bot_data["opencode"]
     turns: TurnRegistry = context.application.bot_data["turns"]
     pending: PendingApprovals = context.application.bot_data["pending"]
+    router: Router = context.application.bot_data["router"]
+
+    # Snapshot-and-button factory for plan_exit questions ("View plan" in the
+    # Mini App). Only wired when app.py stashed a content store (unit tests of
+    # the bot path don't, and the streamer treats None as "no button").
+    plan_view = None
+    content_store = context.application.bot_data.get("content_store")
+    if content_store is not None:
+        config: Config = context.application.bot_data["config"]
+        plan_view = make_plan_view_button(
+            config, content_store, getattr(context.bot, "username", None)
+        )
+
+    def _on_plan_approved() -> None:
+        # The plan_exit question was answered "Yes": the server switches the
+        # session to the build agent, so the sticky flag must drop with it.
+        router.set_plan_mode(chat_id, thread_id, False)
 
     async def run() -> None:
         cancelled = False
@@ -305,6 +329,9 @@ def _start_turn(
                 ),
                 allowed_dirs=job.allowed_dirs,
                 files=job.files,
+                agent=job.agent,
+                plan_view=plan_view,
+                on_plan_approved=_on_plan_approved,
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
@@ -493,6 +520,77 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _open_context_topic(message, context.bot, router, name)
 
 
+async def _handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/plan [request]`` — put this topic in plan mode; ``/plan off`` leaves it.
+
+    OpenCode's plan agent is selected per *prompt*, not per session, so plan mode
+    is a sticky per-topic flag: while set, every prompt is sent with
+    ``agent="plan"`` (the plan agent can read everything but only write its plan
+    file). The flag drops when the plan_exit question is answered "Yes" (the
+    server then switches the session to the build agent itself) or on
+    ``/plan off``. With a ``request`` argument the planning prompt runs
+    immediately; bare ``/plan`` arms the mode for the next message.
+    """
+    message = update.message
+    if message is None:
+        return
+
+    router: Router = context.application.bot_data["router"]
+    chat_id = message.chat_id
+    thread_id = message.message_thread_id
+    args = context.args or []
+
+    if args and args[0].lower() == "off":
+        router.set_plan_mode(chat_id, thread_id, False)
+        await message.reply_text("Plan mode off — messages run the build agent again.")
+        return
+
+    if _is_forum_general_message(message):
+        # Plain General messages spawn fresh topics that would not inherit the
+        # flag, so a sticky General flag would silently do nothing.
+        await message.reply_text("Use /plan inside a topic (General messages open new topics).")
+        return
+
+    router.set_plan_mode(chat_id, thread_id, True)
+    request = " ".join(args).strip()
+    if not request:
+        await message.reply_text(
+            "📋 Plan mode on — messages here run the plan agent (read-only except its "
+            "plan file) until you approve the plan or send /plan off."
+        )
+        return
+
+    # Run the planning request right away, mirroring the message path.
+    turns: TurnRegistry = context.application.bot_data["turns"]
+    try:
+        ref = TopicRef(chat_id=chat_id, thread_id=thread_id, title=_topic_title(message, thread_id))
+        resolved = await router.resolve(ref)
+        await _auto_name_topic(context.bot, router, ref, resolved.context_name, request)
+    except Exception as exc:
+        logger.exception("failed to resolve session for /plan")
+        await _notify_error(context.bot, chat_id, thread_id, exc)
+        return
+
+    job = TurnJob(
+        prompt=request,
+        session_id=resolved.session_id,
+        directory=resolved.directory,
+        provider=resolved.provider,
+        model=resolved.model,
+        effort=resolved.effort,
+        allowed_dirs=[resolved.directory, *resolved.additional_directories],
+        files=[],
+        agent="plan",
+    )
+    if turns.get(chat_id, thread_id) is not None:
+        position = turns.enqueue(chat_id, thread_id, job)
+        await message.reply_text(
+            f"📋 Plan mode on. ⏳ Queued (#{position}) — I'll plan after the current turn finishes."
+        )
+        return
+    _start_turn(context, chat_id, thread_id, job)
+
+
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/status`` — report the topic's context, session, and whether a turn runs."""
     message = update.message
@@ -521,6 +619,7 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Session: {session_id or '(none yet — send a message to start)'}",
         f"Turn: {'running' if running else 'idle'}",
         f"Queued: {queued}",
+        f"Plan mode: {'on' if router.plan_mode(ref.chat_id, ref.thread_id) else 'off'}",
     ]
     await message.reply_text("\n".join(lines))
 
@@ -677,7 +776,7 @@ async def _handle_approval_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _handle_question_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Resolve an OpenCode question-tool inline keyboard (``qst:<token>:i:j``)."""
+    """Handle an OpenCode question-tool option button (``qst:<token>:i:j``)."""
     query = update.callback_query
     if query is None or not (query.data or "").startswith("qst:"):
         return
@@ -706,7 +805,60 @@ async def _handle_question_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     pending_questions: PendingQuestions = context.application.bot_data["pending_questions"]
+    if pending_questions.is_multiple(token, q_index):
+        selected = pending_questions.toggle(token, q_index, o_index)
+        if selected is None:
+            await query.answer("This question has expired.")
+            await _clear_keyboard(query)
+            return
+        await query.answer("Selected." if selected else "Unselected.")
+        await _refresh_question_keyboard(query, pending_questions, token, q_index)
+        return
+
     if not pending_questions.resolve(token, q_index, o_index):
+        await query.answer("This question has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer("Answered.")
+    await _clear_keyboard(query, note=r"✅ Answered\.")
+
+
+async def _handle_question_done_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Resolve a multi-select OpenCode question after the user taps Done."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("qstd:"):
+        return
+
+    config: Config = context.application.bot_data["config"]
+    user = query.from_user
+    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+        await query.answer()
+        return
+    if config.allowed_telegram_chat_id is not None:
+        chat = query.message.chat if query.message else None
+        if chat is None or chat.id != config.allowed_telegram_chat_id:
+            await query.answer()
+            return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed question answer.")
+        return
+    _, token, question_index = parts
+    try:
+        q_index = int(question_index)
+    except ValueError:
+        await query.answer("Malformed question answer.")
+        return
+
+    pending_questions: PendingQuestions = context.application.bot_data["pending_questions"]
+    finished = pending_questions.finish_multi(token, q_index)
+    if finished is False:
+        await query.answer("Select at least one option.")
+        return
+    if finished is None:
         await query.answer("This question has expired.")
         await _clear_keyboard(query)
         return
@@ -753,6 +905,9 @@ async def _handle_question_custom_callback(
         await query.answer("This question has expired.")
         await _clear_keyboard(query)
         return
+    if pending_questions.is_multiple(token, q_index):
+        await query.answer("Send your custom answer, then tap Done.")
+        return
     await query.answer("Send your answer as the next message in this topic.")
     await _clear_keyboard(query, note=r"Reply with your answer\.")
 
@@ -774,6 +929,37 @@ async def _clear_keyboard(query: Any, note: str | None = None) -> bool:
         return True
     except Exception:
         logger.debug("failed to update spent approval message", exc_info=True)
+        return False
+
+
+async def _refresh_question_keyboard(
+    query: Any, pending_questions: PendingQuestions, token: str, question_index: int
+) -> bool:
+    message = getattr(query, "message", None)
+    if message is None:
+        return False
+    labels = pending_questions.labels(token, question_index)
+    selected = pending_questions.selected_indexes(token, question_index)
+    if labels is None or selected is None:
+        return False
+    options = [{"label": label} for label in labels]
+    text = message.text_markdown_v2 or message.text or ""
+    try:
+        await message.edit_text(
+            text=text,
+            parse_mode="MarkdownV2",
+            reply_markup=_question_keyboard(
+                token,
+                question_index,
+                options,
+                custom=pending_questions.allows_custom(token, question_index),
+                multiple=True,
+                selected_indexes=selected,
+            ),
+        )
+        return True
+    except Exception:
+        logger.debug("failed to refresh question keyboard", exc_info=True)
         return False
 
 
@@ -804,6 +990,7 @@ BOT_COMMANDS = [
     BotCommand("status", "Show this topic's context, session, and turn state"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
+    BotCommand("plan", "Plan mode for this topic (/plan [request], /plan off)"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
 ]
 
@@ -867,6 +1054,7 @@ def build_application(
     app.add_handler(CommandHandler("status", _handle_status, filters=allowed))
     app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
+    app.add_handler(CommandHandler("plan", _handle_plan, filters=allowed))
     app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
     app.add_handler(
         MessageHandler(
@@ -877,6 +1065,7 @@ def build_application(
     # CallbackQueryHandler takes no filter; the handler re-checks the trust
     # boundary (ADR-0008) itself before resolving an approval.
     app.add_handler(CallbackQueryHandler(_handle_approval_callback, pattern=r"^appr:"))
+    app.add_handler(CallbackQueryHandler(_handle_question_done_callback, pattern=r"^qstd:"))
     app.add_handler(CallbackQueryHandler(_handle_question_callback, pattern=r"^qst:"))
     app.add_handler(CallbackQueryHandler(_handle_question_custom_callback, pattern=r"^qstc:"))
 

@@ -74,9 +74,14 @@ OpenCode server (separate process, NOT in this repo) — the agent: model + loca
 Backend modules (`apps/backend/src/balam/`): `config.py` (env validation),
 `contexts.py` (`config.yaml` workspace contexts), `opencode.py` (httpx HTTP/SSE
 client), `store.py` (sqlite3 topic→session map), `router.py` (topic→context→
-session, lazy create), `markdown.py` (GFM→MarkdownV2), `streamer.py` (animated
-`send_message_draft` streaming), `bot.py` (PTB: allowlist, chat scoping, message
-handler, `/context`, `setMyCommands`), `app.py` (boot).
+session, lazy create; registers Balam's per-topic MCP tool server),
+`markdown.py` (GFM→MarkdownV2), `streamer.py` (animated `send_message_draft`
+streaming), `bot.py` (PTB: allowlist, chat scoping, message handler, `/context`,
+`setMyCommands`), `server.py` (FastAPI Mini App + `/api` + `/mcp` routes),
+`agent_tools.py` (agent-facing `send_file` tool served to OpenCode as a remote
+MCP server, per-topic scope tokens), `content_store.py` (ephemeral markdown
+snapshots for the Mini App viewer), `miniapp.py` (Mini App launch links/buttons),
+`app.py` (boot).
 
 Telegram specifics (ADR-0009): streaming uses native `send_message_draft`; forum
 topics are addressed by `message_thread_id`. Bot API ref:
@@ -91,8 +96,10 @@ several projects. Defined in the **required** `config.yaml`
 (`default_context` for unbound topics like General). `/context` lists contexts +
 the current binding; `/context <name>` **creates a new topic** bound to `<name>`
 and replies with a "Go to topic" link — it does not rebind the current topic.
-Caveat: `allowed_tools`/`additional_directories` are parsed and validated but
-**path-scoped enforcement is not wired into OpenCode yet** (deferred).
+`allowed_tools`/`additional_directories` are enforced via the **hybrid** model in
+ADR-0012: `permissions.py` translates them into a native OpenCode permission
+ruleset (pre-approved tools run without prompting), while the symlink-safe
+directory boundary and the human-approval keyboard stay local in `approvals.py`.
 
 ## Configuration
 

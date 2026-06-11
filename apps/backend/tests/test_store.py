@@ -147,3 +147,35 @@ def test_migrates_pre_auto_naming_schema(tmp_path) -> None:
     store.close()
     store = SessionStore(path)
     assert store.is_auto_named(100, 6) is False
+
+
+# --- plan mode (/plan) ----------------------------------------------------------
+
+
+def test_plan_mode_defaults_off() -> None:
+    store = fresh_store()
+    assert store.is_plan_mode(1, 7) is False
+
+
+def test_plan_mode_round_trips() -> None:
+    store = fresh_store()
+    store.set_plan_mode(1, 7, True)
+    assert store.is_plan_mode(1, 7) is True
+    store.set_plan_mode(1, 7, False)
+    assert store.is_plan_mode(1, 7) is False
+
+
+def test_plan_mode_is_idempotent_and_scoped() -> None:
+    store = fresh_store()
+    store.set_plan_mode(1, 7, True)
+    store.set_plan_mode(1, 7, True)  # double-on is fine
+    assert store.is_plan_mode(1, 7) is True
+    assert store.is_plan_mode(1, 8) is False  # other thread untouched
+    assert store.is_plan_mode(2, 7) is False  # other chat untouched
+    store.set_plan_mode(1, 8, False)  # off when already off is fine
+
+
+def test_plan_mode_normalizes_general_thread() -> None:
+    store = fresh_store()
+    store.set_plan_mode(1, None, True)
+    assert store.is_plan_mode(1, GENERAL_THREAD_ID) is True

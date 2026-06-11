@@ -39,7 +39,23 @@ from balam.opencode_tools import Permission, Tool
 #: Permissions that should never generate Balam approval noise. ``todowrite`` is
 #: internal bookkeeping; ``question`` is OpenCode's own interactive question flow
 #: and should be handled by OpenCode rather than Balam's tool-approval keyboard.
-ALWAYS_ALLOWED_PERMS: tuple[Permission, ...] = (Permission.TODOWRITE, Permission.QUESTION)
+#: ``plan_enter``/``plan_exit`` are OpenCode's plan-mode switches — the server's
+#: headless defaults deny them (hiding the tools from the model, exactly like
+#: ``question`` before we allowed it), so without these rules plan mode is
+#: unreachable from Telegram. Allowing them lets the build agent enter plan mode
+#: autonomously; the human gate stays intact because ``plan_exit`` asks its
+#: Yes/No "Build Agent" question through the question service either way.
+#: ``task`` (spawning a subagent) is metadata-only — the subagent's own tool
+#: calls still evaluate against the permission rules, so allowing the spawn
+#: removes "Allow Task?" interruptions (constant during plan-mode exploration)
+#: without widening what the agent can actually touch.
+ALWAYS_ALLOWED_PERMS: tuple[Permission, ...] = (
+    Permission.TODOWRITE,
+    Permission.QUESTION,
+    Permission.PLAN_ENTER,
+    Permission.PLAN_EXIT,
+    Permission.TASK,
+)
 
 #: ``allowed_tools`` names that mean "let the model edit files". OpenCode folds
 #: the edit/write/apply_patch *tools* into one ``edit`` *permission* category, so
@@ -111,6 +127,15 @@ def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
     rules: list[dict[str, str]] = [{"permission": "*", "pattern": "*", "action": "ask"}]
     for perm in ALWAYS_ALLOWED_PERMS:
         rules.append(_allow(perm, "*"))
+
+    # Plan-mode plan files. OpenCode's plan agent allows edits to its own plan
+    # file natively, but session rules are merged *after* agent rules and the
+    # last matching rule wins — so without this, our ask-all baseline would make
+    # every plan write prompt in Telegram. Edit asks carry the worktree-relative
+    # path, and ``*`` crosses slashes, so this matches both the in-repo location
+    # (.opencode/plans/*.md) and the upward-relative path to the global plans
+    # dir used for non-git directories.
+    rules.append(_allow(Permission.EDIT, "*opencode/plans/*.md"))
 
     for entry in ctx.allowed_tools:
         permission, pattern = parse_allowed_tool(entry)

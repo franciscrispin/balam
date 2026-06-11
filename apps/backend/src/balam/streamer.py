@@ -29,7 +29,9 @@ import asyncio
 import logging
 import os
 import random
+import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -444,11 +446,20 @@ def _approval_keyboard(token: str, category: str) -> InlineKeyboardMarkup:
 
 
 def _question_keyboard(
-    token: str, question_index: int, options: list[dict[str, Any]], *, custom: bool = True
+    token: str,
+    question_index: int,
+    options: list[dict[str, Any]],
+    *,
+    custom: bool = True,
+    multiple: bool = False,
+    selected_indexes: set[int] | None = None,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    selected_indexes = selected_indexes or set()
     for option_index, option in enumerate(options):
         label = str(option.get("label") or f"Option {option_index + 1}")
+        if multiple:
+            label = f"{'☑' if option_index in selected_indexes else '☐'} {label}"
         rows.append(
             [
                 InlineKeyboardButton(
@@ -456,6 +467,8 @@ def _question_keyboard(
                 )
             ]
         )
+    if multiple:
+        rows.append([InlineKeyboardButton("Done", callback_data=f"qstd:{token}:{question_index}")])
     if custom:
         rows.append(
             [
@@ -481,6 +494,47 @@ def _format_question(question: dict[str, Any]) -> str:
             description = str(option.get("description") or "")
             lines.append(f"- **{label}** — {description}" if description else f"- **{label}**")
     return "\n".join(lines)
+
+
+#: OpenCode's plan_exit tool asks its approval question with this exact text
+#: (tool/plan.ts) — the worktree-relative plan path appears nowhere else.
+_PLAN_QUESTION_RE = re.compile(r"Plan at (.+?) is complete")
+
+
+def plan_path_from_question(
+    request: dict[str, Any],
+    tool_parts: dict[str, tuple[str, dict[str, Any], str | None]],
+    directory: str | None,
+) -> str | None:
+    """The plan file behind a ``plan_exit`` approval question, or ``None``.
+
+    OpenCode's native plan agent finishes by calling ``plan_exit``, which asks
+    "Plan at <path> is complete. …" through the question service. The request's
+    ``tool.callID`` identifies the owning tool via the tool-part cache (primary
+    detection); the path itself only exists in the question text, so the regex
+    does the extraction either way — and doubles as the fallback detector when
+    the cache hasn't seen the part yet. The path is worktree-relative
+    (git projects: ``.opencode/plans/…``; non-git: an upward-relative path into
+    OpenCode's global plans dir), so it resolves against the context directory.
+    """
+    questions = request.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    first = questions[0] if isinstance(questions[0], dict) else {}
+    match = _PLAN_QUESTION_RE.search(str(first.get("question") or ""))
+    if match is None:
+        return None
+    tool = request.get("tool")
+    if isinstance(tool, dict):
+        cached = tool_parts.get(str(tool.get("callID") or ""))
+        if cached is not None and cached[0] != "plan_exit":
+            return None  # some other tool's question merely matched the regex
+    rel = match.group(1).strip()
+    if os.path.isabs(rel):
+        return rel
+    if directory is None:
+        return None
+    return os.path.normpath(os.path.join(directory, rel))
 
 
 def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTransport:
@@ -547,6 +601,9 @@ async def stream_reply(
     pending_questions: PendingQuestions | None = None,
     allowed_dirs: list[str] | None = None,
     files: list[PromptFile] | None = None,
+    agent: str | None = None,
+    plan_view: Callable[[str, str], InlineKeyboardButton | None] | None = None,
+    on_plan_approved: Callable[[], None] | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
 ) -> None:
     """Prompt the agent and stream its reply into the topic.
@@ -565,6 +622,17 @@ async def stream_reply(
     ``allowed_dirs``, and either auto-replies to OpenCode or sends an inline
     keyboard and awaits the user's choice. Without ``pending`` the events are
     ignored (e.g. unit tests of the text/tool path).
+
+    ``plan_view`` (see :func:`balam.miniapp.make_plan_view_button`) maps a plan
+    ``(title, content)`` to a Mini App button; when a question request turns out
+    to be OpenCode's ``plan_exit`` approval, the plan file is snapshotted and the
+    button rides the question keyboard as an extra row.
+
+    ``agent`` is forwarded to the prompt (``"plan"`` while the topic is in plan
+    mode). ``on_plan_approved`` fires when the ``plan_exit`` question is answered
+    "Yes" — the server then switches the session to the build agent, so the
+    caller uses this to drop its sticky plan-mode flag and stop sending
+    ``agent="plan"``.
     """
     transport = _make_transport(bot, chat_id, thread_id)
     # sendMessageDraft is private-chat only; in the Bot API private chats have
@@ -714,31 +782,59 @@ async def stream_reply(
 
         questions = [q for q in raw_questions if isinstance(q, dict)]
         labels: list[list[str]] = []
+        multiples: list[bool] = []
+        customs: list[bool] = []
         for question in questions:
             options = question.get("options")
             if not isinstance(options, list) or not options:
                 await opencode.reject_question(request["id"], directory=directory)
                 return
             labels.append([str(o.get("label") or "") for o in options if isinstance(o, dict)])
+            multiples.append(question.get("multiple", False) is True)
+            customs.append(question.get("custom", True) is not False)
         if any(not question_labels for question_labels in labels):
             await opencode.reject_question(request["id"], directory=directory)
             return
 
+        # A plan_exit approval carries the freshly written plan: snapshot it and
+        # ride a "View plan" button on the question keyboard. Strictly
+        # best-effort — any failure (file unreadable, no public URL) must never
+        # block the Yes/No flow, which is what actually answers OpenCode.
+        plan_path = plan_path_from_question(request, tool_parts, directory)
+        plan_button: InlineKeyboardButton | None = None
+        if plan_view is not None and plan_path is not None:
+            try:
+                plan_text = await asyncio.to_thread(Path(plan_path).read_text, "utf-8", "replace")
+                plan_button = plan_view(os.path.basename(plan_path), plan_text)
+            except Exception:
+                logger.debug("could not snapshot plan at %s", plan_path, exc_info=True)
+
         token, futures = pending_questions.register(
-            session_id, labels, chat_id=chat_id, thread_id=thread_id
+            session_id,
+            labels,
+            multiples=multiples,
+            customs=customs,
+            chat_id=chat_id,
+            thread_id=thread_id,
         )
         try:
             for index, question in enumerate(questions):
                 chunks = gfm_to_telegram(_format_question(question))
                 text = chunks[0] if chunks else "❓ Question"
-                custom = question.get("custom", True) is not False
+                keyboard = _question_keyboard(
+                    token,
+                    index,
+                    question["options"],
+                    custom=customs[index],
+                    multiple=multiples[index],
+                )
+                if index == 0 and plan_button is not None:
+                    keyboard = InlineKeyboardMarkup([*keyboard.inline_keyboard, [plan_button]])
                 await bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     parse_mode="MarkdownV2",
-                    reply_markup=_question_keyboard(
-                        token, index, question["options"], custom=custom
-                    ),
+                    reply_markup=keyboard,
                     **topic_kwargs,
                 )
             answers = await asyncio.gather(*futures)
@@ -752,6 +848,13 @@ async def stream_reply(
             await opencode.reject_question(request["id"], directory=directory)
             return
         await opencode.reply_question(request["id"], answers, directory=directory)
+        # "Yes" to plan_exit makes the server switch this session to the build
+        # agent, so the caller's sticky plan-mode flag must drop with it — else
+        # the next Telegram prompt would force the session straight back into
+        # plan mode. "No" keeps both the server and the flag in plan mode.
+        if plan_path is not None and on_plan_approved is not None:
+            if answers and answers[0] == ["Yes"]:
+                on_plan_approved()
 
     async def note_retry(status: dict[str, Any]) -> None:
         """Tell the user the turn is being retried (e.g. provider rate limit).
@@ -900,6 +1003,7 @@ async def stream_reply(
                     model=model,
                     effort=effort,
                     files=files,
+                    agent=agent,
                 )
                 await consume_task
         except Exception as exc:

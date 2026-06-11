@@ -18,8 +18,8 @@ Small additions to existing modules; all overlap in both reference apps.
 - **Tool-call visibility** — surface which tool ran + truncated output in the stream.
 - **Interactive tool approval** — gate Write/Edit/Bash behind an inline keyboard;
   auto-approve reads inside the context dir. Ships with the directory-boundary check
-  (one mechanism in OpenCode); the heavier `allowed_tools` hard-enforcement stays
-  deferred (ADR-0012).
+  (one mechanism in OpenCode). `allowed_tools` enforcement has since shipped too, as
+  the hybrid model in ADR-0012 (`balam.permissions` + `balam.approvals`).
 - **Inbound file attachments** — accept images/PDFs/text, saved under
   `/tmp/balam_uploads/<thread_id>/`, referenced in the prompt.
 
@@ -31,15 +31,23 @@ Small additions to existing modules; all overlap in both reference apps.
   validate Telegram HMAC (ADR-0003/0008).
 - **Git diff viewer** — hunk-level diff of the working dir (read-only first); the
   flagship Mini App view in both apps.
-- **`/resume` + session titles** — list recent sessions and reopen one.
+
+Dropped: `/resume` + session titles — Balam binds one session per forum topic, so
+the Telegram topic list *is* the session list; navigating topics replaces reopening
+sessions by hand.
 
 ## Tier 3 — Defer (costly or blocked)
 
 - **noVNC live Chrome** (ADR-0006) — blocked on VM X11/VNC infra, not code.
-- **Markdown/document viewer** — complements the diff viewer.
 - **Scheduled tasks** — whole workflow; not core to interactive use yet.
-- **`allowed_tools` hard-enforcement** — the heavy half of ADR-0012; human approval
-  (Tier 1) is the backstop until then.
+
+Shipped since this doc was written: `allowed_tools` enforcement (the hybrid
+native-ruleset + local-boundary model; see ADR-0012 and `balam.permissions`);
+the **markdown viewer** with open-shrimp's two triggers — an agent-facing
+`send_file` MCP tool whose `.md` sends carry a "📖 Preview" button, and a
+"📋 View plan" button on OpenCode's native `plan_exit` approval question
+(`balam.agent_tools` + `balam.content_store`; review-comments mode in the
+viewer remains a deferred follow-up).
 
 Out of scope per ADRs (open-shrimp breadth, not Balam's single-user local design):
 sandboxing, computer-use GUI tools, voice/STT, multi-instance packaging, macOS app.
@@ -48,6 +56,6 @@ sandboxing, computer-use GUI tools, voice/STT, multi-instance packaging, macOS a
 
 ```
 Tier 1:  /new,/status,/cancel  →  tool-call display  →  approvals  →  attachments
-Tier 2:  FastAPI + initData     →  git diff viewer    →  /resume + titles
-Tier 3:  noVNC  ·  markdown viewer  ·  scheduling  ·  allowed_tools enforcement
+Tier 2:  FastAPI + initData     →  git diff viewer    →  markdown viewer
+Tier 3:  noVNC  ·  scheduling
 ```

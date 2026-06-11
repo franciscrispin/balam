@@ -116,6 +116,15 @@ class Router:
         row = self._store.get_row(ref.chat_id, ref.thread_id)
         return row[0] if row else None
 
+    def plan_mode(self, chat_id: int, thread_id: int | None) -> bool:
+        """Whether the topic's prompts should run OpenCode's plan agent (/plan)."""
+        return self._store.is_plan_mode(chat_id, thread_id)
+
+    def set_plan_mode(self, chat_id: int, thread_id: int | None, enabled: bool) -> None:
+        """Flip a topic's plan mode — set by ``/plan``, cleared by ``/plan off`` or
+        by the plan_exit question being answered "Yes" (the agent then builds)."""
+        self._store.set_plan_mode(chat_id, thread_id, enabled)
+
     def topic_auto_named(self, ref: TopicRef) -> bool:
         """Whether the topic has already been auto-named, or manually renamed."""
         return self._store.is_auto_named(ref.chat_id, ref.thread_id)

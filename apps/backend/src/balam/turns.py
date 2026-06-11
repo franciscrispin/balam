@@ -53,6 +53,9 @@ class TurnJob:
     effort: str | None
     allowed_dirs: list[str]
     files: list[PromptFile]
+    #: OpenCode agent override for this turn (``"plan"`` while the topic is in
+    #: plan mode); ``None`` lets the server pick its default (build).
+    agent: str | None = None
 
 
 class TurnRegistry:

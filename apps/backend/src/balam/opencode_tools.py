@@ -60,3 +60,5 @@ class Permission(StrEnum):
     EXTERNAL_DIRECTORY = "external_directory"
     DOOM_LOOP = "doom_loop"
     SKILL = "skill"
+    PLAN_ENTER = "plan_enter"
+    PLAN_EXIT = "plan_exit"

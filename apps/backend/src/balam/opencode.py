@@ -276,6 +276,7 @@ class OpenCode:
         model: str | None = None,
         effort: str | None = None,
         files: list[PromptFile] | None = None,
+        agent: str | None = None,
     ) -> None:
         """Send a user message and return immediately (``prompt_async``). The
         assistant's reply arrives over :meth:`events`, which is what lets us
@@ -284,6 +285,11 @@ class OpenCode:
         ``provider``/``model`` select the context's model (OpenCode wants
         ``{providerID, modelID}``); ``effort`` maps to the prompt ``variant``.
         Each is omitted when unset so the server applies its own default.
+
+        ``agent`` selects the OpenCode agent for this one turn (e.g. ``"plan"``).
+        The server is **not** sticky: an omitted agent always resolves to the
+        configured default (build), so a topic in plan mode must pass
+        ``agent="plan"`` on every prompt until the plan is approved.
 
         ``files`` become native OpenCode file parts (``FilePartInput``) appended
         to the message ``parts`` — the agent sees them directly (image vision, PDF,
@@ -302,6 +308,8 @@ class OpenCode:
             body["model"] = {"providerID": provider, "modelID": model}
         if effort is not None:
             body["variant"] = effort
+        if agent is not None:
+            body["agent"] = agent
         response = await self._client.post(
             f"/session/{session_id}/prompt_async",
             params={"directory": directory},

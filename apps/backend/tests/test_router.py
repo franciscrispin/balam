@@ -106,6 +106,10 @@ async def test_reuses_live_session_and_its_bound_context() -> None:
                 {"permission": "*", "pattern": "*", "action": "ask"},
                 {"permission": "todowrite", "pattern": "*", "action": "allow"},
                 {"permission": "question", "pattern": "*", "action": "allow"},
+                {"permission": "plan_enter", "pattern": "*", "action": "allow"},
+                {"permission": "plan_exit", "pattern": "*", "action": "allow"},
+                {"permission": "task", "pattern": "*", "action": "allow"},
+                {"permission": "edit", "pattern": "*opencode/plans/*.md", "action": "allow"},
             ],
         )
     ]

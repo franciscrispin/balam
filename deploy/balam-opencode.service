@@ -16,6 +16,11 @@ EnvironmentFile=/home/ubuntu/projects/balam/.env
 # switching the default Node version.
 Environment=PATH=/home/ubuntu/.bun/bin:/home/ubuntu/.opencode/bin:/home/ubuntu/.local/bin:/home/ubuntu/.nvm/versions/node/v24.15.0/bin:/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/usr/local/go/bin:/home/ubuntu/go/bin
 Environment=GOPATH=/home/ubuntu/go
+# Plan mode is experimental and gated off by default on the server (registry.ts:
+# `flags.experimentalPlanMode && flags.client === "cli"`; client defaults to
+# "cli"). This exposes plan_enter/plan_exit to the model so Telegram sessions
+# can enter plan mode; permissions.py allows both in the session ruleset.
+Environment=OPENCODE_EXPERIMENTAL_PLAN_MODE=true
 ExecStart=/home/ubuntu/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
 Restart=on-failure
 RestartSec=5s

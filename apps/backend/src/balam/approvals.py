@@ -224,10 +224,14 @@ class PendingApprovals:
 class _PendingQuestion:
     futures: list[asyncio.Future[list[str]]]
     labels: list[list[str]]
+    multiples: list[bool]
+    customs: list[bool]
     session_id: str
     chat_id: int | None = None
     thread_id: int | None = None
     awaiting_custom: set[int] = field(default_factory=set)
+    selected: list[set[int]] = field(default_factory=list)
+    custom_answers: list[list[str]] = field(default_factory=list)
 
 
 class PendingQuestions:
@@ -247,17 +251,25 @@ class PendingQuestions:
         session_id: str,
         questions: list[list[str]],
         *,
+        multiples: list[bool] | None = None,
+        customs: list[bool] | None = None,
         chat_id: int | None = None,
         thread_id: int | None = None,
     ) -> tuple[str, list[asyncio.Future[list[str]]]]:
         token = uuid.uuid4().hex[:16]
         futures = [asyncio.get_event_loop().create_future() for _ in questions]
+        multiples = multiples or [False] * len(questions)
+        customs = customs or [True] * len(questions)
         self._pending[token] = _PendingQuestion(
             futures=futures,
             labels=questions,
+            multiples=multiples,
+            customs=customs,
             session_id=session_id,
             chat_id=chat_id,
             thread_id=thread_id,
+            selected=[set() for _ in questions],
+            custom_answers=[[] for _ in questions],
         )
         return token, futures
 
@@ -270,6 +282,8 @@ class PendingQuestions:
             return False
         if question_index < 0 or question_index >= len(pending.futures):
             return False
+        if pending.multiples[question_index]:
+            return False
         labels = pending.labels[question_index]
         if option_index < 0 or option_index >= len(labels):
             return False
@@ -277,6 +291,69 @@ class PendingQuestions:
         if future.done():
             return False
         future.set_result([labels[option_index]])
+        if all(f.done() for f in pending.futures):
+            self.discard(token)
+        return True
+
+    def labels(self, token: str, question_index: int) -> list[str] | None:
+        pending = self._pending.get(token)
+        if pending is None or question_index < 0 or question_index >= len(pending.labels):
+            return None
+        return pending.labels[question_index]
+
+    def is_multiple(self, token: str, question_index: int) -> bool:
+        pending = self._pending.get(token)
+        if pending is None or question_index < 0 or question_index >= len(pending.multiples):
+            return False
+        return pending.multiples[question_index]
+
+    def allows_custom(self, token: str, question_index: int) -> bool:
+        pending = self._pending.get(token)
+        if pending is None or question_index < 0 or question_index >= len(pending.customs):
+            return True
+        return pending.customs[question_index]
+
+    def selected_indexes(self, token: str, question_index: int) -> set[int] | None:
+        pending = self._pending.get(token)
+        if pending is None or question_index < 0 or question_index >= len(pending.selected):
+            return None
+        return set(pending.selected[question_index])
+
+    def toggle(self, token: str, question_index: int, option_index: int) -> bool | None:
+        pending = self._pending.get(token)
+        if pending is None:
+            return None
+        if question_index < 0 or question_index >= len(pending.futures):
+            return None
+        if not pending.multiples[question_index] or pending.futures[question_index].done():
+            return None
+        labels = pending.labels[question_index]
+        if option_index < 0 or option_index >= len(labels):
+            return None
+        selected = pending.selected[question_index]
+        if option_index in selected:
+            selected.remove(option_index)
+            return False
+        selected.add(option_index)
+        return True
+
+    def finish_multi(self, token: str, question_index: int) -> bool | None:
+        pending = self._pending.get(token)
+        if pending is None:
+            return None
+        if question_index < 0 or question_index >= len(pending.futures):
+            return None
+        if not pending.multiples[question_index]:
+            return None
+        future = pending.futures[question_index]
+        if future.done():
+            return None
+        selected = sorted(pending.selected[question_index])
+        custom_answers = pending.custom_answers[question_index]
+        if not selected and not custom_answers:
+            return False
+        labels = pending.labels[question_index]
+        future.set_result([labels[index] for index in selected] + custom_answers)
         if all(f.done() for f in pending.futures):
             self.discard(token)
         return True
@@ -293,12 +370,14 @@ class PendingQuestions:
             return False
         if question_index < 0 or question_index >= len(pending.futures):
             return False
+        if not pending.customs[question_index]:
+            return False
         if pending.futures[question_index].done():
             return False
         pending.awaiting_custom.add(question_index)
         return True
 
-    def resolve_custom(self, chat_id: int, thread_id: int | None, answer: str) -> bool:
+    def resolve_custom(self, chat_id: int, thread_id: int | None, answer: str) -> str | None:
         for token, pending in list(self._pending.items()):
             if pending.chat_id != chat_id or pending.thread_id != thread_id:
                 continue
@@ -307,9 +386,13 @@ class PendingQuestions:
                 if future.done():
                     pending.awaiting_custom.discard(question_index)
                     continue
+                if pending.multiples[question_index]:
+                    pending.custom_answers[question_index].append(answer)
+                    pending.awaiting_custom.discard(question_index)
+                    return "added"
                 future.set_result([answer])
                 pending.awaiting_custom.discard(question_index)
                 if all(f.done() for f in pending.futures):
                     self.discard(token)
-                return True
-        return False
+                return "resolved"
+        return None

@@ -14,7 +14,9 @@ from balam.bot import (
     _handle_context,
     _handle_message,
     _handle_new,
+    _handle_question_callback,
     _handle_question_custom_callback,
+    _handle_question_done_callback,
     _handle_rename,
     _handle_status,
     _topic_link,
@@ -801,10 +803,12 @@ class _FakeCBMessage:
         self.chat = SimpleNamespace(id=chat_id)
         self.message_thread_id = thread_id
         self.edited: list[str] = []
+        self.reply_markups: list[object] = []
         self.deleted = 0
 
     async def edit_text(self, *, text: str, reply_markup=None, **_: object) -> None:
         self.edited.append(text)
+        self.reply_markups.append(reply_markup)
 
     async def delete(self) -> None:
         self.deleted += 1
@@ -956,6 +960,136 @@ def test_callback_handler_is_registered() -> None:
 # --- question custom-answer callback ------------------------------------------
 
 
+def _button_texts(markup: object) -> list[str]:
+    return [button.text for row in markup.inline_keyboard for button in row]
+
+
+async def test_question_callback_single_select_resolves_and_clears_keyboard() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Coffee", "Tea"]], chat_id=SUPERGROUP, thread_id=7
+    )
+    query = _FakeQuery(f"qst:{token}:0:1", OWNER, _FakeCBMessage(thread_id=7))
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_callback(update, context)
+
+    assert futures[0].result() == ["Tea"]
+    assert query.message.edited
+    assert query.message.reply_markups[-1] is None
+
+
+async def test_question_callback_multi_select_toggles_without_resolving() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Coffee", "Tea"]], multiples=[True], chat_id=SUPERGROUP, thread_id=7
+    )
+    query = _FakeQuery(f"qst:{token}:0:1", OWNER, _FakeCBMessage(thread_id=7))
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_callback(update, context)
+
+    assert not futures[0].done()
+    assert query.answers == ["Selected."]
+    assert _button_texts(query.message.reply_markups[-1]) == [
+        "☐ Coffee",
+        "☑ Tea",
+        "Done",
+        "Type your own answer",
+    ]
+
+
+async def test_question_callback_multi_select_can_unselect() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Coffee", "Tea"]], multiples=[True], chat_id=SUPERGROUP, thread_id=7
+    )
+    message = _FakeCBMessage(thread_id=7)
+    query = _FakeQuery(f"qst:{token}:0:1", OWNER, message)
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_callback(update, context)
+    await _handle_question_callback(update, context)
+
+    assert not futures[0].done()
+    assert query.answers == ["Selected.", "Unselected."]
+    assert _button_texts(message.reply_markups[-1]) == [
+        "☐ Coffee",
+        "☐ Tea",
+        "Done",
+        "Type your own answer",
+    ]
+
+
+async def test_question_done_callback_requires_selection() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Coffee", "Tea"]], multiples=[True], chat_id=SUPERGROUP, thread_id=7
+    )
+    query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_done_callback(update, context)
+
+    assert not futures[0].done()
+    assert query.answers == ["Select at least one option."]
+
+
+async def test_question_done_callback_resolves_multi_select() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x",
+        [["Coffee", "Tea", "Water"]],
+        multiples=[True],
+        chat_id=SUPERGROUP,
+        thread_id=7,
+    )
+    assert pending_questions.toggle(token, 0, 0) is True
+    assert pending_questions.toggle(token, 0, 2) is True
+    query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_done_callback(update, context)
+
+    assert futures[0].result() == ["Coffee", "Water"]
+    assert query.message.reply_markups[-1] is None
+
+
+async def test_question_done_callback_resolves_multi_select_with_custom_answer() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x",
+        [["Coffee", "Tea", "Water"]],
+        multiples=[True],
+        chat_id=SUPERGROUP,
+        thread_id=7,
+    )
+    assert pending_questions.toggle(token, 0, 1) is True
+    assert pending_questions.await_custom(token, 0, SUPERGROUP, 7) is True
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "kombucha") == "added"
+    query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_done_callback(update, context)
+
+    assert futures[0].result() == ["Tea", "kombucha"]
+
+
+async def test_question_done_callback_allows_custom_only_multi_select() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Coffee", "Tea"]], multiples=[True], chat_id=SUPERGROUP, thread_id=7
+    )
+    assert pending_questions.await_custom(token, 0, SUPERGROUP, 7) is True
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "sparkling water") == "added"
+    query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_done_callback(update, context)
+
+    assert futures[0].result() == ["sparkling water"]
+
+
 async def test_question_custom_callback_arms_next_topic_message() -> None:
     pending_questions = PendingQuestions()
     token, futures = pending_questions.register(
@@ -969,8 +1103,26 @@ async def test_question_custom_callback_arms_next_topic_message() -> None:
     assert not futures[0].done()
     assert query.message.edited
     assert any("next message" in (answer or "") for answer in query.answers)
-    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer") is True
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer") == "resolved"
     assert futures[0].result() == ["typed answer"]
+
+
+async def test_question_custom_callback_multi_select_keeps_keyboard_visible() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Preset"]], multiples=[True], chat_id=SUPERGROUP, thread_id=7
+    )
+    message = _FakeCBMessage(thread_id=7)
+    query = _FakeQuery(f"qstc:{token}:0", OWNER, message)
+    update, context = _question_callback_env(query, pending_questions)
+
+    await _handle_question_custom_callback(update, context)
+
+    assert not futures[0].done()
+    assert not message.edited
+    assert query.answers == ["Send your custom answer, then tap Done."]
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer") == "added"
+    assert not futures[0].done()
 
 
 async def test_message_resolves_pending_custom_answer_without_starting_turn() -> None:
@@ -1000,6 +1152,37 @@ async def test_message_resolves_pending_custom_answer_without_starting_turn() ->
 
     assert futures[0].result() == ["my typed answer"]
     assert replies == ["✅ Answer sent."]
+    assert turns.get(SUPERGROUP, 5) is None
+
+
+async def test_message_adds_pending_multi_select_custom_answer_without_starting_turn() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Preset"]], multiples=[True], chat_id=SUPERGROUP, thread_id=5
+    )
+    assert pending_questions.await_custom(token, 0, SUPERGROUP, 5)
+
+    replies: list[str] = []
+
+    async def reply_text(text: str) -> None:
+        replies.append(text)
+
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        text="my typed answer",
+        caption=None,
+        reply_text=reply_text,
+    )
+    update, context, turns = _message_env(message, SimpleNamespace())
+    context.application.bot_data["pending_questions"] = pending_questions
+
+    await _handle_message(update, context)
+
+    assert not futures[0].done()
+    assert pending_questions.finish_multi(token, 0) is True
+    assert futures[0].result() == ["my typed answer"]
+    assert replies == ["✅ Custom answer added. Select more options or tap Done."]
     assert turns.get(SUPERGROUP, 5) is None
 
 

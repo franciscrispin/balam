@@ -39,6 +39,10 @@ def test_baseline_when_no_opt_ins() -> None:
         {"permission": "*", "pattern": "*", "action": "ask"},
         {"permission": "todowrite", "pattern": "*", "action": "allow"},
         {"permission": "question", "pattern": "*", "action": "allow"},
+        {"permission": "plan_enter", "pattern": "*", "action": "allow"},
+        {"permission": "plan_exit", "pattern": "*", "action": "allow"},
+        {"permission": "task", "pattern": "*", "action": "allow"},
+        {"permission": "edit", "pattern": "*opencode/plans/*.md", "action": "allow"},
     ]
 
 
