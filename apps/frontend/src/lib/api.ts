@@ -8,9 +8,15 @@
  * (ADR-0013), so it answers only requests made from inside Telegram's webview;
  * a plain browser has no `initData` and is rejected with 401.
  */
-import type { DiffResponse, MarkdownContent } from "@balam/shared";
+import type { BrowserStatus, DiffResponse, MarkdownContent } from "@balam/shared";
 
-function getInitData(): string {
+/**
+ * The raw Telegram `initData`. Exported for the one consumer that can't ride
+ * `apiFetch`: the noVNC WebSocket, where a browser can't set an Authorization
+ * header and the backend instead expects `initData` as the first text frame
+ * (ADR-0006).
+ */
+export function getInitData(): string {
   return window.Telegram?.WebApp?.initData ?? "";
 }
 
@@ -59,4 +65,9 @@ export function getDiff(context: string | undefined): Promise<DiffResponse> {
 /** Fetch an ephemeral markdown snapshot (a plan, a sent .md file) by id. */
 export function getMarkdownContent(id: string): Promise<MarkdownContent> {
   return apiFetch<MarkdownContent>(`/markdown/content/${encodeURIComponent(id)}`);
+}
+
+/** Whether the live browser stack (x11vnc) is reachable on the VM (ADR-0006). */
+export function getBrowserStatus(): Promise<BrowserStatus> {
+  return apiFetch<BrowserStatus>("/browser/status");
 }

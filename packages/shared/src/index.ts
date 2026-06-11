@@ -25,3 +25,6 @@ export type DiffResponse = components["schemas"]["DiffResponse"];
 
 /** An ephemeral markdown snapshot (`GET /api/markdown/content/{id}`). */
 export type MarkdownContent = components["schemas"]["MarkdownContentResponse"];
+
+/** Live browser stack reachability (`GET /api/browser/status`, ADR-0006). */
+export type BrowserStatus = components["schemas"]["BrowserStatus"];

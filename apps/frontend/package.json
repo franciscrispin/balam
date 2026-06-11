@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@balam/shared": "workspace:*",
+    "@novnc/novnc": "^1.7.0",
     "@shikijs/langs": "4.2.0",
     "@shikijs/rehype": "^4.2.0",
     "@shikijs/themes": "4.2.0",

@@ -14,7 +14,8 @@ export default defineConfig({
     port: 5180,
     strictPort: true,
     // Proxy the Mini App API to the FastAPI backend (BALAM_PORT) so `bun run dev`
-    // (5180) and the served build hit the same relative `/api/*` paths.
-    proxy: { "/api": "http://127.0.0.1:3000" },
+    // (5180) and the served build hit the same relative `/api/*` paths. ws:true
+    // forwards the Upgrade for the noVNC WebSocket (/api/vnc/ws, ADR-0006).
+    proxy: { "/api": { target: "http://127.0.0.1:3000", ws: true } },
   },
 });
