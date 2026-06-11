@@ -195,15 +195,16 @@ Renders agent output / docs. This is the "prose" surface.
 
 ### 6.4 Live noVNC Chrome view
 
-- The agent's Chrome embedded as a noVNC `<iframe>` (ADR-0006). The iframe fills
-  the content area; **we do not style inside it**.
+- The agent's Chrome rendered by the noVNC RFB client straight into the content
+  area (ADR-0006 as amended — no iframe). The scaled canvas fills the container;
+  **we do not style inside it**.
 - A floating bottom toolbar (`shadow-lg`, `--card`, `10px` radius) with
   connection status (clay dot = live, muted = reconnecting) and a fit/refresh
   control.
 - **Connecting** state: centered serif label + pulsing clay dot over
-  `--background`. **Disconnected**: muted state with a Retry `Button`.
-- CSP must allow `frame-src` for the noVNC origin (ADR-0006) — a design
-  constraint, noted here so the shell's meta/headers account for it.
+  `--background`. **Offline** (the VNC stack isn't running): "No live browser
+  session." + Retry `Button`. **Disconnected**: muted state with a Retry
+  `Button`.
 
 ### 6.5 Shared states
 

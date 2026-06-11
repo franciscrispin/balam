@@ -127,6 +127,7 @@ roughly this sequence:
 | Cancel a running turn | `bot.py:_handle_cancel` + `turns.py` + `opencode.abort_session` |
 | Trust boundary / allowlist | `config.py` + `bot.py:build_application` (filters) |
 | OpenCode HTTP/SSE | `opencode.py` |
+| Live browser view (`/browser`, ADR-0006) | `vnc.py` (WS↔TCP bridge) + `server.py` (`/api/vnc/ws`, `/api/browser/status`) + `browser-view.tsx` |
 
 ## Running it
 
@@ -154,6 +155,7 @@ Prereqs: a running **OpenCode server** (separate process, not in this repo),
   a new topic. This keeps each topic's session history coherent.
 - **`allowed_tools` enforcement is deferred.** It's validated but not wired into
   OpenCode yet; human approval (`approvals.py`) is today's backstop.
-- The frontend is a **scaffold** — don't expect a working Mini App yet.
+- The Mini App needs a build: the backend serves `apps/frontend/dist`, so run
+  `bun run build` (repo root) after frontend changes or the SPA won't update.
 
 [OpenCode]: https://opencode.ai

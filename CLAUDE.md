@@ -13,9 +13,9 @@ design and the reasons behind the choices summarized here. Load-bearing:
 **ADR-0011, the backend is Python** (FastAPI + python-telegram-bot, OpenCode over
 HTTP); the frontend stays TypeScript (ADR-0003).
 
-> Status: early implementation. Built: the bot↔agent round-trip over forum
-> topics, workspace contexts + `/context`. Not yet built: the Mini App, noVNC
-> view, other slash commands.
+> Status: core features built — the bot↔agent round-trip over forum topics,
+> workspace contexts + `/context`, plan mode (`/plan`), and the Mini App
+> (diff viewer, markdown viewer, live noVNC browser view via `/browser`).
 
 ## Repo layout — two toolchains
 
@@ -81,7 +81,8 @@ streaming), `bot.py` (PTB: allowlist, chat scoping, message handler, `/context`,
 `agent_tools.py` (agent-facing `send_file` tool served to OpenCode as a remote
 MCP server, per-topic scope tokens), `content_store.py` (ephemeral markdown
 snapshots for the Mini App viewer), `miniapp.py` (Mini App launch links/buttons),
-`app.py` (boot).
+`vnc.py` (live browser view: `/api/vnc/ws` WebSocket↔TCP bridge to x11vnc,
+ADR-0006), `app.py` (boot).
 
 Telegram specifics (ADR-0009): streaming uses native `send_message_draft`; forum
 topics are addressed by `message_thread_id`. Bot API ref:

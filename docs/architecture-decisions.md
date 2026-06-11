@@ -149,7 +149,7 @@ not drive the browser itself.
 
 ## ADR-0006: The live Chrome view is an embedded noVNC iframe, not a screenshot relay
 
-Status: Accepted Date: 2026-05-20
+Status: Accepted, amended 2026-06-11 Date: 2026-05-20
 
 ### Context
 
@@ -185,6 +185,30 @@ Mini App points an iframe at the noVNC page; it does not draw frames itself.
   never expose those ports, reach them only through the backend's authenticated,
   token-checked reverse proxy, and keep the viewer view-only (see ADR-0007 and
   ADR-0008).
+
+### Amendment (2026-06-11)
+
+Built with the same substance — the standard noVNC/VNC stack, no screenshot
+relay, a backend-authenticated proxy, view-only — but two mechanics changed now
+that the Mini App shell (React + auth + design system) exists, following the
+open-shrimp reference (ADR-0011):
+
+- **The noVNC RFB client is imported in-page (`@novnc/novnc`), not an iframe.**
+  The browser view renders the RFB canvas straight into its content area, inside
+  the same React shell, theme, and `initData` auth context. The iframe was the
+  least-code option before the shell existed; stock `vnc.html` would now bring a
+  second UI chrome and a machine-level noVNC checkout into the serving path. The
+  `frame-src` CSP consequence above is void.
+- **The backend bridges the WebSocket straight to x11vnc** (`/api/vnc/ws` ↔ TCP
+  `127.0.0.1:5900`, `balam.vnc`), so websockify and the noVNC web checkout on
+  `:6081` are a dev convenience of the browser-use skill, not part of serving.
+  Auth is the client's `initData` sent as the **first text frame** — a browser
+  cannot set an `Authorization` header on a WebSocket, and a `?token=` query
+  param would land verbatim in uvicorn's accept log (verified live). The
+  ordering is safe because in RFB the server speaks first; the bridge stays
+  silent until the frame passes the same owner allowlist (ADR-0008). The
+  backend never starts the VNC stack: `GET /api/browser/status` probes it and
+  the view shows an offline state when it is down.
 
 ---
 
@@ -571,7 +595,7 @@ Conditions (all enforced):
 | 0002 | HTTP API is source of truth; thin `httpx` client, no SDK                    | Contract-first; language never limits capability                |
 | 0003 | Three layers; frontend is fixed TypeScript                                  | Clear responsibilities; Mini App must be web                    |
 | 0005 | Browser-use as an OpenCode skill                                            | Reuse skill; backend language irrelevant to it                  |
-| 0006 | Live Chrome via embedded noVNC iframe                                       | Real-time view from a standard stack; least UI code             |
+| 0006 | Live Chrome via noVNC (amended: RFB client in-page, backend WS↔TCP bridge)  | Real-time view from a standard stack; least UI code             |
 | 0007 | Local single-user on the VM                                                 | Full local access; minimal security surface                     |
 | 0008 | Telegram entry point is the trust boundary; allowlist one user ID           | The bot is internet-facing even when ports are local            |
 | 0009 | One Telegram forum topic = one OpenCode session                             | Native parallel task threads, no custom UI                      |
