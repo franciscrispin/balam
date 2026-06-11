@@ -1,5 +1,5 @@
 from balam.contexts import ContextConfig
-from balam.permissions import build_ruleset, parse_allowed_tool
+from balam.permissions import build_ruleset, parse_allowed_tool, send_file_rules
 
 
 def _ctx(**kwargs) -> ContextConfig:
@@ -45,6 +45,16 @@ def test_baseline_when_no_opt_ins() -> None:
 def test_ask_baseline_is_first() -> None:
     rules = build_ruleset(_ctx(allowed_tools=["LSP"]))
     assert rules[0] == {"permission": "*", "pattern": "*", "action": "ask"}
+
+
+def test_send_file_rules_order_is_deny_then_allow() -> None:
+    # The glob-deny hides every topic's send_file from the model's tool list;
+    # the topic's own allow must come after it (OpenCode uses the last match).
+    rules = send_file_rules("balam_t42")
+    assert rules == [
+        {"permission": "balam_*_send_file", "pattern": "*", "action": "deny"},
+        {"permission": "balam_t42_send_file", "pattern": "*", "action": "allow"},
+    ]
 
 
 def test_bash_pattern_is_verbatim() -> None:

@@ -38,6 +38,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/markdown/content/{content_id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Markdown Content */
+    get: operations["markdown_content_api_markdown_content__content_id__get"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -102,6 +119,16 @@ export interface components {
       old_no: number | null;
       /** New No */
       new_no: number | null;
+      /** Content */
+      content: string;
+    };
+    /**
+     * MarkdownContentResponse
+     * @description An ephemeral markdown snapshot (plan text, a sent ``.md`` file).
+     */
+    MarkdownContentResponse: {
+      /** Title */
+      title: string;
       /** Content */
       content: string;
     };
@@ -178,6 +205,39 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["DiffResponse"];
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  markdown_content_api_markdown_content__content_id__get: {
+    parameters: {
+      query?: never;
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        content_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["MarkdownContentResponse"];
         };
       };
       /** @description Validation Error */

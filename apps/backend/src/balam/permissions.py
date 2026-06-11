@@ -136,3 +136,20 @@ def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
         rules.append(_allow(Permission.EXTERNAL_DIRECTORY, _external_directory_pattern(directory)))
 
     return rules
+
+
+def send_file_rules(server_name: str) -> list[dict[str, str]]:
+    """Session rules scoping Balam's per-topic ``send_file`` MCP tool.
+
+    Every topic registers its own MCP server (``balam_t<thread>``), and OpenCode
+    exposes *all* servers registered in a directory to *every* session there. A
+    rule whose last match is a ``*``-pattern deny removes a tool from the model's
+    tool list entirely, so the glob-deny hides the other topics' copies; the
+    topic's own tool is then re-allowed (order is load-bearing: last match wins).
+    The allow also pre-approves the call — ``send_file`` runs without the
+    Telegram keyboard, like open-shrimp.
+    """
+    return [
+        {"permission": "balam_*_send_file", "pattern": "*", "action": "deny"},
+        {"permission": f"{server_name}_send_file", "pattern": "*", "action": "allow"},
+    ]

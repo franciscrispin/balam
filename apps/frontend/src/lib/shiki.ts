@@ -71,6 +71,18 @@ export async function getHighlighterWith(langs: string[]): Promise<HighlighterCo
   return highlighter;
 }
 
+/** The supported fence languages used in a markdown document, deduped — what
+ * the markdown view preloads. Unsupported fences render unhighlighted via the
+ * rehype plugin's `fallbackLanguage: "text"`. */
+export function fenceLanguages(markdown: string): string[] {
+  const langs = new Set<string>();
+  for (const match of markdown.matchAll(/^[ \t]*(?:```|~~~)[ \t]*([\w-]+)/gm)) {
+    const lang = match[1]?.toLowerCase();
+    if (lang && lang in LANG_LOADERS) langs.add(lang);
+  }
+  return [...langs];
+}
+
 export interface HighlightedToken {
   content: string;
   /** Inline color from the theme; undefined for unstyled tokens. */

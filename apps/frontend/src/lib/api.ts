@@ -8,7 +8,7 @@
  * (ADR-0013), so it answers only requests made from inside Telegram's webview;
  * a plain browser has no `initData` and is rejected with 401.
  */
-import type { DiffResponse } from "@balam/shared";
+import type { DiffResponse, MarkdownContent } from "@balam/shared";
 
 function getInitData(): string {
   return window.Telegram?.WebApp?.initData ?? "";
@@ -54,4 +54,9 @@ async function apiFetch<T>(path: string): Promise<T> {
 export function getDiff(context: string | undefined): Promise<DiffResponse> {
   const query = context ? `?context=${encodeURIComponent(context)}` : "";
   return apiFetch<DiffResponse>(`/diff${query}`);
+}
+
+/** Fetch an ephemeral markdown snapshot (a plan, a sent .md file) by id. */
+export function getMarkdownContent(id: string): Promise<MarkdownContent> {
+  return apiFetch<MarkdownContent>(`/markdown/content/${encodeURIComponent(id)}`);
 }

@@ -26,9 +26,11 @@ const VIEW_COMPONENTS: Record<ViewId, ComponentType> = {
 export function AppShell({
   initialView,
   context,
+  content,
 }: {
   initialView: ViewId;
   context: string | undefined;
+  content: string | undefined;
 }) {
   // The view is chosen on launch from the deep link (the bot links to the
   // relevant surface). The menu offers switching as a secondary path — and keeps
@@ -37,7 +39,7 @@ export function AppShell({
   const Active = VIEW_COMPONENTS[view];
 
   return (
-    <LaunchProvider value={{ context }}>
+    <LaunchProvider value={{ context, content }}>
       <div className="flex h-full flex-col bg-background">
         <TopBar
           title={VIEW_TITLES[view]}

@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
-from urllib.parse import quote
 
 from telegram import (
     Bot,
@@ -24,7 +23,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
-    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -39,6 +37,7 @@ from telegram.ext import (
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import collect_attachments
 from balam.config import Config
+from balam.miniapp import mini_app_reply
 from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
 from balam.streamer import stream_reply
@@ -561,75 +560,6 @@ async def _handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await message.reply_text(f"Renamed topic to {new_name}.")
 
 
-def _mini_app_url(config: Config, view: str, context_name: str) -> str:
-    """Build the browser/``web_app`` Mini App URL for ``view`` bound to ``context_name``.
-
-    Uses the public HTTPS base when configured (``BALAM_PUBLIC_URL``), else the
-    local ``127.0.0.1`` address — which Telegram won't open in-app (ADR-0007) but
-    the owner can open in a browser.
-    """
-    base = config.balam_public_url or f"http://127.0.0.1:{config.balam_port}"
-    return f"{base}/?view={view}&context={quote(context_name)}"
-
-
-def _mini_app_reply(
-    config: Config,
-    view: str,
-    context_name: str,
-    *,
-    bot_username: str | None,
-    is_private: bool,
-) -> tuple[str, InlineKeyboardMarkup | None]:
-    """How to surface a Mini App ``view`` bound to ``context_name`` for this chat.
-
-    Returns ``(text, reply_markup)``. Single decision point for the transport, so
-    every Mini App command reuses the same fallbacks instead of re-deriving them.
-    Preference order (ADR-0013):
-
-    1. **Direct Mini App link** — opens in Telegram's webview (signed initData) in
-       ANY chat type, so it works in the workspace supergroup where ``web_app``
-       inline buttons are rejected. Needs a BotFather short name + the bot username;
-       ``start_param`` carries view+context as ``"view__context"``.
-    2. **``web_app`` button** — also opens in-Telegram (initData, ADR-0008), but
-       Telegram allows it ONLY in private chats.
-    3. **Plain URL** — opens in the external browser (HTTPS public base set).
-    4. **Local URL** — no public base; localhost link Telegram won't open in-app.
-    """
-    is_public = config.balam_public_url is not None
-    shortname = config.balam_miniapp_shortname
-
-    if is_public and shortname and bot_username:
-        start_param = f"{view}__{context_name}"
-        link = f"https://t.me/{bot_username}/{shortname}?startapp={quote(start_param)}"
-        button = InlineKeyboardButton("View changes", url=link)
-        return f"Changes in {context_name}:", InlineKeyboardMarkup([[button]])
-
-    url = _mini_app_url(config, view, context_name)
-
-    if is_public and is_private:
-        button = InlineKeyboardButton("View changes", web_app=WebAppInfo(url=url))
-        return f"Changes in {context_name}:", InlineKeyboardMarkup([[button]])
-
-    if is_public:
-        # In groups a web_app inline button is rejected (Button_type_invalid); a
-        # plain URL button opens in the external browser instead (no initData
-        # there, so the Mini App relies on the owner's Telegram session).
-        button = InlineKeyboardButton("View changes", url=url)
-        text = (
-            f"Changes in {context_name}: {url}\n\n"
-            "Opens in your browser. (Telegram only allows the in-app Mini App button "
-            "in a private chat with the bot.)"
-        )
-        return text, InlineKeyboardMarkup([[button]])
-
-    text = (
-        f"Diff viewer for {context_name}:\n{url}\n\n"
-        "Opens in a browser. To open inside Telegram, serve the Mini App from "
-        "a public HTTPS URL and set BALAM_PUBLIC_URL (ADR-0013)."
-    )
-    return text, None
-
-
 async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/diff`` — open the Mini App git diff viewer for this topic's context."""
     message = update.message
@@ -644,7 +574,7 @@ async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         title=_topic_title(message, message.message_thread_id),
     )
     name = router.current_context_name(ref)
-    text, keyboard = _mini_app_reply(
+    text, keyboard = mini_app_reply(
         config,
         "diff",
         name,

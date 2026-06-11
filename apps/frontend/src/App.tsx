@@ -7,5 +7,5 @@ export function App() {
   // Init Telegram once and resolve the launch: initial view + workspace context
   // from the deep link (query params, with start_param as a fallback).
   const launch = useMemo(() => resolveLaunch(initTelegram().startParam), []);
-  return <AppShell initialView={launch.view} context={launch.context} />;
+  return <AppShell initialView={launch.view} context={launch.context} content={launch.content} />;
 }

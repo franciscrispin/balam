@@ -1,3 +1,4 @@
+from balam.agent_tools import ToolScopes
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
@@ -12,8 +13,12 @@ class FakeOpenCode:
         self.permissions: list[list[dict[str, str]] | None] = []
         self.updated_permissions: list[tuple[str, str | None, list[dict[str, str]]]] = []
         self.mcps: list[dict | None] = []
+        self.registered_mcps: list[tuple[str, dict, str | None]] = []
         self.exists_calls: list[tuple[str, str | None]] = []
         self._counter = 0
+
+    async def register_mcp(self, name: str, config: dict, *, directory: str | None = None) -> None:
+        self.registered_mcps.append((name, config, directory))
 
     async def session_exists(self, session_id: str, *, directory: str | None = None) -> bool:
         self.exists_calls.append((session_id, directory))
@@ -188,6 +193,100 @@ async def test_reused_session_syncs_context_ruleset() -> None:
     assert oc.updated_permissions
     _, _, ruleset = oc.updated_permissions[0]
     assert {"permission": "bash", "pattern": "git *", "action": "allow"} in ruleset
+
+
+def _wired_router(store: SessionStore, oc: FakeOpenCode, *, qualify_chat: bool = False) -> Router:
+    return Router(
+        store,
+        oc,
+        _contexts(),
+        tool_scopes=ToolScopes(),
+        mcp_base_url="http://127.0.0.1:3000",
+        qualify_chat=qualify_chat,
+    )
+
+
+async def test_create_includes_balam_tool_server_and_rules() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = _wired_router(store, oc)
+
+    await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    mcp = oc.mcps[0]
+    assert mcp is not None and "balam_t5" in mcp
+    assert mcp["balam_t5"]["type"] == "remote"
+    assert mcp["balam_t5"]["url"].startswith("http://127.0.0.1:3000/mcp/")
+    ruleset = oc.permissions[0]
+    assert ruleset is not None
+    # Order is load-bearing: glob-deny hides other topics' tools, own allow last.
+    deny = {"permission": "balam_*_send_file", "pattern": "*", "action": "deny"}
+    allow = {"permission": "balam_t5_send_file", "pattern": "*", "action": "allow"}
+    assert deny in ruleset and allow in ruleset
+    assert ruleset.index(allow) > ruleset.index(deny)
+
+
+async def test_reuse_reregisters_balam_tool_server() -> None:
+    store, oc = _store(), FakeOpenCode(existing={"ses_live"})
+    router = _wired_router(store, oc)
+    store.set(1, 5, "ses_live", 1, context="balam")
+
+    await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    # OpenCode restarts lose in-memory MCP registrations while sessions persist;
+    # the reuse path heals by re-registering (deterministic name → overwrite).
+    assert [(n, d) for n, _, d in oc.registered_mcps] == [("balam_t5", "/work/balam")]
+    _, _, ruleset = oc.updated_permissions[0]
+    assert {"permission": "balam_t5_send_file", "pattern": "*", "action": "allow"} in ruleset
+
+
+async def test_topics_get_distinct_tool_servers_and_stable_tokens() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = _wired_router(store, oc)
+
+    await router.resolve(TopicRef(chat_id=1, thread_id=5, title="a"))
+    await router.resolve(TopicRef(chat_id=1, thread_id=6, title="b"))
+
+    url_t5 = oc.mcps[0]["balam_t5"]["url"]
+    url_t6 = oc.mcps[1]["balam_t6"]["url"]
+    assert url_t5 != url_t6
+
+    # Re-resolving the same topic reuses the token (idempotent registration).
+    store2, oc2 = _store(), FakeOpenCode()
+    router2 = Router(
+        store2, oc2, _contexts(), tool_scopes=ToolScopes(), mcp_base_url="http://127.0.0.1:3000"
+    )
+    first = await router2.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+    oc2.existing.add(first.session_id)
+    await router2.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+    assert oc2.registered_mcps[0][1]["url"] == oc2.mcps[0]["balam_t5"]["url"]
+
+
+async def test_create_topic_session_includes_tool_server() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = _wired_router(store, oc)
+
+    await router.create_topic_session(1, 9, "scratch", "scratch")
+
+    assert oc.mcps[0] is not None and "balam_t9" in oc.mcps[0]
+
+
+async def test_unwired_router_keeps_legacy_behavior() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())  # no tool_scopes / mcp_base_url
+
+    await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    assert oc.mcps[0] == {}
+    assert all("send_file" not in r["permission"] for r in oc.permissions[0])
+
+
+async def test_qualified_server_name_for_multi_chat() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = _wired_router(store, oc, qualify_chat=True)
+
+    await router.resolve(TopicRef(chat_id=-100123, thread_id=5, title="t"))
+
+    assert "balam_cn100123_t5" in oc.mcps[0]
 
 
 async def test_unknown_bound_context_falls_back_to_default() -> None:

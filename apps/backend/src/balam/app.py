@@ -24,8 +24,10 @@ import sys
 import uvicorn
 from telegram.ext import Application
 
+from balam.agent_tools import ToolScopes
 from balam.bot import build_application, register_commands
 from balam.config import ConfigError, load_config
+from balam.content_store import ContentStore
 from balam.contexts import ContextsConfigError, load_contexts
 from balam.opencode import OpenCode
 from balam.router import Router
@@ -59,7 +61,20 @@ def main() -> None:
         password=config.opencode_server_password,
     )
     store = SessionStore(config.db_path)
-    router = Router(store, opencode, contexts)
+    # The viewer snapshots + per-topic tool scopes feed both the bot (buttons,
+    # send_file delivery) and the FastAPI server (the /api + /mcp routes).
+    content_store = ContentStore()
+    tool_scopes = ToolScopes()
+    router = Router(
+        store,
+        opencode,
+        contexts,
+        tool_scopes=tool_scopes,
+        # OpenCode dials Balam's own Mini App server for agent tools (ADR-0007:
+        # both live on this VM, loopback only).
+        mcp_base_url=f"http://127.0.0.1:{config.balam_port}",
+        qualify_chat=config.allowed_telegram_chat_id is None,
+    )
 
     # The Mini App server runs in the bot's event loop (one asyncio task), so the
     # bot, OpenCode SSE, and HTTP share a process (ADR-0007). Created in
@@ -77,7 +92,18 @@ def main() -> None:
         await opencode.wait_for_ready()
         logger.info("OpenCode is ready.")
 
-        api = create_app(config, router)
+        # The bot is initialized by post_init time, so its username is available
+        # for t.me Mini App links; bot_data carries the store to the streamer's
+        # plan-view button.
+        application.bot_data["content_store"] = content_store
+        api = create_app(
+            config,
+            router,
+            content_store=content_store,
+            tool_scopes=tool_scopes,
+            bot=application.bot,
+            bot_username=application.bot.username,
+        )
         server = uvicorn.Server(
             uvicorn.Config(api, host="127.0.0.1", port=config.balam_port, log_level="info")
         )

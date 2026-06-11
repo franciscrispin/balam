@@ -22,3 +22,6 @@ export type DiffHunk = components["schemas"]["DiffHunk"];
 
 /** The working-tree diff of a context (`GET /api/diff`). */
 export type DiffResponse = components["schemas"]["DiffResponse"];
+
+/** An ephemeral markdown snapshot (`GET /api/markdown/content/{id}`). */
+export type MarkdownContent = components["schemas"]["MarkdownContentResponse"];

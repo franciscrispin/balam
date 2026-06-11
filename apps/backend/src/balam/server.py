@@ -10,8 +10,8 @@ Runs in the same process as the bot (mounted from :mod:`balam.app`), bound to
   3. Emit the OpenAPI schema (``/openapi.json``) the frontend generates its
      TypeScript types from (ADR-0003).
 
-This slice ships the flagship **git diff viewer** endpoint; markdown and the
-noVNC live-Chrome proxy come later (Tier 3 / ADR-0006).
+Ships the **git diff viewer** and **markdown viewer** endpoints; the noVNC
+live-Chrome proxy comes later (Tier 3 / ADR-0006).
 """
 
 from __future__ import annotations
@@ -19,12 +19,16 @@ from __future__ import annotations
 import logging
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from balam.agent_tools import ToolScopes, create_send_file_tool, handle_rpc
 from balam.config import Config
+from balam.content_store import ContentStore
 from balam.git_diff import DiffHunk, NotAGitRepo, get_hunks
 from balam.router import Router
 from balam.webapp_auth import RequireOwner
@@ -58,7 +62,22 @@ class DiffResponse(BaseModel):
     hunks: list[DiffHunk]
 
 
-def create_app(config: Config, router: Router) -> FastAPI:
+class MarkdownContentResponse(BaseModel):
+    """An ephemeral markdown snapshot (plan text, a sent ``.md`` file)."""
+
+    title: str
+    content: str
+
+
+def create_app(
+    config: Config,
+    router: Router,
+    *,
+    content_store: ContentStore | None = None,
+    tool_scopes: ToolScopes | None = None,
+    bot: Any | None = None,
+    bot_username: str | None = None,
+) -> FastAPI:
     """Build the FastAPI app: auth-gated API routes plus the static Mini App."""
     # The app is reachable over the internet (ADR-0013), so don't serve the
     # interactive docs or the HTTP OpenAPI route — they need no auth and would
@@ -76,6 +95,7 @@ def create_app(config: Config, router: Router) -> FastAPI:
         bot_token=config.telegram_bot_token,
         allowed_user_id=config.allowed_telegram_user_id,
     )
+    store = content_store if content_store is not None else ContentStore()
 
     @app.get("/api/app-info", response_model=AppInfo)
     async def app_info(_owner: int = Depends(require_owner)) -> AppInfo:
@@ -98,6 +118,55 @@ def create_app(config: Config, router: Router) -> FastAPI:
         except NotAGitRepo as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return DiffResponse(context=name, hunks=hunks)
+
+    @app.get("/api/markdown/content/{content_id}", response_model=MarkdownContentResponse)
+    async def markdown_content(
+        content_id: str,
+        _owner: int = Depends(require_owner),
+    ) -> MarkdownContentResponse:
+        entry = store.get(content_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="content not found or expired")
+        return MarkdownContentResponse(title=entry.title, content=entry.content)
+
+    if tool_scopes is not None and bot is not None:
+        # Balam's own MCP server (balam.agent_tools): OpenCode calls this over
+        # localhost. Out of the schema — it is server-to-server, not part of the
+        # Mini App contract the TS types are generated from.
+        @app.post("/mcp/{scope_token}", include_in_schema=False)
+        async def mcp(scope_token: str, request: Request) -> Response:
+            # The unguessable token is the auth (OpenCode dials 127.0.0.1
+            # directly); requests that crossed the Cloudflare tunnel are not it.
+            if "cf-connecting-ip" in request.headers:
+                raise HTTPException(status_code=404, detail="not found")
+            scope = tool_scopes.get(scope_token)
+            if scope is None:
+                raise HTTPException(status_code=404, detail="unknown tool scope")
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error"},
+                    },
+                    status_code=400,
+                )
+            tools = [
+                create_send_file_tool(
+                    bot,
+                    scope.chat_id,
+                    scope.thread_id,
+                    config=config,
+                    bot_username=bot_username,
+                    content_store=store,
+                )
+            ]
+            reply = await handle_rpc(body, tools)
+            if reply is None:
+                return Response(status_code=202)
+            return JSONResponse(reply)
 
     # Serve the built SPA last so the API routes above win. html=True serves
     # index.html for "/" and 404s unknown asset paths.

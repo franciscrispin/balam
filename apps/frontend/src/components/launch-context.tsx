@@ -7,9 +7,14 @@ import { createContext, useContext } from "react";
 export interface LaunchContextValue {
   /** Workspace context name to scope data to; undefined → backend default. */
   context: string | undefined;
+  /** Ephemeral markdown snapshot id for the markdown view. */
+  content: string | undefined;
 }
 
-const LaunchContext = createContext<LaunchContextValue>({ context: undefined });
+const LaunchContext = createContext<LaunchContextValue>({
+  context: undefined,
+  content: undefined,
+});
 
 export const LaunchProvider = LaunchContext.Provider;
 

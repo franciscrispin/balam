@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Any
 
+from balam.agent_tools import ToolScopes, server_name
 from balam.contexts import ContextsConfig
 from balam.opencode import OpenCode
-from balam.permissions import build_ruleset
+from balam.permissions import build_ruleset, send_file_rules
 from balam.store import SessionStore
 
 
@@ -51,14 +53,57 @@ class ResolvedSession:
 
 
 class Router:
-    def __init__(self, store: SessionStore, opencode: OpenCode, contexts: ContextsConfig) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        opencode: OpenCode,
+        contexts: ContextsConfig,
+        *,
+        tool_scopes: ToolScopes | None = None,
+        mcp_base_url: str | None = None,
+        qualify_chat: bool = False,
+    ) -> None:
         self._store = store
         self._opencode = opencode
         self._contexts = contexts
+        self._tool_scopes = tool_scopes
+        self._mcp_base_url = mcp_base_url
+        self._qualify_chat = qualify_chat
 
     @property
     def contexts(self) -> ContextsConfig:
         return self._contexts
+
+    def _balam_tool_server(
+        self, chat_id: int, thread_id: int | None
+    ) -> tuple[str, dict[str, Any]] | None:
+        """This topic's own MCP server (Balam's ``send_file``), or ``None`` unwired.
+
+        Per-topic server names + secret token URLs: OpenCode's MCP registry is
+        name-keyed per directory (re-registration overwrites), gives servers no
+        session identity, and exposes every registered server to every session in
+        the directory — so each topic gets its own name, and
+        :func:`balam.permissions.send_file_rules` hides the other topics' copies.
+        """
+        if self._tool_scopes is None or self._mcp_base_url is None:
+            return None
+        scope = self._tool_scopes.register(chat_id, thread_id)
+        name = server_name(scope, qualify_chat=self._qualify_chat)
+        return name, {"type": "remote", "url": f"{self._mcp_base_url}/mcp/{scope.token}"}
+
+    def _session_setup(
+        self,
+        ctx_mcp: dict[str, Any],
+        permission: list[dict[str, str]],
+        chat_id: int,
+        thread_id: int | None,
+    ) -> tuple[dict[str, Any], list[dict[str, str]], tuple[str, dict[str, Any]] | None]:
+        """The session's MCP map + ruleset, with Balam's tool server merged in."""
+        balam_server = self._balam_tool_server(chat_id, thread_id)
+        if balam_server is None:
+            return ctx_mcp, permission, None
+        name, config = balam_server
+        return {**ctx_mcp, name: config}, permission + send_file_rules(name), balam_server
 
     def current_context_name(self, ref: TopicRef) -> str:
         """The context name a topic is bound to (or the default if unbound)."""
@@ -99,8 +144,9 @@ class Router:
         caller validates that ``name`` exists.
         """
         ctx = self._contexts.contexts[name]
+        mcp, permission, _ = self._session_setup(ctx.mcp, build_ruleset(ctx), chat_id, thread_id)
         session_id = await self._opencode.create_session(
-            title, directory=ctx.directory, permission=build_ruleset(ctx), mcp=ctx.mcp
+            title, directory=ctx.directory, permission=permission, mcp=mcp
         )
         self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=name)
         if auto_named:
@@ -116,7 +162,9 @@ class Router:
         bound_name = row[1] if row else None
         ctx = self._contexts.get(bound_name)
         context_name = self._contexts.resolve_name(bound_name)
-        permission = build_ruleset(ctx)
+        mcp, permission, balam_server = self._session_setup(
+            ctx.mcp, build_ruleset(ctx), ref.chat_id, ref.thread_id
+        )
 
         existing = row[0] if row else None
         if existing and await self._opencode.session_exists(existing, directory=ctx.directory):
@@ -124,6 +172,15 @@ class Router:
             await self._opencode.update_session_permission(
                 session_id, directory=ctx.directory, permission=permission
             )
+            if balam_server is not None:
+                # OpenCode's MCP registry is in-memory while sessions persist on
+                # disk, so a reused session may have lost its tool server to an
+                # OpenCode restart. The name is deterministic and the token stable,
+                # so re-registering is an idempotent overwrite (cheap: a remote
+                # client handshake against our own localhost endpoint). Best-effort
+                # like update_session_permission — never blocks the turn.
+                name, config = balam_server
+                await self._opencode.register_mcp(name, config, directory=ctx.directory)
         else:
             if existing:
                 # Mapped session is gone server-side: clear the stale row, recreate.
@@ -131,7 +188,7 @@ class Router:
                 # topic's name carries across the recreate.
                 self._store.delete(ref.chat_id, ref.thread_id)
             session_id = await self._opencode.create_session(
-                ref.title, directory=ctx.directory, permission=permission, mcp=ctx.mcp
+                ref.title, directory=ctx.directory, permission=permission, mcp=mcp
             )
             self._store.set(
                 ref.chat_id,
