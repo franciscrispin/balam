@@ -8,18 +8,18 @@ user.
 The design and the reasons behind it live in
 [docs/architecture-decisions.md](docs/architecture-decisions.md). Read that first.
 
-## Layout
+## Features
 
-This is a **polyglot** repo — a Python backend beside a TypeScript frontend, with
-no shared toolchain (ADR-0011):
-
-- `apps/backend` — **Python** (uv): Telegram bot, OpenCode HTTP/SSE client, Mini
-  App host, and noVNC proxy. This is the core of the system.
-- `apps/frontend` — the Telegram Mini App (React + Vite, TypeScript).
-- `packages/shared` — TypeScript types for the Mini App.
-
-The contract between the two sides is the backend's FastAPI-emitted OpenAPI
-schema, from which the frontend's types are generated (ADR-0003).
+- **Agent chat in Telegram** — each forum topic is its own OpenCode session;
+  replies stream live as animated drafts.
+- **Workspace contexts** — one bot drives several projects. `/context <name>`
+  opens a new topic bound to that project's directory, model, and allowed tools.
+- **Plan mode** — `/plan` keeps a topic read-only until you approve the plan.
+- **Tool approvals** — pre-approved tools run without prompting; anything else
+  asks via an inline keyboard, behind a symlink-safe directory boundary.
+- **Mini App viewers** — `/diff` opens a git diff viewer, and the agent can share
+  files into a markdown viewer with its `send_file` tool.
+- **Topic management** — `/new`, `/rename`, `/status`, and `/cancel`.
 
 ## Prerequisites
 
@@ -58,8 +58,14 @@ Workspace contexts (per-directory agent workspaces) live in `config.yaml` — co
 | `bun run typecheck` | Type-check `packages/*` + the frontend. |
 | `bun run lint` | Lint and check formatting with Biome. |
 
-## Status
+## Repository structure
 
-Early implementation. The bot↔agent round-trip over forum topics and the
-workspace `/context` command are built; the Mini App, noVNC view, and the
-remaining slash commands are not yet. See `CLAUDE.md` for details.
+A Python backend beside a TypeScript frontend, with no shared toolchain:
+
+- `apps/backend` — **Python** (uv): Telegram bot, OpenCode HTTP/SSE client, Mini
+  App host, and noVNC proxy. This is the core of the system.
+- `apps/frontend` — the Telegram Mini App (React + Vite, TypeScript).
+- `packages/shared` — TypeScript types for the Mini App.
+
+The contract between the two sides is the backend's FastAPI-emitted OpenAPI
+schema, from which the frontend's types are generated.
