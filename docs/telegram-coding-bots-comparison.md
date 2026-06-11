@@ -1,32 +1,36 @@
 # Feature Comparison: Telegram Coding-Agent Bots
 
-A side-by-side catalog of features across three Telegram-driven coding-agent
+A side-by-side catalog of features across four Telegram-driven coding-agent
 bots, marking which features overlap and which are distinct to each project:
 
 - **zog** (`/home/ubuntu/projects/zog`)
 - **open-shrimp** (`/home/ubuntu/projects/open-shrimp`)
 - **opencode-telegram-bot** (`/home/ubuntu/references/opencode-telegram-bot`),
   abbreviated **OC-TG-Bot** in tables below.
+- **Balam** (`/home/ubuntu/projects/balam`) — this repo. Entries reflect what is
+  implemented today, not the full ADR roadmap.
 
 ## At a glance
 
-|                  | **Zog**                                   | **Open-Shrimp**                                       | **OC-TG-Bot**                                          |
-| ---------------- | ----------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------ |
-| One-liner        | Personal Telegram bot powered by the **Claude Agent SDK** | Self-hosted Telegram bot powered by an **OpenCode** coding agent | Telegram client for a **local OpenCode server** — run/monitor coding tasks with no open ports |
-| Agent backend    | Claude Agent SDK (in-process)             | OpenCode server over HTTP/SSE                          | OpenCode server over HTTP (local, health-monitored)    |
-| Language         | Python 3.13+                              | Python 3.11+                                           | TypeScript / Node 20+                                  |
-| Package manager  | uv                                        | uv                                                     | npm (published: `@grinev/opencode-telegram-bot`)       |
-| Telegram client  | python-telegram-bot (long polling)        | python-telegram-bot (long polling)                    | grammY (long polling)                                  |
-| Persistence      | SQLite (aiosqlite)                         | SQLite (aiosqlite)                                     | SQLite (better-sqlite3) + `settings.json`              |
-| Frontend         | React/TS Mini App (single app, 5 views)   | React/TS Mini Apps (5 separate apps)                  | None — native Telegram UI (inline + reply keyboards)   |
-| Scope            | Single-user, home-server self-host        | Single-user, self-host (Linux + macOS)                | Single-user, single private chat                       |
-| Distribution     | uv run / systemd user service             | Pre-built binary, systemd, launchd, macOS menu-bar app | `npm install -g` / npx, setup wizard, systemd guide    |
+|                  | **Zog**                                   | **Open-Shrimp**                                       | **OC-TG-Bot**                                          | **Balam**                                              |
+| ---------------- | ----------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------ |
+| One-liner        | Personal Telegram bot powered by the **Claude Agent SDK** | Self-hosted Telegram bot powered by an **OpenCode** coding agent | Telegram client for a **local OpenCode server** — run/monitor coding tasks with no open ports | Forum-topic-native bot + Mini App for an **OpenCode** agent: topic = session = workspace context |
+| Agent backend    | Claude Agent SDK (in-process)             | OpenCode server over HTTP/SSE                          | OpenCode server over HTTP (local, health-monitored)    | OpenCode server over HTTP/SSE (hand-written httpx client) |
+| Language         | Python 3.13+                              | Python 3.11+                                           | TypeScript / Node 20+                                  | Python 3.12+ backend, TypeScript frontend              |
+| Package manager  | uv                                        | uv                                                     | npm (published: `@grinev/opencode-telegram-bot`)       | uv (backend) + Bun workspace (frontend)                |
+| Telegram client  | python-telegram-bot (long polling)        | python-telegram-bot (long polling)                    | grammY (long polling)                                  | python-telegram-bot (long polling)                     |
+| Persistence      | SQLite (aiosqlite)                         | SQLite (aiosqlite)                                     | SQLite (better-sqlite3) + `settings.json`              | SQLite (stdlib sqlite3)                                |
+| Frontend         | React/TS Mini App (single app, 5 views)   | React/TS Mini Apps (5 separate apps)                  | None — native Telegram UI (inline + reply keyboards)   | React/TS Mini App (single app, 3 views; browser view a placeholder) |
+| Scope            | Single-user, home-server self-host        | Single-user, self-host (Linux + macOS)                | Single-user, single private chat                       | Single-user, one forum supergroup, Ubuntu VM           |
+| Distribution     | uv run / systemd user service             | Pre-built binary, systemd, launchd, macOS menu-bar app | `npm install -g` / npx, setup wizard, systemd guide    | uv run / systemd                                       |
 
-All three are, fundamentally, the same idea — *a coding agent driven from
+All four are, fundamentally, the same idea — *a coding agent driven from
 Telegram* — which is why a large core overlaps. They diverge most in the agent
-backend (Claude SDK vs. OpenCode), in surface (zog and open-shrimp invest in
-Mini Apps; OC-TG-Bot deliberately stays native-Telegram-only), and in how far
-open-shrimp pushes into sandboxing, computer-use, and packaging.
+backend (Claude SDK vs. OpenCode), in surface (zog, open-shrimp, and Balam
+invest in Mini Apps; OC-TG-Bot deliberately stays native-Telegram-only), in how
+far open-shrimp pushes into sandboxing, computer-use, and packaging, and in how
+far Balam pushes the forum-topic model (topics *are* sessions, bound to
+workspace contexts).
 
 ---
 
@@ -36,118 +40,118 @@ Legend: ✅ yes · ➖ partial / different shape · ❌ no.
 
 ### Core agent & messaging
 
-| Feature                                   | Zog | Open-Shrimp | OC-TG-Bot |
-| ----------------------------------------- | --- | ----------- | --------- |
-| Telegram-driven coding agent              | ✅  | ✅          | ✅        |
-| Multi-turn sessions persisted in SQLite   | ✅  | ✅          | ✅        |
-| Session resume / browse                   | ✅ `/resume` | ✅ `/resume` | ✅ `/sessions` |
-| New / clear session                       | ✅ `/clear` | ✅ `/clear` | ✅ `/new` |
-| Revert / fork from message history        | ❌  | ❌          | ✅ `/messages` |
-| Streaming via `sendMessageDraft`          | ✅  | ✅          | ➖ opt-in `draft` mode (default: throttled message edits) |
-| Message auto-splitting (4096-char limit)  | ✅  | ✅          | ✅        |
-| GFM → Telegram MarkdownV2                 | ✅ mistune | ✅ mistune | ✅ remark/unified, plain-text fallback |
-| File / photo attachments (inbound)        | ✅  | ✅          | ✅ (albums batched into one prompt) |
-| Forum topic support (topic = session)     | ✅  | ✅          | ❌ explicit non-goal |
-| Group-chat etiquette (@mention / reply)   | ✅  | ✅          | ❌ private chat only |
-| Tool-output truncation                    | ✅  | ✅          | ✅ + optional hiding of tool/thinking messages |
+| Feature                                   | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| ----------------------------------------- | --- | ----------- | --------- | ----- |
+| Telegram-driven coding agent              | ✅  | ✅          | ✅        | ✅    |
+| Multi-turn sessions persisted in SQLite   | ✅  | ✅          | ✅        | ✅ (topic → session map) |
+| Session resume / browse                   | ✅ `/resume` | ✅ `/resume` | ✅ `/sessions` | ➖ implicit — reopening a topic resumes its session |
+| New / clear session                       | ✅ `/clear` | ✅ `/clear` | ✅ `/new` | ✅ `/new` (opens a new topic) |
+| Revert / fork from message history        | ❌  | ❌          | ✅ `/messages` | ❌ |
+| Streaming via `sendMessageDraft`          | ✅  | ✅          | ➖ opt-in `draft` mode (default: throttled message edits) | ✅ in private chats; live-edit fallback in groups |
+| Message auto-splitting (4096-char limit)  | ✅  | ✅          | ✅        | ✅ code-fence-aware |
+| GFM → Telegram MarkdownV2                 | ✅ mistune | ✅ mistune | ✅ remark/unified, plain-text fallback | ✅ mistune |
+| File / photo attachments (inbound)        | ✅  | ✅          | ✅ (albums batched into one prompt) | ✅ (inline base64 file parts) |
+| Forum topic support (topic = session)     | ✅  | ✅          | ❌ explicit non-goal | ✅ the core design |
+| Group-chat etiquette (@mention / reply)   | ✅  | ✅          | ❌ private chat only | ➖ one allowlisted forum supergroup; every message is for the bot |
+| Tool-output truncation                    | ✅  | ✅          | ✅ + optional hiding of tool/thinking messages | ✅ (Bash tail-kept; other tools shown as compact one-liners) |
 
 ### Contexts & configuration
 
-| Feature                       | Zog | Open-Shrimp | OC-TG-Bot |
-| ----------------------------- | --- | ----------- | --------- |
-| Multi-project contexts        | ✅  | ✅          | ✅ `/projects` (OpenCode projects; `/open` adds one by browsing dirs) |
-| Default context               | ✅  | ✅          | ✅ persisted in settings |
-| Additional directories        | ✅  | ✅          | ➖ allowlisted browser roots for `/open` & `/ls` only |
-| Per-context model override    | ✅  | ✅          | ➖ model persisted per session, not per project |
-| Config format                 | YAML | YAML       | `.env` env vars |
-| Telegram user allowlist       | ✅  | ✅          | ✅ single required user ID |
+| Feature                       | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| ----------------------------- | --- | ----------- | --------- | ----- |
+| Multi-project contexts        | ✅  | ✅          | ✅ `/projects` (OpenCode projects; `/open` adds one by browsing dirs) | ✅ `/context` (topic binds to one context for its lifetime) |
+| Default context               | ✅  | ✅          | ✅ persisted in settings | ✅ `default_context` for unbound topics |
+| Additional directories        | ✅  | ✅          | ➖ allowlisted browser roots for `/open` & `/ls` only | ✅ |
+| Per-context model override    | ✅  | ✅          | ➖ model persisted per session, not per project | ✅ (+ per-context `effort`) |
+| Config format                 | YAML | YAML       | `.env` env vars | YAML (+ `.env` secrets, `${VAR}` substitution) |
+| Telegram user allowlist       | ✅  | ✅          | ✅ single required user ID | ✅ user ID + optional chat scoping |
 
 ### Model & agent control
 
-| Feature                          | Zog | Open-Shrimp | OC-TG-Bot |
-| -------------------------------- | --- | ----------- | --------- |
-| Model command / picker           | ✅ `/model` | ✅ `/model` (+ `reset`) | ✅ reply-keyboard picker (OpenCode favorites + recents) |
-| Reasoning-effort control         | ❌  | ✅ `/effort` | ➖ model "variant" selection |
-| Agent-mode switching (plan/build/…) | ❌ | ❌         | ✅ reply keyboard |
+| Feature                          | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| -------------------------------- | --- | ----------- | --------- | ----- |
+| Model command / picker           | ✅ `/model` | ✅ `/model` (+ `reset`) | ✅ reply-keyboard picker (OpenCode favorites + recents) | ❌ per-context config only |
+| Reasoning-effort control         | ❌  | ✅ `/effort` | ➖ model "variant" selection | ➖ per-context `effort` config, no command |
+| Agent-mode switching (plan/build/…) | ❌ | ❌         | ✅ reply keyboard | ➖ `/plan` — sticky per-topic plan agent (see below) |
 
 ### Tool approval
 
-| Feature                                | Zog | Open-Shrimp | OC-TG-Bot |
-| -------------------------------------- | --- | ----------- | --------- |
-| Inline approval buttons                | ✅  | ✅ Allow once / Accept all / Deny | ✅ Allow once / Always / Reject |
-| Path-scoped auto-approval              | ✅  | ✅          | ❌ delegated to OpenCode config |
-| Pattern-based tool rules (`Bash(git *)`) | ✅ | ✅         | ❌        |
-| Out-of-directory protection            | ✅  | ✅          | ❌        |
-| Interactive agent questions            | ✅ Question Form Mini App | ❌ | ✅ inline buttons + free-text answers |
+| Feature                                | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| -------------------------------------- | --- | ----------- | --------- | ----- |
+| Inline approval buttons                | ✅  | ✅ Allow once / Accept all / Deny | ✅ Allow once / Always / Reject | ✅ Allow once / Accept all edits / Deny |
+| Path-scoped auto-approval              | ✅  | ✅          | ❌ delegated to OpenCode config | ✅ in-workspace reads auto-allowed |
+| Pattern-based tool rules (`Bash(git *)`) | ✅ | ✅         | ❌        | ✅ compiled into OpenCode's native ruleset |
+| Out-of-directory protection            | ✅  | ✅          | ❌        | ✅ symlink-safe (`realpath`) |
+| Interactive agent questions            | ✅ Question Form Mini App | ❌ | ✅ inline buttons + free-text answers | ✅ inline buttons, multi-select, free-text answers |
 
 ### Status & control
 
-| Feature                              | Zog | Open-Shrimp | OC-TG-Bot |
-| ------------------------------------ | --- | ----------- | --------- |
-| `/status`                            | ✅  | ✅          | ✅ health, project, model, context usage, changed files |
-| Pinned auto-refreshing status message | ❌ | ✅          | ✅        |
-| Cancel a running turn                | ✅ `/cancel` | ✅ `/cancel` | ✅ `/abort` |
-| Detach from session w/o stopping it  | ❌  | ❌          | ✅ `/detach` |
-| Agent-server lifecycle management    | n/a (in-process) | ➖ bundled runtime | ✅ `/opencode_start` / `/opencode_stop` + optional auto-restart monitor |
-| Git worktree switching               | ❌  | ❌          | ✅ `/worktree` |
-| Interactive file browser + download  | ❌  | ❌          | ✅ `/ls`  |
-| Run agent commands / skills catalogs | ❌  | ❌          | ✅ `/commands`, `/skills` |
-| Rename session                       | ❌  | ❌          | ✅ `/rename` |
+| Feature                              | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| ------------------------------------ | --- | ----------- | --------- | ----- |
+| `/status`                            | ✅  | ✅          | ✅ health, project, model, context usage, changed files | ✅ context, model, session, turn + queue state |
+| Pinned auto-refreshing status message | ❌ | ✅          | ✅        | ❌    |
+| Cancel a running turn                | ✅ `/cancel` | ✅ `/cancel` | ✅ `/abort` | ✅ `/cancel` (also clears queued messages) |
+| Detach from session w/o stopping it  | ❌  | ❌          | ✅ `/detach` | ❌ |
+| Agent-server lifecycle management    | n/a (in-process) | ➖ bundled runtime | ✅ `/opencode_start` / `/opencode_stop` + optional auto-restart monitor | ❌ external systemd |
+| Git worktree switching               | ❌  | ❌          | ✅ `/worktree` | ❌ |
+| Interactive file browser + download  | ❌  | ❌          | ✅ `/ls`  | ❌    |
+| Run agent commands / skills catalogs | ❌  | ❌          | ✅ `/commands`, `/skills` | ❌ |
+| Rename session                       | ❌  | ❌          | ✅ `/rename` | ✅ `/rename` (renames the topic) |
 
 ### Scheduled tasks
 
-| Feature                              | Zog | Open-Shrimp | OC-TG-Bot |
-| ------------------------------------ | --- | ----------- | --------- |
-| Recurring scheduled prompts          | ✅  | ✅          | ✅ `/task` (cron-like, 5-min minimum) |
-| Safer / isolated execution           | ✅ restricted tool sets | ✅ restricted tool sets | ➖ runs `build` agent off-session; auto-rejects permission prompts |
-| Listing / management                 | ✅ `/schedule(s)` | ✅ `/schedule(s)` | ✅ `/tasklist` |
-| Persisted across restarts            | ✅  | ✅          | ✅        |
-| Natural-language scheduling via agent tool | ❌ | ✅      | ❌        |
+| Feature                              | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| ------------------------------------ | --- | ----------- | --------- | ----- |
+| Recurring scheduled prompts          | ✅  | ✅          | ✅ `/task` (cron-like, 5-min minimum) | ❌ |
+| Safer / isolated execution           | ✅ restricted tool sets | ✅ restricted tool sets | ➖ runs `build` agent off-session; auto-rejects permission prompts | ❌ |
+| Listing / management                 | ✅ `/schedule(s)` | ✅ `/schedule(s)` | ✅ `/tasklist` | ❌ |
+| Persisted across restarts            | ✅  | ✅          | ✅        | ❌    |
+| Natural-language scheduling via agent tool | ❌ | ✅      | ❌        | ❌    |
 
 ### Mini App (web UI)
 
-| Feature                                  | Zog | Open-Shrimp | OC-TG-Bot |
-| ---------------------------------------- | --- | ----------- | --------- |
-| Companion Mini App (cloudflared, InitData auth) | ✅ | ✅     | ❌ deliberately native-UI-only |
-| Hunk-level diff viewer w/ stage–unstage  | ✅  | ✅          | ❌        |
-| Multi-directory review                   | ✅  | ✅          | ❌        |
+| Feature                                  | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| ---------------------------------------- | --- | ----------- | --------- | ----- |
+| Companion Mini App (cloudflared, InitData auth) | ✅ | ✅     | ❌ deliberately native-UI-only | ✅ initData HMAC auth; named tunnel optional |
+| Hunk-level diff viewer w/ stage–unstage  | ✅  | ✅          | ❌        | ➖ `/diff` — read-only hunk viewer (Shiki highlighting) |
+| Multi-directory review                   | ✅  | ✅          | ❌        | ❌    |
 
 ### Voice
 
-| Feature             | Zog | Open-Shrimp | OC-TG-Bot |
-| ------------------- | --- | ----------- | --------- |
-| Voice input (STT)   | ❌  | ✅ local Moonshine (no cloud) | ✅ any Whisper-compatible API |
-| Voice replies (TTS) | ❌  | ❌          | ✅ `/tts` (OpenAI-compatible or Google Cloud) |
+| Feature             | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| ------------------- | --- | ----------- | --------- | ----- |
+| Voice input (STT)   | ❌  | ✅ local Moonshine (no cloud) | ✅ any Whisper-compatible API | ❌ |
+| Voice replies (TTS) | ❌  | ❌          | ✅ `/tts` (OpenAI-compatible or Google Cloud) | ❌ |
 
 ### MCP & background work
 
-| Feature                          | Zog | Open-Shrimp | OC-TG-Bot |
-| -------------------------------- | --- | ----------- | --------- |
-| MCP server management            | ❌  | ✅ `/mcp` (status/tools/reset/enable/disable) | ✅ `/mcps` (browse / toggle) |
-| Per-context MCP servers          | ❌  | ✅          | ❌ (OpenCode-level config) |
-| Built-in agent-facing MCP tools  | ❌  | ✅ `send_file`, schedules, `edit_topic`, subagent launch | ❌ |
-| Background subagents / tasks     | ❌  | ✅ `run_in_background` + `/tasks` | ➖ background-session notifications + live subagent activity display |
+| Feature                          | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| -------------------------------- | --- | ----------- | --------- | ----- |
+| MCP server management            | ❌  | ✅ `/mcp` (status/tools/reset/enable/disable) | ✅ `/mcps` (browse / toggle) | ❌ config-only |
+| Per-context MCP servers          | ❌  | ✅          | ❌ (OpenCode-level config) | ✅ stdio + http/sse, `${VAR}` from `.env` |
+| Built-in agent-facing MCP tools  | ❌  | ✅ `send_file`, schedules, `edit_topic`, subagent launch | ❌ | ✅ `send_file` (per-topic MCP server, scope tokens) |
+| Background subagents / tasks     | ❌  | ✅ `run_in_background` + `/tasks` | ➖ background-session notifications + live subagent activity display | ❌ (per-topic FIFO queue instead) |
 
 ### Sandboxing & computer use
 
-| Feature                    | Zog | Open-Shrimp | OC-TG-Bot |
-| -------------------------- | --- | ----------- | --------- |
-| Sandboxed agent execution  | ❌  | ✅ Docker / libvirt / Lima | ❌ |
-| Computer use (GUI tools)   | ❌  | ✅          | ❌        |
-| Live VNC viewer            | ❌  | ✅ `/vnc`   | ❌        |
+| Feature                    | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| -------------------------- | --- | ----------- | --------- | ----- |
+| Sandboxed agent execution  | ❌  | ✅ Docker / libvirt / Lima | ❌ | ❌ |
+| Computer use (GUI tools)   | ❌  | ✅          | ❌        | ❌ (browser-use skill lives in OpenCode, not the bot) |
+| Live VNC viewer            | ❌  | ✅ `/vnc`   | ❌        | ➖ planned (ADR-0006); Mini App browser view is a placeholder |
 
 ### Ops & packaging
 
-| Feature                    | Zog | Open-Shrimp | OC-TG-Bot |
-| -------------------------- | --- | ----------- | --------- |
-| systemd service            | ✅  | ✅ (+ launchd) | ✅ guide + optional `--daemon` |
-| Structured logging         | ✅  | ✅          | ✅ levels + log-file retention |
-| Single-user trust model    | ✅  | ✅          | ✅        |
-| Interactive setup wizard   | ❌  | ✅          | ✅ first-launch config |
-| Auto-update                | ❌  | ✅          | ❌        |
-| Config hot-reload          | ❌  | ✅          | ❌        |
-| UI localization            | ❌  | ❌          | ✅ 7 languages |
-| Telegram network flexibility | ❌ | ❌         | ✅ forward proxy (SOCKS/HTTP), reverse proxy + shared secret, IPv4 forcing |
+| Feature                    | Zog | Open-Shrimp | OC-TG-Bot | Balam |
+| -------------------------- | --- | ----------- | --------- | ----- |
+| systemd service            | ✅  | ✅ (+ launchd) | ✅ guide + optional `--daemon` | ✅ |
+| Structured logging         | ✅  | ✅          | ✅ levels + log-file retention | ✅ |
+| Single-user trust model    | ✅  | ✅          | ✅        | ✅    |
+| Interactive setup wizard   | ❌  | ✅          | ✅ first-launch config | ❌ fail-fast config validation |
+| Auto-update                | ❌  | ✅          | ❌        | ❌    |
+| Config hot-reload          | ❌  | ✅          | ❌        | ❌    |
+| UI localization            | ❌  | ❌          | ✅ 7 languages | ❌ |
+| Telegram network flexibility | ❌ | ❌         | ✅ forward proxy (SOCKS/HTTP), reverse proxy + shared secret, IPv4 forcing | ❌ |
 
 ---
 
@@ -262,7 +266,7 @@ Legend: ✅ yes · ➖ partial / different shape · ❌ no.
 
 - **Revert & fork from message history** — `/messages` browses the session's user
   messages and can revert the session to a prior state or fork a new session from
-  any old message. Unique among the three.
+  any old message. Unique among the four.
 - **`/detach`** — stop tracking a session without terminating it; with
   `TRACK_BACKGROUND_SESSIONS` the bot still sends short notifications when a
   detached session (same project/worktree) replies, asks a question, or requests
@@ -312,12 +316,72 @@ Legend: ✅ yes · ➖ partial / different shape · ❌ no.
 
 ---
 
+## Distinct to **Balam**
+
+### Topic-native session model
+
+- **Topic = session = context, by design** — every forum topic binds to one
+  workspace context for its lifetime and maps to one persistent OpenCode
+  session; the others treat topics as an optional add-on (or skip them).
+- **General-topic auto-spawn** — a message in General automatically creates a
+  new topic in the default context, with a "Go to topic" deep-link button;
+  `/context <name>` likewise opens a *new* bound topic rather than rebinding.
+- **Topic auto-naming** — topics are named `"<context>: <first message>"` from
+  the first prompt; a manual `/rename` pins the name against future renames.
+- **Per-topic message queue** — messages sent during a running turn are queued
+  FIFO with a "⏳ Queued (#2)…" position notice, instead of being dropped or
+  run concurrently.
+
+### Hybrid permission model (ADR-0012)
+
+- **Two-layer enforcement** — `allowed_tools` patterns (`Bash(git *)`, bare
+  `Edit`/`Read`) are compiled into OpenCode's *native* permission ruleset so
+  pre-approved tools never round-trip to Telegram, while the directory
+  boundary and the human-approval keyboard stay local in the bot.
+- **Symlink-safe directory fence** — `realpath` on both sides plus
+  trailing-separator checks; in-workspace reads auto-allowed, in-workspace
+  edits auto-allowed only after the user picks **"Accept all edits"**.
+
+### Per-topic agent-facing MCP
+
+- **Scope tokens** — each topic registers its *own* MCP server with OpenCode,
+  keyed by an unguessable per-topic token, so the agent's `send_file` always
+  lands in the topic that asked (and the token doubles as auth on localhost).
+- **`send_file` with markdown preview** — photo/document heuristics, and
+  markdown files get an ephemeral content-store snapshot plus a "📖 Preview"
+  button that opens the Mini App markdown viewer.
+
+### Plan mode
+
+- **`/plan` sticky plan agent** — arms plan mode for a topic (optionally
+  running a request immediately); every prompt then runs with OpenCode's
+  read-only `plan` agent. The flag is persisted in SQLite across restarts and
+  cleared by `/plan off` or by answering "Yes" to the agent's plan-exit
+  question, which carries a **"📋 View plan"** Mini App button.
+
+### Streaming details
+
+- **Reasoning / answer separation** — the agent's reasoning and tool progress
+  stream and finalize as a separate message group from the final answer.
+- **Provider-retry notice** — a single per-turn "rate-limited, retrying…"
+  notice with a `/cancel` reminder when OpenCode hits transient errors.
+- **Draft streaming with graceful fallback** — native `sendMessageDraft` in
+  private chats, throttled live-edit streaming in groups/supergroups.
+
+### Mini App launch fallback chain
+
+- Buttons degrade gracefully with configuration: direct `t.me/...?startapp=`
+  link → `web_app` button → plain URL button → localhost text, depending on
+  whether a public URL and Mini App shortname are configured.
+
+---
+
 ## Summary
 
-- **Shared core:** all three are single-user, long-polling Telegram bots with
+- **Shared core:** all four are single-user, long-polling Telegram bots with
   SQLite-persisted resumable sessions, streaming output, GFM→MarkdownV2
   rendering, attachments, multi-project switching, inline tool-approval buttons,
-  `/status` + cancel, and persisted scheduled tasks.
+  and `/status` + cancel. All except Balam also ship persisted scheduled tasks.
 
 - **Zog leans toward** a richer **single Mini App** experience around the Claude
   SDK: interactive question forms, an approval queue, and a notification-inbox
@@ -338,9 +402,13 @@ Legend: ✅ yes · ➖ partial / different shape · ❌ no.
   deliberately skips forum topics, group chats, sandboxing, and path-scoped
   approvals (delegating permissions to OpenCode).
 
-Balam (this repo) is architecturally closest to **open-shrimp** — it is also
-OpenCode-backed (ADR-0011) and adapts open-shrimp's workspace-context model
-(ADR-0012) — while sharing the Mini App ambitions seen in zog and open-shrimp.
-OC-TG-Bot is the closest reference for *breadth of OpenCode API coverage* from
-chat (sessions, agents, commands, skills, MCP toggling, server lifecycle), even
-though its single-chat, no-topics model differs from Balam's forum-topic design.
+- **Balam (this repo) leans toward** a **forum-topic-native** workflow on top
+  of OpenCode: topics *are* sessions bound to workspace contexts, with a hybrid
+  permission model (native OpenCode rules + a local symlink-safe fence),
+  per-topic agent-facing MCP (`send_file` with scope tokens), sticky `/plan`
+  mode, and a growing Mini App (diff + markdown viewers today, noVNC live
+  browser planned). Architecturally it is closest to **open-shrimp** — also
+  OpenCode-backed (ADR-0011), adapting its workspace-context model (ADR-0012)
+  — while OC-TG-Bot remains the closest reference for *breadth of OpenCode API
+  coverage* from chat. It does not yet have scheduling, voice, a model picker,
+  sandboxing, or session revert/fork.
