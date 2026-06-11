@@ -91,6 +91,24 @@ async def test_failing_draft_falls_back_to_live_edit_streaming() -> None:
     ]
 
 
+async def test_native_drafts_off_streams_live_edit_without_a_draft_attempt() -> None:
+    # A group/supergroup caller disables drafts up front: live-edit from the
+    # first flush, with no doomed sendMessageDraft call to fail first.
+    t = FakeTransport(fail_drafts=True)  # would raise if a draft were attempted
+    session = DraftSession(t, draft_id=7, render=_identity, native_drafts=False)
+    assert session.drafts_disabled is True
+
+    session.set_text("hi")
+    await session.flush_draft()
+    session.set_text("hi there")
+    await session.flush_draft()
+
+    assert t.ops == [
+        ("message", None, "hi"),
+        ("edit", 100, "hi there"),
+    ]
+
+
 async def test_live_edit_skips_unchanged_render() -> None:
     # Different raw text that renders identically must not trigger a redundant edit.
     def collapse(text: str) -> list[str]:
@@ -341,6 +359,37 @@ async def _run(events: list[dict[str, object]], *, directory: str | None = None)
         draft_interval=0.01,  # tiny: finalize waits on the flusher's sleep
     )
     return bot
+
+
+async def test_stream_reply_in_group_chat_never_attempts_a_native_draft() -> None:
+    # Negative chat_id (group/supergroup) → live-edit streaming from the start;
+    # sendMessageDraft is private-chat only and must not be tried at all.
+    class DraftRecordingBot(FakeBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.draft_calls = 0
+
+        async def send_message_draft(self, **kwargs: object) -> None:
+            self.draft_calls += 1
+
+    bot = DraftRecordingBot()
+    await stream_reply(
+        bot=bot,
+        opencode=FakeOpenCode(
+            [
+                _msg_updated("assistant", AID),
+                _text_part(AID, "hey there"),
+                _ev("session.idle", sessionID=SID),
+            ]
+        ),
+        session_id=SID,
+        chat_id=-1003953430909,
+        thread_id=99,
+        prompt="hello",
+        draft_interval=0.01,
+    )
+    assert bot.draft_calls == 0
+    assert bot.messages == ["hey there"]
 
 
 async def test_stream_reply_captures_assistant_text_and_skips_user_echo() -> None:

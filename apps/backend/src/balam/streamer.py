@@ -11,8 +11,11 @@ throttled ``editMessageText`` path ADR-0010 specifies. Approach follows zog
   1. Accumulate assistant text as it streams; mark the draft dirty.
   2. A background loop flushes every ~0.5s, reusing one ``draft_id`` so Telegram
      *animates* native drafts.
-  3. If a draft call fails, switch to live-edit streaming for the rest of the turn
-     (works in groups) instead of going silent.
+  3. The streaming approach is picked up front from the chat type: private chats
+     (positive ``chat_id`` in the Bot API) use native drafts; groups/supergroups
+     (negative ``chat_id``) go straight to live-edit, never burning a doomed
+     ``sendMessageDraft`` call per turn. A draft failure in a private chat still
+     falls back to live-edit mid-turn instead of going silent.
   4. On turn completion, send the real message(s). A live-edit message is reused
      for the first chunk (no duplicate); overflow goes to new messages. Drafts and
      final messages render GFM as Telegram MarkdownV2 (ADR-0010), ≤4096-char chunks.
@@ -94,10 +97,11 @@ class DraftSession:
 
     Mirrors zog's ``_DraftState`` + ``_flush_draft`` + finalize flow. Native
     ``sendMessageDraft`` only works in **private chats** (Telegram rejects it
-    elsewhere with ``Textdraft_peer_invalid``); in a forum supergroup the first
-    draft fails, so we fall back to **live-edit streaming** — send one real
+    elsewhere with ``Textdraft_peer_invalid``); ``native_drafts=False`` starts a
+    group/supergroup session directly in **live-edit streaming** — send one real
     message and keep editing it in place — exactly the throttled ``editMessageText``
     fallback ADR-0010 calls for (ported from open-shrimp's ``_send_live_edit``).
+    A failing draft call still flips to live-edit mid-turn as a safety net.
     """
 
     def __init__(
@@ -106,6 +110,7 @@ class DraftSession:
         *,
         draft_id: int | None = None,
         render: Renderer = gfm_to_telegram,
+        native_drafts: bool = True,
     ) -> None:
         self._transport = transport
         # draft_id must be non-zero and stable for the segment (animates on change).
@@ -114,7 +119,9 @@ class DraftSession:
         self._raw = ""
         self._dirty = False
         # Native drafts disabled (unsupported chat type) → use live-edit instead.
-        self._disabled = False
+        # ``native_drafts=False`` disables them up front when the caller already
+        # knows the chat can't take them (groups/supergroups).
+        self._disabled = not native_drafts
         # The live-edit message reused across flushes and at finalize, and the
         # last text pushed to it (so an unchanged render is not re-sent).
         self._live_edit_message_id: int | None = None
@@ -560,8 +567,12 @@ async def stream_reply(
     ignored (e.g. unit tests of the text/tool path).
     """
     transport = _make_transport(bot, chat_id, thread_id)
-    reasoning_draft = DraftSession(transport)
-    answer_draft = DraftSession(transport)
+    # sendMessageDraft is private-chat only; in the Bot API private chats have
+    # positive ids and groups/supergroups negative ones, so the chat id alone
+    # picks the streaming approach — no wasted draft call per group turn.
+    native_drafts = chat_id > 0
+    reasoning_draft = DraftSession(transport, native_drafts=native_drafts)
+    answer_draft = DraftSession(transport, native_drafts=native_drafts)
     topic_kwargs = thread_kwargs(thread_id)
 
     streaming = True
