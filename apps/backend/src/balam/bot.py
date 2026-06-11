@@ -22,6 +22,7 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
     Update,
 )
 from telegram.ext import (
@@ -35,7 +36,7 @@ from telegram.ext import (
 )
 
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
-from balam.attachments import collect_attachments
+from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
 from balam.miniapp import make_plan_view_button, mini_app_reply
 from balam.opencode import OpenCode
@@ -209,7 +210,6 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     router: Router = context.application.bot_data["router"]
-    turns: TurnRegistry = context.application.bot_data["turns"]
 
     if _is_forum_general_message(message):
         created_thread_id = await _create_topic_from_general(
@@ -222,6 +222,30 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if created_thread_id is None:
             return
         thread_id = created_thread_id
+
+    await _submit_turn(message, context, text, files, thread_id=thread_id)
+
+
+async def _submit_turn(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    files: list[PromptFile],
+    *,
+    thread_id: int | None,
+    queued_reply: str = "⏳ Queued (#{position}) — I'll run this after the current turn finishes.",
+) -> None:
+    """Resolve the topic's session and run ``text`` as its turn, or park it in the
+    topic's queue when a turn is already streaming.
+
+    Shared dispatch tail of the message and ``/plan`` paths. ``thread_id`` is
+    explicit because a General message has already been rehomed into a freshly
+    created topic by the time it gets here; ``queued_reply`` is formatted with
+    the job's 1-based queue ``position``.
+    """
+    router: Router = context.application.bot_data["router"]
+    turns: TurnRegistry = context.application.bot_data["turns"]
+    chat_id = message.chat_id
 
     try:
         ref = TopicRef(
@@ -263,9 +287,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # can't race in and miss this message.
     if turns.get(chat_id, thread_id) is not None:
         position = turns.enqueue(chat_id, thread_id, job)
-        await message.reply_text(
-            f"⏳ Queued (#{position}) — I'll run this after the current turn finishes."
-        )
+        await message.reply_text(queued_reply.format(position=position))
         return
 
     _start_turn(context, chat_id, thread_id, job)
@@ -562,34 +584,18 @@ async def _handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # Run the planning request right away, mirroring the message path.
-    turns: TurnRegistry = context.application.bot_data["turns"]
-    try:
-        ref = TopicRef(chat_id=chat_id, thread_id=thread_id, title=_topic_title(message, thread_id))
-        resolved = await router.resolve(ref)
-        await _auto_name_topic(context.bot, router, ref, resolved.context_name, request)
-    except Exception as exc:
-        logger.exception("failed to resolve session for /plan")
-        await _notify_error(context.bot, chat_id, thread_id, exc)
-        return
-
-    job = TurnJob(
-        prompt=request,
-        session_id=resolved.session_id,
-        directory=resolved.directory,
-        provider=resolved.provider,
-        model=resolved.model,
-        effort=resolved.effort,
-        allowed_dirs=[resolved.directory, *resolved.additional_directories],
-        files=[],
+    # Run the planning request right away through the shared dispatch tail (the
+    # flag is already set, so the turn derives agent="plan" when it starts).
+    await _submit_turn(
+        message,
+        context,
+        request,
+        [],
+        thread_id=thread_id,
+        queued_reply=(
+            "📋 Plan mode on. ⏳ Queued (#{position}) — I'll plan after the current turn finishes."
+        ),
     )
-    if turns.get(chat_id, thread_id) is not None:
-        position = turns.enqueue(chat_id, thread_id, job)
-        await message.reply_text(
-            f"📋 Plan mode on. ⏳ Queued (#{position}) — I'll plan after the current turn finishes."
-        )
-        return
-    _start_turn(context, chat_id, thread_id, job)
 
 
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
