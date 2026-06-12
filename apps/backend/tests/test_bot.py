@@ -12,7 +12,9 @@ from balam.bot import (
     _handle_approval_callback,
     _handle_cancel,
     _handle_context,
+    _handle_effort,
     _handle_message,
+    _handle_model,
     _handle_new,
     _handle_question_callback,
     _handle_question_custom_callback,
@@ -106,7 +108,12 @@ def _router() -> Router:
     contexts = ContextsConfig(
         default_context="balam",
         contexts={
-            "balam": ContextConfig(directory="/work/balam", description="Balam"),
+            "balam": ContextConfig(
+                directory="/work/balam",
+                description="Balam",
+                model="anthropic/claude-opus-4-8",
+                effort="high",
+            ),
             "scratch": ContextConfig(directory="/work/scratch", description="Scratch"),
         },
     )
@@ -237,7 +244,7 @@ async def test_unknown_context_is_rejected_without_creating_a_topic() -> None:
 # --- /new, /status, /cancel ---------------------------------------------------
 
 
-def _session_cmd_env(message: _FakeMessage):
+def _session_cmd_env(message: _FakeMessage, args: list[str] | None = None):
     """An (update, context) pair wired with router + opencode + turns, plus the
     bare opencode/turns/router handles for assertions."""
     opencode = _FakeOpenCode()
@@ -248,6 +255,7 @@ def _session_cmd_env(message: _FakeMessage):
                 directory="/work/balam",
                 description="Balam",
                 model="anthropic/claude-opus-4-8",
+                effort="high",
             ),
         },
     )
@@ -258,6 +266,7 @@ def _session_cmd_env(message: _FakeMessage):
         application=SimpleNamespace(
             bot_data={"router": router, "opencode": opencode, "turns": turns}
         ),
+        args=args or [],
     )
     return update, context, router, opencode, turns
 
@@ -491,6 +500,119 @@ async def test_status_reports_running_turn() -> None:
 
     assert "running" in message.replies[-1]
     task.cancel()
+
+
+async def test_status_reports_effective_model_and_effort_overrides() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, _opencode, _turns = _session_cmd_env(message)
+    router.set_model_override(SUPERGROUP, 5, "anthropic", "claude-sonnet-4")
+    router.set_effort_override(SUPERGROUP, 5, "medium")
+
+    await _handle_status(update, context)
+
+    reply = message.replies[-1]
+    assert "Model: anthropic/claude-sonnet-4" in reply
+    assert "Effort: medium" in reply
+
+
+async def test_model_reports_current_effective_value() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, *_ = _session_cmd_env(message)
+
+    await _handle_model(update, context)
+
+    reply = message.replies[-1]
+    assert "Model: anthropic/claude-opus-4-8" in reply
+    assert "Source: context default" in reply
+
+
+async def test_model_sets_topic_override() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message, ["anthropic/claude-sonnet-4"])
+
+    await _handle_model(update, context)
+
+    resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
+    assert resolved.provider == "anthropic"
+    assert resolved.model == "claude-sonnet-4"
+    assert "Model override set" in message.replies[-1]
+
+
+async def test_model_reset_clears_topic_override() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message, ["reset"])
+    router.set_model_override(SUPERGROUP, 5, "anthropic", "claude-sonnet-4")
+
+    await _handle_model(update, context)
+
+    resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
+    assert resolved.model == "claude-opus-4-8"
+    assert "Model reset" in message.replies[-1]
+
+
+async def test_model_rejects_unqualified_value() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message, ["claude-sonnet-4"])
+
+    await _handle_model(update, context)
+
+    assert router.model_override(SUPERGROUP, 5) == (None, None)
+    assert "Usage: /model" in message.replies[-1]
+
+
+async def test_model_rejects_empty_model_part() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message, ["anthropic/"])
+
+    await _handle_model(update, context)
+
+    assert router.model_override(SUPERGROUP, 5) == (None, None)
+    assert "Usage: /model" in message.replies[-1]
+
+
+async def test_effort_reports_current_effective_value() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, *_ = _session_cmd_env(message)
+
+    await _handle_effort(update, context)
+
+    reply = message.replies[-1]
+    assert "Effort: high" in reply
+    assert "Source: context default" in reply
+
+
+async def test_effort_sets_topic_override() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message, ["medium"])
+
+    await _handle_effort(update, context)
+
+    resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
+    assert resolved.effort == "medium"
+    assert "Effort override set" in message.replies[-1]
+
+
+async def test_effort_reset_clears_topic_override() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message, ["reset"])
+    router.set_effort_override(SUPERGROUP, 5, "medium")
+
+    await _handle_effort(update, context)
+
+    resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
+    assert resolved.effort == "high"
+    assert "Effort reset" in message.replies[-1]
+
+
+async def test_effort_rejects_unknown_value() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message, ["turbo"])
+
+    await _handle_effort(update, context)
+
+    assert router.effort_override(SUPERGROUP, 5) is None
+    assert "Unknown effort" in message.replies[-1]
+    assert "xhigh" in message.replies[-1]
 
 
 async def test_cancel_with_no_running_turn() -> None:
@@ -829,7 +951,7 @@ async def test_register_commands_adds_chat_scope_when_configured() -> None:
 
 def test_bot_commands_includes_all_commands() -> None:
     names = {c.command for c in BOT_COMMANDS}
-    assert {"new", "rename", "status", "cancel", "context"} <= names
+    assert {"new", "rename", "status", "model", "effort", "cancel", "context"} <= names
 
 
 # --- approval inline-keyboard callback ----------------------------------------

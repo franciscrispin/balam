@@ -129,6 +129,75 @@ async def test_recreates_vanished_session_preserving_context() -> None:
     assert store.get_row(1, 5) == (resolved.session_id, "scratch")
 
 
+async def test_resolve_applies_model_override() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+
+    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
+    resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    assert resolved.provider == "anthropic"
+    assert resolved.model == "claude-sonnet-4"
+    assert resolved.effort == "high"
+
+
+async def test_resolve_applies_effort_override() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+
+    router.set_effort_override(1, 5, "low")
+    resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    assert resolved.provider == "anthropic"
+    assert resolved.model == "claude-opus-4-8"
+    assert resolved.effort == "low"
+
+
+async def test_resolve_returns_context_defaults_after_override_reset() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+
+    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
+    router.set_effort_override(1, 5, "low")
+    router.reset_model_override(1, 5)
+    router.reset_effort_override(1, 5)
+    resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    assert resolved.provider == "anthropic"
+    assert resolved.model == "claude-opus-4-8"
+    assert resolved.effort == "high"
+
+
+async def test_overrides_are_isolated_per_topic() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+
+    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
+    router.set_effort_override(1, 6, "max")
+
+    first = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+    second = await router.resolve(TopicRef(chat_id=1, thread_id=6, title="t"))
+
+    assert first.model == "claude-sonnet-4"
+    assert first.effort == "high"
+    assert second.model == "claude-opus-4-8"
+    assert second.effort == "max"
+
+
+async def test_overrides_survive_vanished_session_recreation() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+    store.set(1, 5, "ses_gone", 1, context="balam")
+    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
+    router.set_effort_override(1, 5, "medium")
+
+    resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    assert resolved.session_id != "ses_gone"
+    assert resolved.model == "claude-sonnet-4"
+    assert resolved.effort == "medium"
+
+
 async def test_create_topic_session_binds_new_topic_without_touching_others() -> None:
     store, oc = _store(), FakeOpenCode()
     router = Router(store, oc, _contexts())

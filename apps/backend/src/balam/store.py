@@ -63,6 +63,21 @@ class SessionStore:
             );
             """
         )
+        # Per-topic model/effort overrides. Kept separate from ``topic_sessions``
+        # so they can be set before a session exists and survive session
+        # recreation when a stale session row is deleted.
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topic_overrides (
+                chat_id        INTEGER NOT NULL,
+                thread_id      INTEGER NOT NULL,
+                model_provider TEXT,
+                model          TEXT,
+                effort         TEXT,
+                PRIMARY KEY (chat_id, thread_id)
+            );
+            """
+        )
         self._migrate_auto_named()
         self._db.commit()
 
@@ -180,6 +195,89 @@ class SessionStore:
                 (chat_id, self.thread_key(thread_id)),
             )
         self._db.commit()
+
+    def get_overrides(
+        self, chat_id: int, thread_id: int | None
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return ``(provider, model, effort)`` overrides for a topic."""
+        row = self._db.execute(
+            """
+            SELECT model_provider, model, effort
+            FROM topic_overrides
+            WHERE chat_id = ? AND thread_id = ?
+            """,
+            (chat_id, self.thread_key(thread_id)),
+        ).fetchone()
+        return (row[0], row[1], row[2]) if row else (None, None, None)
+
+    def set_model_override(
+        self, chat_id: int, thread_id: int | None, provider: str, model: str
+    ) -> None:
+        """Set this topic's model override."""
+        self._db.execute(
+            """
+            INSERT INTO topic_overrides (chat_id, thread_id, model_provider, model)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (chat_id, thread_id)
+            DO UPDATE SET
+                model_provider = excluded.model_provider,
+                model = excluded.model
+            """,
+            (chat_id, self.thread_key(thread_id), provider, model),
+        )
+        self._db.commit()
+
+    def reset_model_override(self, chat_id: int, thread_id: int | None) -> None:
+        """Clear this topic's model override."""
+        self._db.execute(
+            """
+            UPDATE topic_overrides
+            SET model_provider = NULL, model = NULL
+            WHERE chat_id = ? AND thread_id = ?
+            """,
+            (chat_id, self.thread_key(thread_id)),
+        )
+        self._delete_empty_override(chat_id, thread_id)
+        self._db.commit()
+
+    def set_effort_override(self, chat_id: int, thread_id: int | None, effort: str) -> None:
+        """Set this topic's effort override."""
+        self._db.execute(
+            """
+            INSERT INTO topic_overrides (chat_id, thread_id, effort)
+            VALUES (?, ?, ?)
+            ON CONFLICT (chat_id, thread_id)
+            DO UPDATE SET effort = excluded.effort
+            """,
+            (chat_id, self.thread_key(thread_id), effort),
+        )
+        self._db.commit()
+
+    def reset_effort_override(self, chat_id: int, thread_id: int | None) -> None:
+        """Clear this topic's effort override."""
+        self._db.execute(
+            """
+            UPDATE topic_overrides
+            SET effort = NULL
+            WHERE chat_id = ? AND thread_id = ?
+            """,
+            (chat_id, self.thread_key(thread_id)),
+        )
+        self._delete_empty_override(chat_id, thread_id)
+        self._db.commit()
+
+    def _delete_empty_override(self, chat_id: int, thread_id: int | None) -> None:
+        self._db.execute(
+            """
+            DELETE FROM topic_overrides
+            WHERE chat_id = ?
+              AND thread_id = ?
+              AND model_provider IS NULL
+              AND model IS NULL
+              AND effort IS NULL
+            """,
+            (chat_id, self.thread_key(thread_id)),
+        )
 
     def delete(self, chat_id: int, thread_id: int | None) -> None:
         """Drop a mapping, e.g. when its session no longer exists server-side."""

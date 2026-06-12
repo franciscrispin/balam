@@ -125,6 +125,34 @@ class Router:
         by the plan_exit question being answered "Yes" (the agent then builds)."""
         self._store.set_plan_mode(chat_id, thread_id, enabled)
 
+    def model_override(self, chat_id: int, thread_id: int | None) -> tuple[str | None, str | None]:
+        """The topic's explicit model override, or ``(None, None)`` when unset."""
+        provider, model, _ = self._store.get_overrides(chat_id, thread_id)
+        return provider, model
+
+    def set_model_override(
+        self, chat_id: int, thread_id: int | None, provider: str, model: str
+    ) -> None:
+        """Set this topic's model override."""
+        self._store.set_model_override(chat_id, thread_id, provider, model)
+
+    def reset_model_override(self, chat_id: int, thread_id: int | None) -> None:
+        """Clear this topic's model override."""
+        self._store.reset_model_override(chat_id, thread_id)
+
+    def effort_override(self, chat_id: int, thread_id: int | None) -> str | None:
+        """The topic's explicit effort override, or ``None`` when unset."""
+        _, _, effort = self._store.get_overrides(chat_id, thread_id)
+        return effort
+
+    def set_effort_override(self, chat_id: int, thread_id: int | None, effort: str) -> None:
+        """Set this topic's effort override."""
+        self._store.set_effort_override(chat_id, thread_id, effort)
+
+    def reset_effort_override(self, chat_id: int, thread_id: int | None) -> None:
+        """Clear this topic's effort override."""
+        self._store.reset_effort_override(chat_id, thread_id)
+
     def topic_auto_named(self, ref: TopicRef) -> bool:
         """Whether the topic has already been auto-named, or manually renamed."""
         return self._store.is_auto_named(ref.chat_id, ref.thread_id)
@@ -208,12 +236,15 @@ class Router:
             )
 
         provider, model = ctx.provider_model
+        override_provider, override_model, override_effort = self._store.get_overrides(
+            ref.chat_id, ref.thread_id
+        )
         return ResolvedSession(
             session_id=session_id,
             context_name=context_name,
             directory=ctx.directory,
-            provider=provider,
-            model=model,
-            effort=ctx.effort,
+            provider=override_provider or provider,
+            model=override_model or model,
+            effort=override_effort or ctx.effort,
             additional_directories=list(ctx.additional_directories),
         )

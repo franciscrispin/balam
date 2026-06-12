@@ -38,6 +38,7 @@ from telegram.ext import (
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
+from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.miniapp import make_plan_view_button, mini_app_reply
 from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
@@ -614,21 +615,125 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     name = router.current_context_name(ref)
     ctx = router.contexts.get(name)
+    provider, model = ctx.provider_model
+    override_provider, override_model = router.model_override(ref.chat_id, ref.thread_id)
+    override_effort = router.effort_override(ref.chat_id, ref.thread_id)
     session_id = router.current_session_id(ref)
     running = turns.get(ref.chat_id, ref.thread_id) is not None
     queued = turns.queue_len(ref.chat_id, ref.thread_id)
+    effective_model = _format_model(override_provider or provider, override_model or model)
 
     lines = [
         f"Context: {name}",
         f"Directory: {ctx.directory}",
-        f"Model: {ctx.model or '(server default)'}",
-        f"Effort: {ctx.effort or '(server default)'}",
+        f"Model: {effective_model}",
+        f"Effort: {override_effort or ctx.effort or '(server default)'}",
         f"Session: {session_id or '(none yet — send a message to start)'}",
         f"Turn: {'running' if running else 'idle'}",
         f"Queued: {queued}",
         f"Plan mode: {'on' if router.plan_mode(ref.chat_id, ref.thread_id) else 'off'}",
     ]
     await message.reply_text("\n".join(lines))
+
+
+def _format_model(provider: str | None, model: str | None) -> str:
+    if provider and model:
+        return f"{provider}/{model}"
+    return "(server default)"
+
+
+async def _handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/model [provider/model|reset]`` — inspect or override this topic's model."""
+    message = update.message
+    if message is None:
+        return
+
+    router: Router = context.application.bot_data["router"]
+    ref = TopicRef(
+        chat_id=message.chat_id,
+        thread_id=message.message_thread_id,
+        title=_topic_title(message, message.message_thread_id),
+    )
+    args = context.args or []
+
+    if not args:
+        name = router.current_context_name(ref)
+        provider, model = router.contexts.get(name).provider_model
+        override_provider, override_model = router.model_override(ref.chat_id, ref.thread_id)
+        source = (
+            "topic override" if override_model else "context default" if model else "server default"
+        )
+        await message.reply_text(
+            f"Model: {_format_model(override_provider or provider, override_model or model)}\n"
+            f"Source: {source}\n"
+            "Set with /model <provider/model>, reset with /model reset."
+        )
+        return
+
+    value = args[0].strip()
+    if value.lower() == "reset":
+        router.reset_model_override(ref.chat_id, ref.thread_id)
+        name = router.current_context_name(ref)
+        provider, model = router.contexts.get(name).provider_model
+        await message.reply_text(f"Model reset to {_format_model(provider, model)}.")
+        return
+
+    try:
+        provider, model = split_provider_model(value)
+    except ValueError as exc:
+        await message.reply_text(f"{exc}\nUsage: /model <provider/model> or /model reset")
+        return
+    if not provider or not model:
+        await message.reply_text("Usage: /model <provider/model> or /model reset")
+        return
+
+    router.set_model_override(ref.chat_id, ref.thread_id, provider, model)
+    await message.reply_text(f"Model override set to {provider}/{model}.")
+
+
+async def _handle_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/effort [level|reset]`` — inspect or override this topic's effort."""
+    message = update.message
+    if message is None:
+        return
+
+    router: Router = context.application.bot_data["router"]
+    ref = TopicRef(
+        chat_id=message.chat_id,
+        thread_id=message.message_thread_id,
+        title=_topic_title(message, message.message_thread_id),
+    )
+    args = context.args or []
+
+    if not args:
+        name = router.current_context_name(ref)
+        ctx = router.contexts.get(name)
+        override = router.effort_override(ref.chat_id, ref.thread_id)
+        source = (
+            "topic override" if override else "context default" if ctx.effort else "server default"
+        )
+        await message.reply_text(
+            f"Effort: {override or ctx.effort or '(server default)'}\n"
+            f"Source: {source}\n"
+            "Set with /effort <level>, reset with /effort reset."
+        )
+        return
+
+    value = args[0].strip().lower()
+    if value == "reset":
+        router.reset_effort_override(ref.chat_id, ref.thread_id)
+        name = router.current_context_name(ref)
+        ctx = router.contexts.get(name)
+        await message.reply_text(f"Effort reset to {ctx.effort or '(server default)'}.")
+        return
+
+    if value not in EFFORT_LEVELS:
+        allowed = ", ".join(sorted(EFFORT_LEVELS))
+        await message.reply_text(f"Unknown effort {value!r}. Available: {allowed}")
+        return
+
+    router.set_effort_override(ref.chat_id, ref.thread_id, value)
+    await message.reply_text(f"Effort override set to {value}.")
 
 
 async def _handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1020,6 +1125,8 @@ BOT_COMMANDS = [
     BotCommand("new", "Open a new topic (this context, or /new <name> for another)"),
     BotCommand("rename", "Rename the current topic"),
     BotCommand("status", "Show this topic's context, session, and turn state"),
+    BotCommand("model", "Show or set this topic's model override"),
+    BotCommand("effort", "Show or set this topic's effort override"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
     BotCommand("plan", "Plan mode for this topic (/plan [request], /plan off)"),
@@ -1085,6 +1192,8 @@ def build_application(
     app.add_handler(CommandHandler("new", _handle_new, filters=allowed))
     app.add_handler(CommandHandler("rename", _handle_rename, filters=allowed))
     app.add_handler(CommandHandler("status", _handle_status, filters=allowed))
+    app.add_handler(CommandHandler("model", _handle_model, filters=allowed))
+    app.add_handler(CommandHandler("effort", _handle_effort, filters=allowed))
     app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
     app.add_handler(CommandHandler("plan", _handle_plan, filters=allowed))

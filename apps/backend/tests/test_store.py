@@ -179,3 +179,74 @@ def test_plan_mode_normalizes_general_thread() -> None:
     store = fresh_store()
     store.set_plan_mode(1, None, True)
     assert store.is_plan_mode(1, GENERAL_THREAD_ID) is True
+
+
+# --- model/effort overrides ----------------------------------------------------
+
+
+def test_overrides_default_to_unset() -> None:
+    store = fresh_store()
+    assert store.get_overrides(1, 7) == (None, None, None)
+
+
+def test_model_override_round_trips_and_resets() -> None:
+    store = fresh_store()
+
+    store.set_model_override(1, 7, "anthropic", "claude-sonnet-4")
+    assert store.get_overrides(1, 7) == ("anthropic", "claude-sonnet-4", None)
+
+    store.reset_model_override(1, 7)
+    assert store.get_overrides(1, 7) == (None, None, None)
+
+
+def test_effort_override_round_trips_and_resets() -> None:
+    store = fresh_store()
+
+    store.set_effort_override(1, 7, "high")
+    assert store.get_overrides(1, 7) == (None, None, "high")
+
+    store.reset_effort_override(1, 7)
+    assert store.get_overrides(1, 7) == (None, None, None)
+
+
+def test_overrides_are_scoped_per_chat_and_thread() -> None:
+    store = fresh_store()
+
+    store.set_model_override(1, 7, "anthropic", "claude-sonnet-4")
+    store.set_effort_override(1, 8, "low")
+    store.set_effort_override(2, 7, "max")
+
+    assert store.get_overrides(1, 7) == ("anthropic", "claude-sonnet-4", None)
+    assert store.get_overrides(1, 8) == (None, None, "low")
+    assert store.get_overrides(2, 7) == (None, None, "max")
+
+
+def test_overrides_survive_session_recreation() -> None:
+    store = fresh_store()
+    store.set(1, 7, "ses_old", 1, context="balam")
+    store.set_model_override(1, 7, "anthropic", "claude-sonnet-4")
+    store.set_effort_override(1, 7, "medium")
+
+    store.delete(1, 7)
+    store.set(1, 7, "ses_new", 2, context="balam")
+
+    assert store.get_overrides(1, 7) == ("anthropic", "claude-sonnet-4", "medium")
+
+
+def test_override_reset_is_idempotent() -> None:
+    store = fresh_store()
+    store.reset_model_override(1, 7)
+    store.reset_effort_override(1, 7)
+    assert store.get_overrides(1, 7) == (None, None, None)
+
+
+def test_overrides_normalize_general_thread() -> None:
+    store = fresh_store()
+    store.set_model_override(1, None, "anthropic", "claude-sonnet-4")
+    store.set_effort_override(1, None, "xhigh")
+
+    assert store.get_overrides(1, GENERAL_THREAD_ID) == (
+        "anthropic",
+        "claude-sonnet-4",
+        "xhigh",
+    )
