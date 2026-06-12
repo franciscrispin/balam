@@ -227,24 +227,28 @@ def _describe_error(error: Any) -> str:
 
 
 #: One streamed fragment: ``(arrival_order, kind, rendered_text)`` where ``kind``
-#: is ``"text"`` (assistant prose) or ``"tool"`` (a rendered tool-call line).
+#: is ``"text"`` (assistant prose), ``"tool"`` (a rendered tool-call line), or
+#: ``"narration"`` (an earlier step's interim text, demoted to progress).
 StreamPart = tuple[int, str, str]
 
 
 def _join_stream(parts: dict[str, StreamPart]) -> str:
     """Render the session's text and tool parts as one GFM string, in arrival
     order. Consecutive text fragments concatenate (they are deltas of one
-    message); a tool line is set off from its neighbours by a blank line."""
+    message); tool lines and demoted narration blocks are set off from their
+    neighbours by separators."""
     out = ""
     prev_kind: str | None = None
     for _order, kind, text in sorted(parts.values(), key=lambda p: p[0]):
         if not text:
             continue
         if out:
-            if prev_kind != kind:  # text↔tool transition
+            if prev_kind != kind:  # kind transition (text↔tool↔narration)
                 out = out.rstrip("\n") + "\n\n"
             elif kind == "tool":  # group consecutive tool lines
                 out = out.rstrip("\n") + "\n"
+            elif kind == "narration":  # blocks from different steps
+                out = out.rstrip("\n") + "\n\n"
             # text after text: concatenate the deltas, no separator
         out += text
         prev_kind = kind
@@ -660,6 +664,11 @@ async def stream_reply(
     # Tool calls are progress, so they live with the reasoning stream.
     reasoning_parts: dict[str, StreamPart] = {}
     answer_parts: dict[str, StreamPart] = {}
+    # The assistant message whose text currently fills the answer draft.
+    # OpenCode opens a new assistant message per step, and a step's interim
+    # narration ("I'll check…") is a plain text part just like the final
+    # answer — only the *last* message's text is the answer.
+    answer_message_id: str | None = None
     # Latest ``(tool, input, status)`` per tool callID. Built here so the
     # interactive-approval step (#3) can recover a call's input by callID.
     tool_parts: dict[str, tuple[str, dict[str, Any], str | None]] = {}
@@ -885,7 +894,7 @@ async def stream_reply(
             logger.debug("failed to post retry notice", exc_info=True)
 
     async def consume() -> None:
-        nonlocal order, error_text
+        nonlocal order, error_text, answer_message_id
         async for event in opencode.events(directory=directory, ready=stream_ready):
             etype = event.get("type")
             props = event.get("properties", {})
@@ -904,8 +913,21 @@ async def stream_reply(
                     # Render only assistant text. Subscribing before prompting
                     # guarantees we see the assistant's message.updated before its
                     # parts, so this set is populated by the time they arrive.
-                    if part.get("messageID") not in assistant_message_ids:
+                    message_id = part.get("messageID")
+                    if message_id not in assistant_message_ids:
                         continue
+                    if message_id != answer_message_id:
+                        # Text from a new step: what the answer draft holds was an
+                        # earlier step's narration, not the answer. Demote it to
+                        # the progress stream (it keeps its arrival order, so it
+                        # interleaves with the tool lines it narrates) and start
+                        # the answer over with the new step's text.
+                        if answer_parts:
+                            for pid, (pos, _kind, prev) in answer_parts.items():
+                                reasoning_parts[pid] = (pos, "narration", prev)
+                            answer_parts.clear()
+                            reasoning_draft.set_text(_join_stream(reasoning_parts))
+                        answer_message_id = message_id
                     part_id = part.get("id")
                     text = part.get("text", "")
                     if part_id in answer_parts:

@@ -504,6 +504,54 @@ async def test_stream_reply_renders_tool_line_separately_from_answer() -> None:
     assert answer == r"Let me look\.Done\."
 
 
+async def test_stream_reply_demotes_prior_step_text_to_progress() -> None:
+    # OpenCode opens a new assistant message per step; the interim narration a
+    # step emits before its tool calls is a plain text part just like the final
+    # answer. Only the last message's text is the answer — earlier steps' text
+    # belongs with the progress stream (regression: the answer bubble glued
+    # every step's narration to the real answer).
+    aid2 = "msg_assistant_2"
+    fpath = "/work/proj/src/foo.py"
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _text_part(AID, "Checking the repo first.", "prt_s1"),
+            _tool_part(
+                "call_1",
+                "read",
+                {"status": "completed", "input": {"filePath": fpath}, "output": "..."},
+            ),
+            _msg_updated("assistant", aid2),
+            _text_part(aid2, "the answer", "prt_s2"),
+            _ev("session.idle", sessionID=SID),
+        ],
+        directory="/work/proj",
+    )
+    assert len(bot.messages) == 2
+    progress, answer = bot.messages
+    assert "Checking the repo first" in progress
+    assert "🔧 Read" in progress
+    assert answer == "the answer"
+
+
+async def test_stream_reply_separates_demoted_narration_blocks() -> None:
+    # Narration demoted from consecutive steps must not concatenate without a
+    # separator (they are distinct blocks, not deltas of one message).
+    aid2, aid3 = "msg_assistant_2", "msg_assistant_3"
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _text_part(AID, "step one", "prt_s1"),
+            _msg_updated("assistant", aid2),
+            _text_part(aid2, "step two", "prt_s2"),
+            _msg_updated("assistant", aid3),
+            _text_part(aid3, "the answer", "prt_s3"),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    assert bot.messages == ["step one\n\nstep two", "the answer"]
+
+
 async def test_stream_reply_truncates_bash_output() -> None:
     long_output = "\n".join(f"line {i}" for i in range(200))
     bot = await _run(
