@@ -19,6 +19,10 @@ throttled ``editMessageText`` path ADR-0010 specifies. Approach follows zog
   4. On turn completion, send the real message(s). A live-edit message is reused
      for the first chunk (no duplicate); overflow goes to new messages. Drafts and
      final messages render GFM as Telegram MarkdownV2 (ADR-0010), ≤4096-char chunks.
+  5. The answer ends the turn. If other messages landed below the streamed answer
+     bubble while it was open (progress overflow at finalize, approval prompts,
+     retry notices — Telegram cannot insert above them), the stale bubble is
+     deleted and the answer is re-sent at the bottom.
 
 The transport-agnostic :class:`DraftSession` is unit-tested with a fake.
 """
@@ -85,12 +89,15 @@ class DraftTransport(Protocol):
     """Where draft previews and final messages land.
 
     ``send_message`` returns the new message's id (or ``None``) so the live-edit
-    fallback can keep editing it; ``edit_message`` updates a message in place.
+    fallback can keep editing it; ``edit_message`` updates a message in place;
+    ``delete_message`` removes one (used to drop a stale streamed bubble when
+    the answer must be re-sent at the bottom of the topic).
     """
 
     async def send_draft(self, draft_id: int, text: str) -> None: ...
     async def send_message(self, text: str) -> int | None: ...
     async def edit_message(self, message_id: int, text: str) -> None: ...
+    async def delete_message(self, message_id: int) -> None: ...
 
 
 class DraftSession:
@@ -193,15 +200,37 @@ class DraftSession:
             logger.debug("live-edit flush failed", exc_info=True)
 
     async def finalize(
-        self, fallback: str = "(the agent finished without producing any text)"
+        self,
+        fallback: str = "(the agent finished without producing any text)",
+        *,
+        latest_message_id: int | None = None,
     ) -> None:
         """Send the accumulated text as real message(s), split at the char cap.
 
         If a live-edit message exists, its first chunk is delivered by editing
         that message in place (no duplicate of the streamed bubble); any overflow
         chunks are sent as new messages.
+
+        ``latest_message_id`` is the id of the most recent message the turn sent
+        to the topic. When given and it isn't the live-edit message, other
+        messages landed *below* the streamed bubble — and since this text must
+        end the turn, the stale bubble is deleted and the text re-sent at the
+        bottom. If the delete fails the bubble is edited in place instead, so
+        the content is never duplicated.
         """
         text = self._raw if self._raw.strip() else fallback
+        if (
+            self._live_edit_message_id is not None
+            and latest_message_id is not None
+            and latest_message_id != self._live_edit_message_id
+        ):
+            try:
+                await self._transport.delete_message(self._live_edit_message_id)
+            except Exception:
+                logger.debug("could not delete stale streamed bubble", exc_info=True)
+            else:
+                self._live_edit_message_id = None
+                self._live_edit_last = None
         for i, chunk in enumerate(self._render(text)):
             if i == 0 and self._live_edit_message_id is not None:
                 # Skip the edit when the streamed bubble already shows this text —
@@ -541,7 +570,12 @@ def plan_path_from_question(
     return os.path.normpath(os.path.join(directory, rel))
 
 
-def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTransport:
+def _make_transport(
+    bot: Any,
+    chat_id: int,
+    thread_id: int | None,
+    on_sent: Callable[[int | None], None] | None = None,
+) -> DraftTransport:
     # message_thread_id routes both the draft and the final message to the topic.
     topic_kwargs = thread_kwargs(thread_id)
 
@@ -564,7 +598,13 @@ def _make_transport(bot: Any, chat_id: int, thread_id: int | None) -> DraftTrans
                 # Malformed MarkdownV2 → resend without formatting rather than drop.
                 logger.debug("MarkdownV2 send failed; falling back to plain text", exc_info=True)
                 msg = await bot.send_message(chat_id=chat_id, text=text, **topic_kwargs)
-            return getattr(msg, "message_id", None)
+            message_id = getattr(msg, "message_id", None)
+            if on_sent is not None:
+                on_sent(message_id)
+            return message_id
+
+        async def delete_message(self, message_id: int) -> None:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
         async def edit_message(self, message_id: int, text: str) -> None:
             # edit_message_text addresses the message by id within the chat, so no
@@ -638,7 +678,19 @@ async def stream_reply(
     caller uses this to drop its sticky plan-mode flag and stop sending
     ``agent="plan"``.
     """
-    transport = _make_transport(bot, chat_id, thread_id)
+    # The id of the most recent message this turn sent to the topic — live-edit
+    # bubbles and finalize chunks (via the transport) as well as approval
+    # prompts, question keyboards, and retry notices (noted at their send
+    # sites). The answer's finalize compares its streamed bubble against this to
+    # know whether other messages landed below it (Telegram ids are monotonic).
+    last_sent_id: int | None = None
+
+    def note_sent(message_id: int | None) -> None:
+        nonlocal last_sent_id
+        if message_id is not None:
+            last_sent_id = message_id
+
+    transport = _make_transport(bot, chat_id, thread_id, on_sent=note_sent)
     # sendMessageDraft is private-chat only; in the Bot API private chats have
     # positive ids and groups/supergroups negative ones, so the chat id alone
     # picks the streaming approach — no wasted draft call per group turn.
@@ -711,22 +763,24 @@ async def stream_reply(
         chunks = gfm_to_telegram(gfm)
         text = chunks[0] if chunks else f"🔐 Allow {tool}?"
         try:
-            await bot.send_message(
+            msg = await bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode="MarkdownV2",
                 reply_markup=keyboard,
                 **topic_kwargs,
             )
+            note_sent(getattr(msg, "message_id", None))
         except Exception:
             logger.debug("approval keyboard MarkdownV2 send failed; retrying plain", exc_info=True)
             try:
-                await bot.send_message(
+                msg = await bot.send_message(
                     chat_id=chat_id,
                     text=f"🔐 Allow {tool}? (see request)",
                     reply_markup=keyboard,
                     **topic_kwargs,
                 )
+                note_sent(getattr(msg, "message_id", None))
             except Exception:
                 logger.exception("failed to send approval keyboard; denying")
                 pending.discard(token)
@@ -839,13 +893,14 @@ async def stream_reply(
                 )
                 if index == 0 and plan_button is not None:
                     keyboard = InlineKeyboardMarkup([*keyboard.inline_keyboard, [plan_button]])
-                await bot.send_message(
+                msg = await bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     parse_mode="MarkdownV2",
                     reply_markup=keyboard,
                     **topic_kwargs,
                 )
+                note_sent(getattr(msg, "message_id", None))
             answers = await asyncio.gather(*futures)
         except asyncio.CancelledError:
             pending_questions.discard(token)
@@ -889,7 +944,8 @@ async def stream_reply(
             body += f"\n{detail}"
         body += "\nThis can take a while; send /cancel to stop waiting."
         try:
-            await bot.send_message(chat_id=chat_id, text=body, **topic_kwargs)
+            msg = await bot.send_message(chat_id=chat_id, text=body, **topic_kwargs)
+            note_sent(getattr(msg, "message_id", None))
         except Exception:
             logger.debug("failed to post retry notice", exc_info=True)
 
@@ -1059,8 +1115,10 @@ async def stream_reply(
 
     # Replace ephemeral drafts with real, persistent messages. Reasoning/progress
     # is intentionally separate from the answer; only emit the answer fallback if
-    # the turn produced nothing visible at all.
+    # the turn produced nothing visible at all. The reasoning stream keeps its
+    # position; the answer must end the turn, so its finalize gets the last sent
+    # id and re-sends at the bottom if anything landed below its bubble.
     if reasoning_draft.text.strip():
         await reasoning_draft.finalize()
     if answer_draft.text.strip() or not reasoning_draft.text.strip():
-        await answer_draft.finalize()
+        await answer_draft.finalize(latest_message_id=last_sent_id)

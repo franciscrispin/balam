@@ -14,14 +14,15 @@ from balam.streamer import (
 
 
 class FakeTransport:
-    """Records draft/message/edit calls; can simulate draft failures.
+    """Records draft/message/edit/delete calls; can simulate failures.
 
     ``send_message`` hands back an incrementing id so the live-edit fallback has a
     message to edit, mirroring the real transport.
     """
 
-    def __init__(self, *, fail_drafts: bool = False) -> None:
+    def __init__(self, *, fail_drafts: bool = False, fail_delete: bool = False) -> None:
         self.fail_drafts = fail_drafts
+        self.fail_delete = fail_delete
         self.ops: list[tuple[str, int | None, str]] = []
         self._next_id = 100
 
@@ -38,6 +39,11 @@ class FakeTransport:
 
     async def edit_message(self, message_id: int, text: str) -> None:
         self.ops.append(("edit", message_id, text))
+
+    async def delete_message(self, message_id: int) -> None:
+        if self.fail_delete:
+            raise RuntimeError("message can't be deleted")
+        self.ops.append(("delete", message_id, ""))
 
 
 # Identity-ish renderer so DraftSession tests are independent of markdown.
@@ -168,6 +174,45 @@ async def test_live_edit_defers_while_text_overflows_one_chunk() -> None:
     session.set_text("abcdefghij")  # two chunks immediately
     await session.flush_draft()
     assert t.ops == []  # nothing streamed yet
+
+
+async def test_finalize_reuses_bubble_when_it_is_still_the_latest_message() -> None:
+    # Nothing landed below the streamed bubble → edit it in place, no delete.
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_identity)
+    session.set_text("hi")
+    await session.flush_draft()  # live-edit bubble id 100
+    session.set_text("the answer")
+    await session.finalize(latest_message_id=100)
+    assert t.ops == [("message", None, "hi"), ("edit", 100, "the answer")]
+
+
+async def test_finalize_resends_at_bottom_when_bubble_is_stale() -> None:
+    # Another message (id 101) landed after the streamed bubble (id 100): the
+    # bubble is deleted and the text re-sent so it ends the turn.
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_identity)
+    session.set_text("hi")
+    await session.flush_draft()  # live-edit bubble id 100
+    session.set_text("the answer")
+    await session.finalize(latest_message_id=101)
+    assert t.ops == [
+        ("message", None, "hi"),
+        ("delete", 100, ""),
+        ("message", None, "the answer"),
+    ]
+
+
+async def test_finalize_edits_in_place_when_stale_bubble_delete_fails() -> None:
+    # A failed delete must not duplicate the text — fall back to editing the
+    # streamed bubble in place (the pre-fix behavior).
+    t = FakeTransport(fail_drafts=True, fail_delete=True)
+    session = DraftSession(t, draft_id=7, render=_identity)
+    session.set_text("hi")
+    await session.flush_draft()  # live-edit bubble id 100
+    session.set_text("the answer")
+    await session.finalize(latest_message_id=101)
+    assert t.ops == [("message", None, "hi"), ("edit", 100, "the answer")]
 
 
 async def test_finalize_sends_real_message() -> None:
@@ -550,6 +595,113 @@ async def test_stream_reply_separates_demoted_narration_blocks() -> None:
         ]
     )
     assert bot.messages == ["step one\n\nstep two", "the answer"]
+
+
+class PacedOpenCode(FakeOpenCode):
+    """Like FakeOpenCode, but a ``"SLEEP"`` sentinel in the event list yields to
+    the flush loop, so live-edit bubbles are created mid-stream (deterministic
+    ordering for the answer-ends-the-turn tests)."""
+
+    async def events(self, *, directory: str | None = None, ready: asyncio.Event | None = None):
+        self.events_directory = directory
+        if ready is not None:
+            ready.set()
+        for event in self._events:
+            if event == "SLEEP":
+                await asyncio.sleep(0.05)
+                continue
+            yield event
+
+
+class TimelineBot(FakeBot):
+    """A bot whose sends return real message ids and which records the full
+    send/edit/delete timeline — enough for the live-edit + delete paths."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._id = 100
+        self.timeline: list[tuple[str, int, str]] = []
+
+    async def send_message(self, *, text: str, reply_markup: object = None, **kwargs: object):
+        await super().send_message(text=text, reply_markup=reply_markup, **kwargs)
+        self._id += 1
+        self.timeline.append(("send", self._id, text))
+        return SimpleNamespace(message_id=self._id)
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, text: str, **kwargs: object
+    ) -> None:
+        self.timeline.append(("edit", message_id, text))
+
+    async def delete_message(self, *, chat_id: int, message_id: int) -> None:
+        self.timeline.append(("delete", message_id, ""))
+
+
+async def test_stream_reply_answer_ends_the_turn_after_progress_overflow() -> None:
+    # Regression for the trailing-progress quirk: when the reasoning stream
+    # overflows one chunk, finalize sends the overflow as new messages — which
+    # land below the already-created answer bubble. The answer must end the
+    # turn, so its stale bubble is deleted and the answer re-sent at the bottom.
+    long_reasoning = "thinking very hard about it " * 200  # > 4096 rendered
+    bot = TimelineBot()
+    await stream_reply(
+        bot=bot,
+        opencode=PacedOpenCode(
+            [
+                _msg_updated("assistant", AID),
+                _reasoning_part(AID, "thinking"),
+                "SLEEP",  # flush → reasoning bubble created
+                _text_part(AID, "the answer"),
+                "SLEEP",  # flush → answer bubble created below it
+                _reasoning_part(AID, long_reasoning),
+                "SLEEP",  # flush defers (overflows one chunk)
+                _ev("session.idle", sessionID=SID),
+            ]
+        ),
+        session_id=SID,
+        chat_id=-1003953430909,  # supergroup → live-edit streaming
+        thread_id=99,
+        prompt="hello",
+        draft_interval=0.01,
+    )
+    sends = [op for op in bot.timeline if op[0] == "send"]
+    reasoning_bubble_id = sends[0][1]
+    answer_bubble_id = sends[1][1]
+    # The reasoning overflow chunk(s) were sent after the answer bubble…
+    overflow_sends = [op for op in sends[2:] if op[2] != "the answer"]
+    assert overflow_sends, "expected the reasoning overflow to send new messages"
+    assert all(op[1] > answer_bubble_id for op in overflow_sends)
+    # …so the stale answer bubble is deleted and the answer re-sent last.
+    assert ("delete", answer_bubble_id, "") in bot.timeline
+    assert bot.timeline[-1][0] == "send"
+    assert bot.timeline[-1][2] == "the answer"
+    assert reasoning_bubble_id < answer_bubble_id
+
+
+async def test_stream_reply_answer_bubble_is_reused_when_nothing_landed_below() -> None:
+    # The common case must not churn: no overflow, no prompts → the streamed
+    # answer bubble is already the last message and is finalized in place.
+    bot = TimelineBot()
+    await stream_reply(
+        bot=bot,
+        opencode=PacedOpenCode(
+            [
+                _msg_updated("assistant", AID),
+                _reasoning_part(AID, "thinking"),
+                "SLEEP",  # flush → reasoning bubble created
+                _text_part(AID, "the answer"),
+                "SLEEP",  # flush → answer bubble created (and stays last)
+                _ev("session.idle", sessionID=SID),
+            ]
+        ),
+        session_id=SID,
+        chat_id=-1003953430909,
+        thread_id=99,
+        prompt="hello",
+        draft_interval=0.01,
+    )
+    assert not any(op[0] == "delete" for op in bot.timeline)
+    assert len([op for op in bot.timeline if op[0] == "send"]) == 2
 
 
 async def test_stream_reply_truncates_bash_output() -> None:
