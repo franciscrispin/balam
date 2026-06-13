@@ -21,6 +21,12 @@ Environment=GOPATH=/home/ubuntu/go
 # "cli"). This exposes plan_enter/plan_exit to the model so Telegram sessions
 # can enter plan mode; permissions.py allows both in the session ruleset.
 Environment=OPENCODE_EXPERIMENTAL_PLAN_MODE=true
+# Dedicated SQLite database. opencode migrates its DB forward on every boot
+# and migrations are one-way, so on the default shared DB any newer binary
+# booting anywhere on this VM (ivy, interactive runs) breaks this
+# still-running server mid-flight (2026-06-12: "NOT NULL constraint failed:
+# session_message.seq" on every prompt). Auth/logs/diffs stay shared.
+Environment=OPENCODE_DB=/home/ubuntu/.local/share/opencode/balam.db
 ExecStart=/home/ubuntu/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
 Restart=on-failure
 RestartSec=5s

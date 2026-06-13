@@ -43,7 +43,10 @@ sessions remain after local correlation.
 ## Important Local Paths
 
 - Repo: `/home/ubuntu/projects/balam`
-- OpenCode DB: `/home/ubuntu/.local/share/opencode/opencode.db`
+- OpenCode DB: `/home/ubuntu/.local/share/opencode/balam.db` (dedicated via
+  `OPENCODE_DB` in `balam-opencode.service` since 2026-06-13; seeded from the
+  previously shared `opencode.db`, so pre-split rows may belong to other
+  servers — ivy's `:4097`, interactive runs)
 - OpenCode session diffs:
   `/home/ubuntu/.local/share/opencode/storage/session_diff/*.json`
 - OpenCode file logs: `/home/ubuntu/.local/share/opencode/log/*.log`
@@ -75,7 +78,7 @@ Systemd units used by the deployed stack:
 If the user gives a `ses_...` id, verify it exists:
 
 ```sh
-sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
+sqlite3 -header -column "/home/ubuntu/.local/share/opencode/balam.db" \
   "SELECT id, directory, title,
           datetime(time_created/1000, 'unixepoch', 'localtime') AS created,
           datetime(time_updated/1000, 'unixepoch', 'localtime') AS updated,
@@ -87,7 +90,7 @@ sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
 If the user gives no id, list recent Balam workspace sessions:
 
 ```sh
-sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
+sqlite3 -header -column "/home/ubuntu/.local/share/opencode/balam.db" \
   "SELECT id, directory, title,
           datetime(time_created/1000, 'unixepoch', 'localtime') AS created,
           datetime(time_updated/1000, 'unixepoch', 'localtime') AS updated,
@@ -102,7 +105,7 @@ If the user gives text from the conversation or an error string, search message
 and part JSON for it. Escape single quotes in the search string.
 
 ```sh
-sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
+sqlite3 -header -column "/home/ubuntu/.local/share/opencode/balam.db" \
   "SELECT DISTINCT session_id,
           datetime(time_updated/1000, 'unixepoch', 'localtime') AS updated
      FROM message
@@ -120,7 +123,7 @@ sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
 First list user and assistant message boundaries:
 
 ```sh
-sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
+sqlite3 -header -column "/home/ubuntu/.local/share/opencode/balam.db" \
   "SELECT id, json_extract(data, '$.role') AS role,
           datetime(time_created/1000, 'unixepoch', 'localtime') AS created,
           datetime(time_updated/1000, 'unixepoch', 'localtime') AS updated
@@ -132,7 +135,7 @@ sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
 Preview text parts without dumping everything:
 
 ```sh
-sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
+sqlite3 -header -column "/home/ubuntu/.local/share/opencode/balam.db" \
   "SELECT message_id,
           json_extract(data, '$.type') AS type,
           substr(json_extract(data, '$.text'), 1, 240) AS text_preview,
@@ -146,7 +149,7 @@ sqlite3 -header -column "/home/ubuntu/.local/share/opencode/opencode.db" \
 When full conversation content is needed, query the specific session only:
 
 ```sh
-sqlite3 -json "/home/ubuntu/.local/share/opencode/opencode.db" \
+sqlite3 -json "/home/ubuntu/.local/share/opencode/balam.db" \
   "SELECT message_id, time_created, time_updated, data
      FROM part
     WHERE session_id = '<SESSION_ID>'
