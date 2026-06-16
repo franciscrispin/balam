@@ -22,6 +22,7 @@ from balam.agent.backend import TurnRequest
 from balam.agent.claude_sdk_backend import ClaudeSdkBackend
 from balam.agent.events import (
     PermissionRequested,
+    QuestionAsked,
     SessionStarted,
     TextUpdated,
     ToolUpdated,
@@ -183,6 +184,63 @@ async def test_permission_allow_reply() -> None:
             await backend.reply_permission(event.request_id, allow=True)
 
     assert isinstance(captured[0], PermissionResultAllow)
+
+
+async def test_plan_mode_sets_permission_mode() -> None:
+    seen_options: list = []
+
+    def query_fn(*, prompt, options):
+        seen_options.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    await _collect(ClaudeSdkBackend(query_fn=query_fn), _turn(plan_mode=True))
+    assert seen_options[0].permission_mode == "plan"
+
+
+async def test_exit_plan_mode_becomes_plan_question_yes_allows() -> None:
+    captured: list = []
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            yield _init()
+            ctx = SimpleNamespace(tool_use_id="t1")
+            captured.append(await options.can_use_tool("ExitPlanMode", {"plan": "# Do X"}, ctx))
+            yield _result()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    async for event in backend.run_turn(_turn(plan_mode=True)):
+        if isinstance(event, QuestionAsked):
+            assert event.plan_text == "# Do X"
+            assert event.questions[0]["options"] == [{"label": "Yes"}, {"label": "No"}]
+            await backend.reply_question(event.request_id, [["Yes"]])
+
+    assert isinstance(captured[0], PermissionResultAllow)
+
+
+async def test_exit_plan_mode_no_denies() -> None:
+    captured: list = []
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            yield _init()
+            ctx = SimpleNamespace(tool_use_id="t1")
+            captured.append(await options.can_use_tool("ExitPlanMode", {"plan": "# Do X"}, ctx))
+            yield _result()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    async for event in backend.run_turn(_turn(plan_mode=True)):
+        if isinstance(event, QuestionAsked):
+            await backend.reply_question(event.request_id, [["No"]])
+
+    assert isinstance(captured[0], PermissionResultDeny)
 
 
 async def test_resume_and_model_effort_passed_to_options() -> None:

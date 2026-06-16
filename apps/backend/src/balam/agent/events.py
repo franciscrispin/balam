@@ -107,16 +107,17 @@ class QuestionAsked:
     streamer already renders: a list of ``{question, header, options:[{label,
     description}], multiple, custom}``. ``call_id`` links back to the owning tool.
 
-    ``plan_path`` is set when this question is a plan-approval (OpenCode's
-    ``plan_exit`` or the SDK's ``ExitPlanMode``); the backend resolves it because
-    locating the plan is a wire-specific detail. The streamer uses it to snapshot
-    the plan for the "View plan" button and to recognise plan approval ("Yes").
+    A plan-approval (OpenCode's ``plan_exit`` or the SDK's ``ExitPlanMode``)
+    carries the plan so the streamer can offer a "View plan" button and recognise
+    approval ("Yes"). The backend supplies whichever it has: ``plan_path`` (a
+    file, OpenCode) or ``plan_text`` (inline, the SDK's ExitPlanMode input).
     """
 
     request_id: str
     questions: list[dict[str, Any]]
     call_id: str | None = None
     plan_path: str | None = None
+    plan_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

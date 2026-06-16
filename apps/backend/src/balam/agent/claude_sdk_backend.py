@@ -48,6 +48,7 @@ from balam.agent.backend import TurnRequest
 from balam.agent.events import (
     AgentEvent,
     PermissionRequested,
+    QuestionAsked,
     ReasoningUpdated,
     RetryNotice,
     SessionStarted,
@@ -195,7 +196,10 @@ class ClaudeSdkBackend:
             env["ANTHROPIC_API_KEY"] = self._api_key
         kwargs: dict[str, Any] = {
             "cwd": turn.directory,
-            "permission_mode": "default",
+            # Plan mode gates writes and lets the agent call ExitPlanMode when it
+            # is ready to build; a default turn keeps native natural-language
+            # planning available without forcing the formal mode.
+            "permission_mode": "plan" if turn.plan_mode else "default",
             "can_use_tool": can_use_tool,
             "include_partial_messages": True,
             # Keep Claude Code's native behavior (incl. natural-language planning).
@@ -224,6 +228,7 @@ class ClaudeSdkBackend:
         cur_msg_id: str | None = None
         block_text: dict[int, str] = {}
         owned_perms: set[str] = set()
+        owned_questions: set[str] = set()
 
         def maybe_session(session_id: str | None) -> None:
             nonlocal session_started
@@ -231,9 +236,45 @@ class ClaudeSdkBackend:
                 session_started = True
                 queue.put_nowait(SessionStarted(session_id))
 
+        async def ask_plan_exit(
+            input_data: dict[str, Any],
+        ) -> PermissionResultAllow | PermissionResultDeny:
+            """Surface ExitPlanMode as a Yes/No plan-approval question. "Yes"
+            allows the agent to leave plan mode and build in this same turn; the
+            streamer also drops the sticky plan flag so later turns run normally.
+            "No" denies it, keeping the agent in planning."""
+            request_id = f"q_{uuid.uuid4().hex[:16]}"
+            future: asyncio.Future[list[list[str]] | None] = loop.create_future()
+            self._pending_questions[request_id] = future
+            owned_questions.add(request_id)
+            await queue.put(
+                QuestionAsked(
+                    request_id=request_id,
+                    questions=[
+                        {
+                            "question": "The plan is complete. Build it?",
+                            "header": "Plan",
+                            "options": [{"label": "Yes"}, {"label": "No"}],
+                            "multiple": False,
+                            "custom": False,
+                        }
+                    ],
+                    plan_text=input_data.get("plan"),
+                )
+            )
+            try:
+                answers = await future
+            finally:
+                self._pending_questions.pop(request_id, None)
+            if answers and answers[0] == ["Yes"]:
+                return PermissionResultAllow()
+            return PermissionResultDeny(message="Keep planning; the plan was not approved.")
+
         async def can_use_tool(
             tool_name: str, input_data: dict[str, Any], ctx: Any
         ) -> PermissionResultAllow | PermissionResultDeny:
+            if tool_name == "ExitPlanMode":
+                return await ask_plan_exit(input_data)
             request_id = f"perm_{uuid.uuid4().hex[:16]}"
             norm = _normalize_input(input_data)
             category = _category(tool_name)
@@ -372,4 +413,8 @@ class ClaudeSdkBackend:
                 future = self._pending_perms.pop(request_id, None)
                 if future is not None and not future.done():
                     future.cancel()
+            for request_id in list(owned_questions):
+                qfuture = self._pending_questions.pop(request_id, None)
+                if qfuture is not None and not qfuture.done():
+                    qfuture.cancel()
             await asyncio.gather(driver_task, return_exceptions=True)

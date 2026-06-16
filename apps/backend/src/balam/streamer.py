@@ -758,18 +758,24 @@ async def stream_reply(
             await backend.reject_question(request.request_id, directory=directory)
             return
 
-        # A plan-approval carries the freshly written plan (the backend located
-        # it): snapshot it and ride a "View plan" button on the question keyboard.
+        # A plan-approval carries the freshly written plan: snapshot it and ride a
+        # "View plan" button on the question keyboard. The backend supplies either
+        # an inline ``plan_text`` (SDK) or a ``plan_path`` to read (OpenCode).
         # Strictly best-effort — any failure (file unreadable, no public URL) must
         # never block the Yes/No flow, which is what actually answers the agent.
-        plan_path = request.plan_path
+        is_plan = request.plan_path is not None or request.plan_text is not None
         plan_button: InlineKeyboardButton | None = None
-        if plan_view is not None and plan_path is not None:
+        if plan_view is not None and is_plan:
             try:
-                plan_text = await asyncio.to_thread(Path(plan_path).read_text, "utf-8", "replace")
-                plan_button = plan_view(os.path.basename(plan_path), plan_text)
+                if request.plan_text is not None:
+                    plan_button = plan_view("Plan", request.plan_text)
+                elif request.plan_path is not None:
+                    text = await asyncio.to_thread(
+                        Path(request.plan_path).read_text, "utf-8", "replace"
+                    )
+                    plan_button = plan_view(os.path.basename(request.plan_path), text)
             except Exception:
-                logger.debug("could not snapshot plan at %s", plan_path, exc_info=True)
+                logger.debug("could not snapshot plan", exc_info=True)
 
         token, futures = pending_questions.register(
             sid or "",
@@ -814,7 +820,7 @@ async def stream_reply(
         # "Yes" to a plan-approval makes the agent switch to building, so the
         # caller's sticky plan-mode flag must drop with it — else the next prompt
         # would force it straight back into plan mode. "No" keeps plan mode.
-        if plan_path is not None and on_plan_approved is not None:
+        if is_plan and on_plan_approved is not None:
             if answers and answers[0] == ["Yes"]:
                 on_plan_approved()
 
