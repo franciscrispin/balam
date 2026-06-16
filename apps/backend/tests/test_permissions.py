@@ -1,5 +1,5 @@
 from balam.contexts import ContextConfig
-from balam.permissions import build_ruleset, parse_allowed_tool, send_file_rules
+from balam.permissions import build_ruleset, evaluate, parse_allowed_tool, send_file_rules
 
 
 def _ctx(**kwargs) -> ContextConfig:
@@ -112,3 +112,42 @@ def test_additional_directories_get_external_directory_grant() -> None:
     patterns = [r["pattern"] for r in rules if r["permission"] == "external_directory"]
     assert patterns == ["/work/lib/*", "/work/docs/*"]
     assert all(r["action"] == "allow" for r in rules if r["permission"] == "external_directory")
+
+
+# ---- evaluate (last-match-wins, ported from OpenCode) -------------------------
+
+
+def test_evaluate_defaults_to_ask_when_no_rule_matches() -> None:
+    assert evaluate("bash", "git status", []) == "ask"
+
+
+def test_evaluate_last_matching_rule_wins() -> None:
+    ruleset = [
+        {"permission": "*", "pattern": "*", "action": "ask"},
+        {"permission": "read", "pattern": "*", "action": "allow"},
+    ]
+    assert evaluate("read", "/work/balam/a.py", ruleset) == "allow"
+    assert evaluate("bash", "ls", ruleset) == "ask"
+
+
+def test_evaluate_path_glob_matches_across_slashes() -> None:
+    ruleset = [{"permission": "edit", "pattern": "work/balam/**", "action": "allow"}]
+    assert evaluate("edit", "work/balam/src/x.py", ruleset) == "allow"
+    assert evaluate("edit", "work/other/x.py", ruleset) == "ask"
+
+
+def test_evaluate_deny_overrides_earlier_allow() -> None:
+    ruleset = [
+        {"permission": "balam_t5_send_file", "pattern": "*", "action": "allow"},
+        {"permission": "balam_*_send_file", "pattern": "*", "action": "deny"},
+    ]
+    # Last match wins: the glob deny comes after, so it denies.
+    assert evaluate("balam_t5_send_file", "*", ruleset) == "deny"
+
+
+def test_evaluate_against_build_ruleset_preapproves_opt_in() -> None:
+    ctx = _ctx(allowed_tools=["Bash(git *)", "Read"])
+    ruleset = build_ruleset(ctx)
+    assert evaluate("bash", "git status", ruleset) == "allow"
+    assert evaluate("bash", "rm -rf /", ruleset) == "ask"
+    assert evaluate("read", "work/balam/x.py", ruleset) == "allow"
