@@ -203,6 +203,23 @@ def _content_blocks(prompt: str, files: list[Any]) -> str | list[dict[str, Any]]
     return blocks
 
 
+def _is_resumable(session_id: str | None) -> bool:
+    """Whether ``session_id`` can be passed to the SDK's ``--resume``.
+
+    SDK sessions are UUIDs; the CLI hard-errors on anything else. A topic carried
+    over from the OpenCode backend has a ``ses_…`` id, so we must NOT resume it —
+    omitting resume starts a fresh SDK session, and the streamer persists the new
+    id, transparently rebinding the topic on its first turn after a backend switch.
+    """
+    if not session_id:
+        return False
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        return False
+    return True
+
+
 def _eval_target(category: str, tool_input: dict[str, Any]) -> str:
     """The resource a tool call acts on, for :func:`evaluate` (leading slash
     stripped to match ``build_ruleset``'s file-path patterns)."""
@@ -340,7 +357,7 @@ class ClaudeSdkBackend:
             "setting_sources": [],
             "env": env,
         }
-        if turn.session_id:
+        if _is_resumable(turn.session_id):
             kwargs["resume"] = turn.session_id
         if turn.model:
             kwargs["model"] = turn.model

@@ -338,6 +338,39 @@ async def test_send_file_registered_as_sdk_tool_and_preapproved() -> None:
     assert "mcp__balam__send_file" in opts.allowed_tools
 
 
+async def test_non_uuid_session_id_is_not_resumed() -> None:
+    # A topic carried over from the OpenCode backend has a ses_… id; resuming it
+    # would hard-fail the SDK, so resume must be omitted (start fresh).
+    seen: list = []
+
+    def query_fn(*, prompt, options):
+        seen.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    await _collect(ClaudeSdkBackend(query_fn=query_fn), _turn(session_id="ses_opencode_legacy"))
+    assert seen[0].resume is None
+
+
+async def test_uuid_session_id_is_resumed() -> None:
+    seen: list = []
+
+    def query_fn(*, prompt, options):
+        seen.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    uid = "6ec73cf3-1da4-4ad8-923f-18da769179f2"
+    await _collect(ClaudeSdkBackend(query_fn=query_fn), _turn(session_id=uid))
+    assert seen[0].resume == uid
+
+
 async def test_resume_and_model_effort_passed_to_options() -> None:
     seen_options: list = []
 
@@ -350,12 +383,13 @@ async def test_resume_and_model_effort_passed_to_options() -> None:
         return gen()
 
     backend = ClaudeSdkBackend(api_key="sk-x", query_fn=query_fn)
+    prev = "11111111-2222-3333-4444-555555555555"
     await _collect(
         backend,
-        _turn(session_id="ses_prev", model="claude-opus-4-8", effort="high"),
+        _turn(session_id=prev, model="claude-opus-4-8", effort="high"),
     )
     opts = seen_options[0]
-    assert opts.resume == "ses_prev"
+    assert opts.resume == prev
     assert opts.model == "claude-opus-4-8"
     assert opts.effort == "high"
     assert opts.cwd == "/ws"
