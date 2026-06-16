@@ -35,6 +35,7 @@ from telegram.ext import (
     filters,
 )
 
+from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
@@ -332,14 +333,14 @@ def _start_turn(
     async def run() -> None:
         cancelled = False
         try:
-            # Sticky plan mode (/plan): OpenCode's agent selection is per-prompt,
-            # so every prompt while the flag is set must request the plan agent.
-            # Read at turn start — not at enqueue — so a job that waited in the
-            # queue respects a plan approval or /plan off issued in the meantime.
-            agent = "plan" if router.plan_mode(chat_id, thread_id) else None
+            # Sticky plan mode (/plan): the backend maps it to the plan agent /
+            # plan permission mode per turn. Read at turn start — not at enqueue —
+            # so a job that waited in the queue respects a plan approval or
+            # /plan off issued in the meantime.
+            plan_mode = router.plan_mode(chat_id, thread_id)
             await stream_reply(
                 bot=context.bot,
-                opencode=opencode,
+                backend=OpenCodeBackend(opencode),
                 session_id=job.session_id,
                 chat_id=chat_id,
                 thread_id=thread_id,
@@ -354,7 +355,7 @@ def _start_turn(
                 ),
                 allowed_dirs=job.allowed_dirs,
                 files=job.files,
-                agent=agent,
+                plan_mode=plan_mode,
                 plan_view=plan_view,
                 on_plan_approved=_on_plan_approved,
             )

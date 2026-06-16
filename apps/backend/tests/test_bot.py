@@ -764,8 +764,8 @@ async def test_queued_message_reads_plan_mode_at_drain_time(monkeypatch) -> None
     gate = asyncio.Event()
     first_started = asyncio.Event()
 
-    async def fake_stream_reply(*, prompt: str, agent: object = None, **_: object) -> None:
-        agents.append((prompt, agent))
+    async def fake_stream_reply(*, prompt: str, plan_mode: bool = False, **_: object) -> None:
+        agents.append((prompt, plan_mode))
         if prompt == "first":
             first_started.set()
             await gate.wait()
@@ -792,7 +792,7 @@ async def test_queued_message_reads_plan_mode_at_drain_time(monkeypatch) -> None
     while (turn := turns.get(SUPERGROUP, 5)) is not None:
         await turn.task
 
-    assert agents == [("first", "plan"), ("second", None)]
+    assert agents == [("first", True), ("second", False)]
 
 
 async def test_cancel_drops_queued_messages(monkeypatch) -> None:
