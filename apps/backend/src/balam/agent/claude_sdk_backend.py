@@ -578,7 +578,15 @@ class ClaudeSdkBackend:
                                     handle_tool_result(block)
 
                     elif isinstance(message, RateLimitEvent):
-                        await queue.put(RetryNotice(detail="the model provider is rate-limited"))
+                        # RateLimitEvent is emitted routinely with quota status;
+                        # only surface a notice when actually throttled, not for
+                        # the "allowed"/"allowed_warning" informational updates.
+                        info = message.rate_limit_info
+                        if getattr(info, "status", None) == "rejected":
+                            detail = "the model provider is rate-limited"
+                            if getattr(info, "rate_limit_type", None):
+                                detail += f" ({info.rate_limit_type})"
+                            await queue.put(RetryNotice(detail=detail))
 
                     elif isinstance(message, ResultMessage):
                         maybe_session(message.session_id)
