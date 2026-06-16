@@ -5,7 +5,9 @@ from pydantic import ValidationError
 
 from balam.config import Config
 
-_BASE = {"telegram_bot_token": "t", "allowed_telegram_user_id": 1}
+# _env_file=None keeps these hermetic — the real repo-root .env (which may set
+# AGENT_BACKEND for a live run) must not leak into the defaults under test.
+_BASE = {"telegram_bot_token": "t", "allowed_telegram_user_id": 1, "_env_file": None}
 
 
 def test_agent_backend_defaults_to_opencode() -> None:
