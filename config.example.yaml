@@ -14,7 +14,9 @@ contexts:
   balam:
     directory: /home/ubuntu/projects/balam
     description: "AI assistant"
-    # model: anthropic/claude-opus-4-8   # optional; must be provider/model
+    # model: anthropic/claude-opus-4-8   # optional. OpenCode wants provider/model;
+    #                                    # the Claude Agent SDK (AGENT_BACKEND=claude_sdk)
+    #                                    # wants a bare Claude id/alias, e.g. claude-opus-4-8.
     # effort: medium                     # optional: low | medium | high | xhigh | max
     allowed_tools:
       - LSP

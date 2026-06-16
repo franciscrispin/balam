@@ -11,7 +11,12 @@ agent's Chrome). Runs locally on an Ubuntu VM for **one** user.
 **Read `docs/architecture-decisions.md` first** — the ADRs are the authoritative
 design and the reasons behind the choices summarized here. Load-bearing:
 **ADR-0011, the backend is Python** (FastAPI + python-telegram-bot, OpenCode over
-HTTP); the frontend stays TypeScript (ADR-0003).
+HTTP); the frontend stays TypeScript (ADR-0003). The agent runtime is
+**pluggable** (ADR-0014): `AGENT_BACKEND` selects OpenCode (default) or the
+in-process **Claude Agent SDK**; both implement `AgentBackend` and emit the
+normalized `balam.agent.events` vocabulary, so the streamer/router/permissions
+stay backend-agnostic. SDK mode runs Claude models (a context `model` is then a
+bare Claude id).
 
 > Status: core features built — the bot↔agent round-trip over forum topics,
 > workspace contexts + `/context`, plan mode (`/plan`), and the Mini App
@@ -72,9 +77,12 @@ OpenCode server (separate process, NOT in this repo) — the agent: model + loca
 ```
 
 Backend modules (`apps/backend/src/balam/`): `config.py` (env validation),
-`contexts.py` (`config.yaml` workspace contexts), `opencode.py` (httpx HTTP/SSE
-client), `store.py` (sqlite3 topic→session map), `router.py` (topic→context→
-session, lazy create; registers Balam's per-topic MCP tool server),
+`contexts.py` (`config.yaml` workspace contexts), `agent/` (the `AgentBackend`
+seam, ADR-0014: `events.py` normalized event types, `backend.py` protocol +
+`TurnRequest`, `opencode_backend.py`, `claude_sdk_backend.py`), `opencode.py`
+(httpx HTTP/SSE client wrapped by `OpenCodeBackend`), `store.py` (sqlite3
+topic→session map), `router.py` (topic→context→session, lazy create; registers
+Balam's per-topic MCP tool server),
 `markdown.py` (GFM→MarkdownV2), `streamer.py` (animated `send_message_draft`
 streaming), `bot.py` (PTB: allowlist, chat scoping, message handler, `/context`,
 `setMyCommands`), `server.py` (FastAPI Mini App + `/api` + `/mcp` routes),
