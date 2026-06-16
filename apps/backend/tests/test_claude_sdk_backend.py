@@ -19,7 +19,7 @@ from claude_agent_sdk import (
 )
 
 from balam.agent.backend import TurnRequest
-from balam.agent.claude_sdk_backend import ClaudeSdkBackend
+from balam.agent.claude_sdk_backend import ClaudeSdkBackend, coerce_sdk_mcp_config
 from balam.agent.events import (
     PermissionRequested,
     QuestionAsked,
@@ -29,6 +29,7 @@ from balam.agent.events import (
     TurnFailed,
     TurnFinished,
 )
+from balam.agent_tools import AgentTool
 
 SID = "ses_sdk"
 
@@ -241,6 +242,100 @@ async def test_exit_plan_mode_no_denies() -> None:
             await backend.reply_question(event.request_id, [["No"]])
 
     assert isinstance(captured[0], PermissionResultDeny)
+
+
+def test_coerce_mcp_local_to_stdio() -> None:
+    out = coerce_sdk_mcp_config("x", {"type": "local", "command": ["uvx", "srv", "--flag"]})
+    assert out == {"type": "stdio", "command": "uvx", "args": ["srv", "--flag"]}
+
+
+def test_coerce_mcp_command_shorthand() -> None:
+    out = coerce_sdk_mcp_config("x", {"command": "uvx", "args": ["srv"], "env": {"K": "v"}})
+    assert out == {"type": "stdio", "command": "uvx", "args": ["srv"], "env": {"K": "v"}}
+
+
+def test_coerce_mcp_remote_variants() -> None:
+    assert coerce_sdk_mcp_config("x", {"type": "sse", "url": "http://h/sse"})["type"] == "sse"
+    assert coerce_sdk_mcp_config("x", {"type": "http", "url": "http://h"})["type"] == "http"
+    # OpenCode's collapsed "remote" defaults to http.
+    assert coerce_sdk_mcp_config("x", {"type": "remote", "url": "http://h"})["type"] == "http"
+
+
+async def test_context_mcp_servers_passed_as_sdk_shape() -> None:
+    seen: list = []
+
+    def query_fn(*, prompt, options):
+        seen.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    await _collect(
+        backend,
+        _turn(mcp={"github": {"command": "uvx", "args": ["mcp-github"]}}),
+    )
+    assert seen[0].mcp_servers["github"] == {
+        "type": "stdio",
+        "command": "uvx",
+        "args": ["mcp-github"],
+    }
+
+
+async def test_allowed_tool_is_preapproved_without_human() -> None:
+    # A context that pre-approves Bash(git *) must auto-allow `git status` with no
+    # PermissionRequested reaching the streamer.
+    captured: list = []
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            yield _init()
+            ctx = SimpleNamespace(tool_use_id="t1")
+            captured.append(await options.can_use_tool("Bash", {"command": "git status"}, ctx))
+            yield _result()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    requests: list = []
+    async for event in backend.run_turn(_turn(allowed_tools=["Bash(git *)"])):
+        if isinstance(event, PermissionRequested):
+            requests.append(event)
+    assert isinstance(captured[0], PermissionResultAllow)
+    assert requests == []  # never bugged the human
+
+
+async def test_send_file_registered_as_sdk_tool_and_preapproved() -> None:
+    seen: list = []
+
+    def query_fn(*, prompt, options):
+        seen.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    async def _handler(args):
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    def factory(chat_id, thread_id):
+        assert (chat_id, thread_id) == (42, 7)
+        return AgentTool(
+            name="send_file",
+            description="send a file",
+            input_schema={"type": "object"},
+            read_only=True,
+            handler=_handler,
+        )
+
+    backend = ClaudeSdkBackend(send_file_factory=factory, query_fn=query_fn)
+    await _collect(backend, _turn(chat_id=42, thread_id=7))
+    opts = seen[0]
+    assert "balam" in opts.mcp_servers
+    assert "mcp__balam__send_file" in opts.allowed_tools
 
 
 async def test_resume_and_model_effort_passed_to_options() -> None:

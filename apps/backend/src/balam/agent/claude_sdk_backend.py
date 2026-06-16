@@ -41,7 +41,9 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
+    create_sdk_mcp_server,
     query,
+    tool,
 )
 
 from balam.agent.backend import TurnRequest
@@ -57,6 +59,9 @@ from balam.agent.events import (
     TurnFailed,
     TurnFinished,
 )
+from balam.agent_tools import AgentTool
+from balam.contexts import ContextConfig
+from balam.permissions import build_ruleset, evaluate
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +128,71 @@ def _normalize_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return tool_input
 
 
+def coerce_sdk_mcp_config(name: str, raw_config: Any) -> dict[str, Any]:
+    """Normalise one context MCP server entry into the SDK's ``mcp_servers`` shape.
+
+    Mirrors :func:`balam.opencode.coerce_mcp_config` but targets the SDK's TypedDicts:
+    stdio ``{"type":"stdio","command","args","env"}`` and remote
+    ``{"type":"sse"|"http","url","headers"}``. The same loose ``config.yaml``
+    spellings are accepted (already env-expanded + shape-validated at load).
+    """
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"MCP server {name!r} config must be a mapping")
+    config = dict(raw_config)
+
+    # `command: "uvx"` + `args: [...]` shorthand → an stdio server.
+    if "command" in config and config.get("type") not in {"local", "remote", "http", "sse"}:
+        command = config["command"]
+        if not isinstance(command, str) or not command:
+            raise ValueError(f"MCP server {name!r} command must be a non-empty string")
+        out: dict[str, Any] = {"type": "stdio", "command": command}
+        args = config.get("args", [])
+        if args:
+            out["args"] = [str(a) for a in args]
+        env = config.get("env", config.get("environment"))
+        if env:
+            out["env"] = {str(k): str(v) for k, v in env.items()}
+        return out
+
+    cfg_type = config.get("type")
+    if cfg_type == "local":
+        command = config.get("command")
+        if not isinstance(command, list) or not command:
+            raise ValueError(f"MCP server {name!r} local command must be a non-empty list")
+        out = {"type": "stdio", "command": str(command[0])}
+        if len(command) > 1:
+            out["args"] = [str(a) for a in command[1:]]
+        env = config.get("environment", config.get("env"))
+        if env:
+            out["env"] = {str(k): str(v) for k, v in env.items()}
+        return out
+
+    if cfg_type in {"remote", "http", "sse"}:
+        url = config.get("url")
+        if not isinstance(url, str) or not url:
+            raise ValueError(f"MCP server {name!r} remote config requires a url")
+        # OpenCode collapses http/sse to "remote"; default that to http here.
+        out = {"type": "sse" if cfg_type == "sse" else "http", "url": url}
+        headers = config.get("headers")
+        if isinstance(headers, dict):
+            out["headers"] = {str(k): str(v) for k, v in headers.items()}
+        return out
+
+    raise ValueError(f"MCP server {name!r} must be local (command) or remote (url)")
+
+
+def _eval_target(category: str, tool_input: dict[str, Any]) -> str:
+    """The resource a tool call acts on, for :func:`evaluate` (leading slash
+    stripped to match ``build_ruleset``'s file-path patterns)."""
+    if category == "bash":
+        return tool_input.get("command") or "*"
+    path = tool_input.get("filePath") or tool_input.get("path")
+    if isinstance(path, str) and path:
+        return path[1:] if path.startswith("/") else path
+    return "*"
+
+
+SendFileFactory = Callable[[int, int | None], "AgentTool | None"]
 QueryFn = Callable[..., AsyncIterator[Any]]
 
 
@@ -138,10 +208,12 @@ class ClaudeSdkBackend:
         *,
         api_key: str | None = None,
         cli_path: str | None = None,
+        send_file_factory: SendFileFactory | None = None,
         query_fn: QueryFn = query,
     ) -> None:
         self._api_key = api_key
         self._cli_path = cli_path
+        self._send_file_factory = send_file_factory
         self._query = query_fn
         # request_id -> future resolved by reply_permission / reply_question.
         self._pending_perms: dict[str, asyncio.Future[tuple[bool, str | None]]] = {}
@@ -188,9 +260,40 @@ class ClaudeSdkBackend:
         if future is not None and not future.done():
             future.set_result(None)
 
-    def _build_options(self, turn: TurnRequest, can_use_tool: Any) -> ClaudeAgentOptions:
-        """Translate a turn + context into per-turn SDK options. Plan mode, MCP
-        servers, and the send_file tool are layered in by later commits."""
+    def _mcp_setup(self, turn: TurnRequest) -> tuple[dict[str, Any], list[str]]:
+        """The turn's MCP servers + the tools to pre-approve natively.
+
+        Context ``mcp`` servers are coerced to the SDK shape; Balam's own
+        ``send_file`` is added as an in-process SDK tool (no HTTP server / scope
+        token needed — the closure already carries the topic) and pre-approved so
+        it runs without the keyboard, matching OpenCode's send_file_rules allow.
+        """
+        servers: dict[str, Any] = {}
+        for name, raw in (turn.mcp or {}).items():
+            try:
+                servers[name] = coerce_sdk_mcp_config(name, raw)
+            except ValueError:
+                logger.warning("skipping unusable MCP server %r for the SDK backend", name)
+
+        allowed: list[str] = []
+        if self._send_file_factory is not None and turn.chat_id is not None:
+            agent_tool = self._send_file_factory(turn.chat_id, turn.thread_id)
+            if agent_tool is not None:
+                sdk_tool = tool(
+                    agent_tool.name, agent_tool.description, agent_tool.input_schema
+                )(agent_tool.handler)
+                servers["balam"] = create_sdk_mcp_server(name="balam", tools=[sdk_tool])
+                allowed.append(f"mcp__balam__{agent_tool.name}")
+        return servers, allowed
+
+    def _build_options(
+        self,
+        turn: TurnRequest,
+        can_use_tool: Any,
+        mcp_servers: dict[str, Any],
+        allowed_tools: list[str],
+    ) -> ClaudeAgentOptions:
+        """Translate a turn + context into per-turn SDK options."""
         env: dict[str, str] = {}
         if self._api_key:
             env["ANTHROPIC_API_KEY"] = self._api_key
@@ -214,6 +317,10 @@ class ClaudeSdkBackend:
             kwargs["effort"] = turn.effort
         if turn.additional_directories:
             kwargs["add_dirs"] = list(turn.additional_directories)
+        if mcp_servers:
+            kwargs["mcp_servers"] = mcp_servers
+        if allowed_tools:
+            kwargs["allowed_tools"] = allowed_tools
         if self._cli_path:
             kwargs["cli_path"] = self._cli_path
         return ClaudeAgentOptions(**kwargs)
@@ -229,6 +336,18 @@ class ClaudeSdkBackend:
         block_text: dict[int, str] = {}
         owned_perms: set[str] = set()
         owned_questions: set[str] = set()
+
+        # The context's opt-in ruleset, evaluated in process to pre-approve tool
+        # calls the user allowed (the SDK has no server to delegate this to).
+        ruleset: list[dict[str, str]] = []
+        if turn.directory:
+            ctx = ContextConfig(
+                directory=turn.directory,
+                description="",
+                allowed_tools=list(turn.allowed_tools),
+                additional_directories=list(turn.additional_directories),
+            )
+            ruleset = build_ruleset(ctx)
 
         def maybe_session(session_id: str | None) -> None:
             nonlocal session_started
@@ -275,9 +394,16 @@ class ClaudeSdkBackend:
         ) -> PermissionResultAllow | PermissionResultDeny:
             if tool_name == "ExitPlanMode":
                 return await ask_plan_exit(input_data)
-            request_id = f"perm_{uuid.uuid4().hex[:16]}"
             norm = _normalize_input(input_data)
             category = _category(tool_name)
+            # Pre-approve (or deny) against the context's opt-in ruleset in
+            # process; only "ask" falls through to the human via the streamer.
+            effect = evaluate(category, _eval_target(category, norm), ruleset)
+            if effect == "allow":
+                return PermissionResultAllow()
+            if effect == "deny":
+                return PermissionResultDeny(message="Denied by the context's tool policy.")
+            request_id = f"perm_{uuid.uuid4().hex[:16]}"
             metadata: dict[str, Any] = {}
             if category == "edit" and norm.get("filePath"):
                 metadata = {"files": [{"filePath": norm["filePath"]}]}
@@ -316,9 +442,11 @@ class ClaudeSdkBackend:
                 )
             )
 
+        mcp_servers, allowed_tools = self._mcp_setup(turn)
+
         async def driver() -> None:
             nonlocal cur_msg_id
-            options = self._build_options(turn, can_use_tool)
+            options = self._build_options(turn, can_use_tool, mcp_servers, allowed_tools)
             try:
                 async for message in self._query(prompt=turn.prompt, options=options):
                     if isinstance(message, SystemMessage):
