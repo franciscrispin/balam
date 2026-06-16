@@ -21,10 +21,12 @@ from balam.agent.events import (
     TurnFailed,
     TurnFinished,
 )
+from balam.agent.opencode_backend import OpenCodeBackend
 
 __all__ = [
     "AgentBackend",
     "AgentEvent",
+    "OpenCodeBackend",
     "PermissionRequested",
     "QuestionAsked",
     "ReasoningUpdated",

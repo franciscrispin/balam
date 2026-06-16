@@ -105,21 +105,29 @@ class QuestionAsked:
     OpenCode's ``question`` tool, or the SDK's ``ExitPlanMode`` rendered as a
     Yes/No plan-approval question. ``questions`` follows the OpenCode shape the
     streamer already renders: a list of ``{question, header, options:[{label,
-    description}], multiple, custom}``. ``call_id`` links back to the owning tool
-    (used to locate a freshly written plan file).
+    description}], multiple, custom}``. ``call_id`` links back to the owning tool.
+
+    ``plan_path`` is set when this question is a plan-approval (OpenCode's
+    ``plan_exit`` or the SDK's ``ExitPlanMode``); the backend resolves it because
+    locating the plan is a wire-specific detail. The streamer uses it to snapshot
+    the plan for the "View plan" button and to recognise plan approval ("Yes").
     """
 
     request_id: str
     questions: list[dict[str, Any]]
     call_id: str | None = None
+    plan_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RetryNotice:
     """The turn is being retried internally (e.g. a provider rate limit), so the
-    long silence is explained to the user once per turn."""
+    long silence is explained to the user once per turn.
 
-    message: str
+    ``detail`` is the backend's extra context (e.g. the rate-limit message); the
+    streamer composes the user-facing notice around it.
+    """
+
     detail: str | None = None
 
 
