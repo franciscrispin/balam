@@ -35,13 +35,12 @@ from telegram.ext import (
     filters,
 )
 
-from balam.agent.opencode_backend import OpenCodeBackend
+from balam.agent.backend import AgentBackend
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
 from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.miniapp import make_plan_view_button, mini_app_reply
-from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
 from balam.streamer import _question_keyboard, stream_reply
 from balam.telegram_utils import thread_kwargs
@@ -279,6 +278,9 @@ async def _submit_turn(
         effort=resolved.effort,
         allowed_dirs=[resolved.directory, *resolved.additional_directories],
         files=files,
+        allowed_tools=resolved.allowed_tools,
+        additional_directories=resolved.additional_directories,
+        mcp=resolved.mcp,
     )
 
     # One turn per topic at a time (ADR-0009). OpenCode runs a single turn per
@@ -309,7 +311,7 @@ def _start_turn(
     interrupt it (PTB processes updates sequentially, so awaiting in the handler
     would block ``/cancel``).
     """
-    opencode: OpenCode = context.application.bot_data["opencode"]
+    backend: AgentBackend = context.application.bot_data["backend"]
     turns: TurnRegistry = context.application.bot_data["turns"]
     pending: PendingApprovals = context.application.bot_data["pending"]
     router: Router = context.application.bot_data["router"]
@@ -340,7 +342,7 @@ def _start_turn(
             plan_mode = router.plan_mode(chat_id, thread_id)
             await stream_reply(
                 bot=context.bot,
-                backend=OpenCodeBackend(opencode),
+                backend=backend,
                 session_id=job.session_id,
                 chat_id=chat_id,
                 thread_id=thread_id,
@@ -354,10 +356,14 @@ def _start_turn(
                     "pending_questions", PendingQuestions()
                 ),
                 allowed_dirs=job.allowed_dirs,
+                additional_directories=job.additional_directories,
+                allowed_tools=job.allowed_tools,
+                mcp=job.mcp,
                 files=job.files,
                 plan_mode=plan_mode,
                 plan_view=plan_view,
                 on_plan_approved=_on_plan_approved,
+                on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
@@ -494,22 +500,24 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def _abort_turn(
-    turn: Any, opencode: OpenCode, tasks: set[asyncio.Task[None]]
+    turn: Any, backend: AgentBackend, tasks: set[asyncio.Task[None]]
 ) -> asyncio.Task[None] | None:
-    """Cancel a running turn locally and abort it server-side (best-effort).
+    """Cancel a running turn locally and abort it on the backend (best-effort).
 
-    Cancelling the local task stops streaming; the abort tells OpenCode to stop
-    generating. The abort runs as a background task so callers needn't await the
-    round-trip before replying — but it is anchored in ``tasks`` (with a done
+    Cancelling the local task stops streaming; the abort tells the backend to
+    stop generating. The abort runs as a background task so callers needn't await
+    the round-trip before replying — but it is anchored in ``tasks`` (with a done
     callback that removes it) because the event loop keeps only a *weak*
     reference to a bare task: an unanchored one can be garbage-collected
-    mid-flight, dropping the abort and leaving OpenCode generating. ``None`` when
-    there is no turn.
-    """
+    mid-flight, dropping the abort. ``None`` when there is no turn (or no session
+    id yet, e.g. an SDK turn that hasn't minted one — cancelling the task is
+    enough to tear down its query)."""
     if turn is None:
         return None
     turn.task.cancel()
-    task = asyncio.create_task(opencode.abort_session(turn.session_id, directory=turn.directory))
+    if not turn.session_id:
+        return None
+    task = asyncio.create_task(backend.abort(turn.session_id, directory=turn.directory))
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     return task
@@ -608,6 +616,7 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     router: Router = context.application.bot_data["router"]
     turns: TurnRegistry = context.application.bot_data["turns"]
+    config: Config = context.application.bot_data["config"]
     ref = TopicRef(
         chat_id=message.chat_id,
         thread_id=message.message_thread_id,
@@ -626,6 +635,7 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines = [
         f"Context: {name}",
+        f"Backend: {config.agent_backend}",
         f"Directory: {ctx.directory}",
         f"Model: {effective_model}",
         f"Effort: {override_effort or ctx.effort or '(server default)'}",
@@ -827,7 +837,7 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message is None:
         return
 
-    opencode: OpenCode = context.application.bot_data["opencode"]
+    backend: AgentBackend = context.application.bot_data["backend"]
     turns: TurnRegistry = context.application.bot_data["turns"]
 
     turn = turns.get(message.chat_id, message.message_thread_id)
@@ -846,7 +856,7 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tasks: set[asyncio.Task[None]] = context.application.bot_data.setdefault(
         "background_tasks", set()
     )
-    _abort_turn(turn, opencode, tasks)
+    _abort_turn(turn, backend, tasks)
     if dropped:
         await message.reply_text(f"🛑 Cancelled. Also cleared {dropped} queued message(s).")
     else:
@@ -1155,7 +1165,7 @@ async def register_commands(bot: Bot, chat_id: int | None = None) -> None:
 
 def build_application(
     config: Config,
-    opencode: OpenCode,
+    backend: AgentBackend,
     router: Router,
     *,
     post_init: Any = None,
@@ -1169,7 +1179,7 @@ def build_application(
     app = builder.build()
 
     app.bot_data["config"] = config
-    app.bot_data["opencode"] = opencode
+    app.bot_data["backend"] = backend
     app.bot_data["router"] = router
     # In-flight turns, keyed by topic, so /cancel can interrupt a running reply.
     app.bot_data["turns"] = TurnRegistry()

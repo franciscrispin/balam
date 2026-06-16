@@ -219,6 +219,11 @@ class ClaudeSdkBackend:
         self._pending_perms: dict[str, asyncio.Future[tuple[bool, str | None]]] = {}
         self._pending_questions: dict[str, asyncio.Future[list[list[str]] | None]] = {}
 
+    def set_send_file_factory(self, factory: SendFileFactory) -> None:
+        """Wire the per-topic send_file tool factory once the bot is available
+        (app boot constructs the backend before the Telegram bot exists)."""
+        self._send_file_factory = factory
+
     async def wait_for_ready(self) -> None:
         # The SDK spawns its CLI subprocess lazily per query; nothing to poll.
         return None
@@ -279,9 +284,9 @@ class ClaudeSdkBackend:
         if self._send_file_factory is not None and turn.chat_id is not None:
             agent_tool = self._send_file_factory(turn.chat_id, turn.thread_id)
             if agent_tool is not None:
-                sdk_tool = tool(
-                    agent_tool.name, agent_tool.description, agent_tool.input_schema
-                )(agent_tool.handler)
+                sdk_tool = tool(agent_tool.name, agent_tool.description, agent_tool.input_schema)(
+                    agent_tool.handler
+                )
                 servers["balam"] = create_sdk_mcp_server(name="balam", tools=[sdk_tool])
                 allowed.append(f"mcp__balam__{agent_tool.name}")
         return servers, allowed

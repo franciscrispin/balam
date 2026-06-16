@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from telegram import Chat, Message, MessageEntity, PhotoSize, Update, User
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
+from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.bot import (
     BOT_COMMANDS,
@@ -264,7 +265,12 @@ def _session_cmd_env(message: _FakeMessage, args: list[str] | None = None):
     update = SimpleNamespace(message=message)
     context = SimpleNamespace(
         application=SimpleNamespace(
-            bot_data={"router": router, "opencode": opencode, "turns": turns}
+            bot_data={
+                "router": router,
+                "backend": OpenCodeBackend(opencode),
+                "turns": turns,
+                "config": SimpleNamespace(agent_backend="opencode"),
+            }
         ),
         args=args or [],
     )
@@ -882,7 +888,7 @@ def _text_update(chat_id: int, user_id: int, text: str = "hello") -> Update:
 
 
 def _build(chat_id: int | None):
-    return build_application(_config(chat_id=chat_id), opencode=None, router=None)
+    return build_application(_config(chat_id=chat_id), backend=None, router=None)
 
 
 def test_message_handler_scoped_accepts_owner_in_target_chat() -> None:
@@ -1379,7 +1385,7 @@ def _message_env(message, bot, *, router: Router | None = None):
         application=SimpleNamespace(
             bot_data={
                 "router": router,
-                "opencode": opencode,
+                "backend": OpenCodeBackend(opencode),
                 "turns": turns,
                 "pending": PendingApprovals(),
             }

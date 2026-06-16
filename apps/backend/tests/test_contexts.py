@@ -38,9 +38,10 @@ def test_split_provider_model() -> None:
     assert split_provider_model("") == (None, None)
 
 
-def test_split_provider_model_requires_provider() -> None:
-    with pytest.raises(ValueError):
-        split_provider_model("claude-opus-4-8")
+def test_split_provider_model_allows_bare_id_for_the_sdk() -> None:
+    # The Claude Agent SDK takes a bare id; OpenCode falls back to its default.
+    assert split_provider_model("claude-opus-4-8") == (None, "claude-opus-4-8")
+    assert split_provider_model("opus") == (None, "opus")
 
 
 def test_loads_and_validates(tmp_path) -> None:
@@ -90,13 +91,15 @@ def test_unknown_effort_rejected(tmp_path) -> None:
         load_contexts(_write(tmp_path, bad))
 
 
-def test_unqualified_model_rejected(tmp_path) -> None:
-    bad = (
+def test_bare_model_loads_for_the_sdk(tmp_path) -> None:
+    # A bare model id (no provider) is valid — the Claude Agent SDK takes it
+    # directly; OpenCode would fall back to its default.
+    cfg = (
         "default_context: a\ncontexts:\n  a:\n    directory: /a\n"
-        "    description: A\n    model: gpt-5\n"
+        "    description: A\n    model: claude-opus-4-8\n"
     )
-    with pytest.raises(ContextsConfigError):
-        load_contexts(_write(tmp_path, bad))
+    loaded = load_contexts(_write(tmp_path, cfg))
+    assert loaded.get("a").provider_model == (None, "claude-opus-4-8")
 
 
 def test_unknown_field_rejected(tmp_path) -> None:

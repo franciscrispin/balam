@@ -81,17 +81,18 @@ def _expand_env(value: Any, *, where: str) -> Any:
 
 
 def split_provider_model(model: str | None) -> tuple[str | None, str | None]:
-    """Split a context's ``model`` (``provider/model``) into its parts.
+    """Split a context's ``model`` into ``(provider, model)``.
 
-    Returns ``(None, None)`` when no model is set (OpenCode then uses its own
-    default). A non-empty value must be provider-qualified.
+    OpenCode wants ``provider/model`` (e.g. ``anthropic/claude-opus-4-8``); the
+    Claude Agent SDK takes a bare Claude id/alias (e.g. ``claude-opus-4-8`` or
+    ``opus``). A bare value is therefore allowed and returns ``(None, model)`` —
+    OpenCode only sends a model when both parts are present (so a bare value falls
+    back to its default), while the SDK uses the bare id directly.
     """
     if not model:
         return None, None
     if "/" not in model:
-        raise ValueError(
-            f"model {model!r} must be 'provider/model' (e.g. 'anthropic/claude-opus-4-8')"
-        )
+        return None, model
     provider, _, rest = model.partition("/")
     return provider, rest
 
