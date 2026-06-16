@@ -181,6 +181,28 @@ def coerce_sdk_mcp_config(name: str, raw_config: Any) -> dict[str, Any]:
     raise ValueError(f"MCP server {name!r} must be local (command) or remote (url)")
 
 
+def _content_blocks(prompt: str, files: list[Any]) -> str | list[dict[str, Any]]:
+    """The user message content: a plain string, or text + attachment blocks.
+
+    ``PromptFile.url`` is a ``data:<mime>;base64,…`` URL; split it into an
+    Anthropic image/document source block so the SDK forwards the bytes to the
+    model (vision/PDF) without a filesystem read, mirroring OpenCode file parts.
+    """
+    if not files:
+        return prompt
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": prompt}] if prompt else []
+    for file in files:
+        data = file.url.split("base64,", 1)[-1]
+        kind = "image" if file.mime.startswith("image/") else "document"
+        blocks.append(
+            {
+                "type": kind,
+                "source": {"type": "base64", "media_type": file.mime, "data": data},
+            }
+        )
+    return blocks
+
+
 def _eval_target(category: str, tool_input: dict[str, Any]) -> str:
     """The resource a tool call acts on, for :func:`evaluate` (leading slash
     stripped to match ``build_ruleset``'s file-path patterns)."""
@@ -312,6 +334,10 @@ class ClaudeSdkBackend:
             "include_partial_messages": True,
             # Keep Claude Code's native behavior (incl. natural-language planning).
             "system_prompt": {"type": "preset", "preset": "claude_code"},
+            # Load NO external settings (user/project/local). Balam is the
+            # permission gate: inheriting the owner's ~/.claude allow-rules would
+            # let tools bypass can_use_tool (and the approval keyboard) entirely.
+            "setting_sources": [],
             "env": env,
         }
         if turn.session_id:
@@ -341,6 +367,11 @@ class ClaudeSdkBackend:
         block_text: dict[int, str] = {}
         owned_perms: set[str] = set()
         owned_questions: set[str] = set()
+        # Set when the turn ends, to close the streaming-input channel. The input
+        # stream must stay OPEN for the whole turn: can_use_tool / question control
+        # requests travel back over stdin, so closing it early (after one message)
+        # kills the channel and the CLI denies tools with "Stream closed".
+        turn_done = asyncio.Event()
 
         # The context's opt-in ruleset, evaluated in process to pre-approve tool
         # calls the user allowed (the SDK has no server to delegate this to).
@@ -449,11 +480,28 @@ class ClaudeSdkBackend:
 
         mcp_servers, allowed_tools = self._mcp_setup(turn)
 
+        async def input_stream() -> AsyncIterator[dict[str, Any]]:
+            # can_use_tool requires streaming-input mode: the prompt is an async
+            # iterable of user-message dicts. Send the one turn message, then hold
+            # the stream open until the turn finishes so the bidirectional control
+            # channel (permission/question requests) stays alive.
+            yield {
+                "type": "user",
+                "session_id": "",
+                "message": {
+                    "role": "user",
+                    "content": _content_blocks(turn.prompt, turn.files or []),
+                },
+                "parent_tool_use_id": None,
+            }
+            await turn_done.wait()
+
         async def driver() -> None:
             nonlocal cur_msg_id
             options = self._build_options(turn, can_use_tool, mcp_servers, allowed_tools)
+            stream = self._query(prompt=input_stream(), options=options)
             try:
-                async for message in self._query(prompt=turn.prompt, options=options):
+                async for message in stream:
                     if isinstance(message, SystemMessage):
                         if message.subtype == "init":
                             maybe_session(message.data.get("session_id"))
@@ -531,6 +579,15 @@ class ClaudeSdkBackend:
                 logger.exception("Claude Agent SDK query failed")
                 await queue.put(TurnFailed(message=str(exc) or exc.__class__.__name__))
             finally:
+                # Release the input stream so it can close stdin cleanly.
+                turn_done.set()
+                # Close the SDK query generator (and its subprocess) within this
+                # task, so it doesn't aclose at GC time and collide with the loop.
+                if hasattr(stream, "aclose"):
+                    try:
+                        await stream.aclose()
+                    except Exception:
+                        logger.debug("error closing SDK query stream", exc_info=True)
                 await queue.put(_SENTINEL)
 
         driver_task = asyncio.create_task(driver())
