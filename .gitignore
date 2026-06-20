@@ -38,6 +38,9 @@ __pycache__/
 # Claude Code local settings (personal; shared config and skills are tracked)
 .claude/settings.local.json
 
+# Claude Code agent worktrees (transient per-agent git worktrees)
+.claude/worktrees/
+
 # OpenCode agent working files (transient plan files written per session)
 .opencode/
 
