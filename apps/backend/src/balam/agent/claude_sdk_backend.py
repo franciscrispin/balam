@@ -442,11 +442,68 @@ class ClaudeSdkBackend:
                 return PermissionResultAllow()
             return PermissionResultDeny(message="Keep planning; the plan was not approved.")
 
+        async def ask_user_question(
+            input_data: dict[str, Any],
+        ) -> PermissionResultAllow | PermissionResultDeny:
+            """Surface the SDK's ``AskUserQuestion`` tool as Balam's structured
+            question flow instead of a tool-approval prompt.
+
+            Claude Code answers this tool not by allowing it bare, but by injecting
+            an ``answers`` record (question text → answer string) into the tool
+            input via ``updated_input`` — the tool then reads that record to build
+            its result. So we render the questions on the Telegram keyboard, await
+            the selections, and allow the call with ``answers`` populated. The model
+            never sees a permission prompt; declining maps to a deny."""
+            raw_questions = input_data.get("questions") or []
+            if not isinstance(raw_questions, list) or not raw_questions:
+                return PermissionResultDeny(message="No questions to ask.")
+            request_id = f"q_{uuid.uuid4().hex[:16]}"
+            future: asyncio.Future[list[list[str]] | None] = loop.create_future()
+            self._pending_questions[request_id] = future
+            owned_questions.add(request_id)
+            # Map the SDK's input shape to the OpenCode-style question dict the
+            # streamer renders: ``multiSelect`` → ``multiple``; ``custom`` stays on
+            # so the user can type a free-text answer (Claude Code auto-adds the
+            # "Other" option, which it tells the model not to supply itself).
+            questions = [
+                {
+                    "question": q.get("question", ""),
+                    "header": q.get("header", ""),
+                    "options": [
+                        {"label": o.get("label", ""), "description": o.get("description", "")}
+                        for o in (q.get("options") or [])
+                        if isinstance(o, dict)
+                    ],
+                    "multiple": bool(q.get("multiSelect", False)),
+                    "custom": True,
+                }
+                for q in raw_questions
+                if isinstance(q, dict)
+            ]
+            await queue.put(QuestionAsked(request_id=request_id, questions=questions))
+            try:
+                answers = await future
+            finally:
+                self._pending_questions.pop(request_id, None)
+            if not answers:
+                return PermissionResultDeny(message="User declined to answer the questions.")
+            # answers is one label-list per question; the tool keys its result on
+            # the question text and wants multi-select answers comma-joined.
+            answers_record: dict[str, str] = {}
+            for question, selected in zip(raw_questions, answers):
+                if isinstance(question, dict):
+                    answers_record[question.get("question", "")] = ", ".join(selected)
+            updated = dict(input_data)
+            updated["answers"] = answers_record
+            return PermissionResultAllow(updated_input=updated)
+
         async def can_use_tool(
             tool_name: str, input_data: dict[str, Any], ctx: Any
         ) -> PermissionResultAllow | PermissionResultDeny:
             if tool_name == "ExitPlanMode":
                 return await ask_plan_exit(input_data)
+            if tool_name == "AskUserQuestion":
+                return await ask_user_question(input_data)
             norm = _normalize_input(input_data)
             category = _category(tool_name)
             # Pre-approve (or deny) against the context's opt-in ruleset in

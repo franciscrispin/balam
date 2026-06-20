@@ -244,6 +244,110 @@ async def test_exit_plan_mode_no_denies() -> None:
     assert isinstance(captured[0], PermissionResultDeny)
 
 
+async def test_ask_user_question_becomes_question_and_injects_answers() -> None:
+    # AskUserQuestion must not bug the human with a tool-approval prompt; it is
+    # surfaced as a structured question, and the selection is fed back to the tool
+    # via updated_input.answers (keyed by question text), not a bare allow.
+    captured: list = []
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            yield _init()
+            ctx = SimpleNamespace(tool_use_id="t1")
+            captured.append(
+                await options.can_use_tool(
+                    "AskUserQuestion",
+                    {
+                        "questions": [
+                            {
+                                "question": "Which DB?",
+                                "header": "DB",
+                                "options": [
+                                    {"label": "Postgres", "description": "relational"},
+                                    {"label": "SQLite", "description": "embedded"},
+                                ],
+                                "multiSelect": False,
+                            }
+                        ]
+                    },
+                    ctx,
+                )
+            )
+            yield _result()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    requests: list = []
+    async for event in backend.run_turn(_turn()):
+        if isinstance(event, PermissionRequested):
+            requests.append(event)
+        if isinstance(event, QuestionAsked):
+            assert event.questions[0]["question"] == "Which DB?"
+            assert event.questions[0]["multiple"] is False
+            assert event.questions[0]["options"][0]["label"] == "Postgres"
+            await backend.reply_question(event.request_id, [["Postgres"]])
+
+    assert requests == []  # never shown as a tool-approval prompt
+    result = captured[0]
+    assert isinstance(result, PermissionResultAllow)
+    assert result.updated_input["answers"] == {"Which DB?": "Postgres"}
+
+
+async def test_ask_user_question_multiselect_comma_joins_and_decline_denies() -> None:
+    captured: list = []
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            yield _init()
+            ctx = SimpleNamespace(tool_use_id="t1")
+            captured.append(
+                await options.can_use_tool(
+                    "AskUserQuestion",
+                    {
+                        "questions": [
+                            {
+                                "question": "Pick features",
+                                "header": "Feat",
+                                "options": [
+                                    {"label": "A", "description": ""},
+                                    {"label": "B", "description": ""},
+                                ],
+                                "multiSelect": True,
+                            }
+                        ]
+                    },
+                    ctx,
+                )
+            )
+            ctx2 = SimpleNamespace(tool_use_id="t2")
+            captured.append(
+                await options.can_use_tool(
+                    "AskUserQuestion",
+                    {"questions": [{"question": "Q2", "header": "h", "options": [{"label": "x"}]}]},
+                    ctx2,
+                )
+            )
+            yield _result()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    seen = 0
+    async for event in backend.run_turn(_turn()):
+        if isinstance(event, QuestionAsked):
+            seen += 1
+            if seen == 1:
+                assert event.questions[0]["multiple"] is True
+                await backend.reply_question(event.request_id, [["A", "B"]])
+            else:
+                await backend.reject_question(event.request_id)
+
+    assert isinstance(captured[0], PermissionResultAllow)
+    assert captured[0].updated_input["answers"] == {"Pick features": "A, B"}
+    assert isinstance(captured[1], PermissionResultDeny)
+
+
 def test_coerce_mcp_local_to_stdio() -> None:
     out = coerce_sdk_mcp_config("x", {"type": "local", "command": ["uvx", "srv", "--flag"]})
     assert out == {"type": "stdio", "command": "uvx", "args": ["srv", "--flag"]}
