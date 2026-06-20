@@ -185,6 +185,18 @@ class Router:
         """Prevent future first-message auto-renames for this topic."""
         self._store.mark_auto_named(ref.chat_id, ref.thread_id)
 
+    def set_topic_title(self, chat_id: int, thread_id: int | None, title: str) -> None:
+        """Record a topic's current Telegram title (for the ``/delete`` picker)."""
+        self._store.set_title(chat_id, thread_id, title)
+
+    def list_topics(self, chat_id: int) -> list[tuple[int, str | None, str | None]]:
+        """Mapped topics in a chat as ``(thread_id, title, context)`` (no General)."""
+        return self._store.list_topics(chat_id)
+
+    def purge_topic(self, chat_id: int, thread_id: int | None) -> None:
+        """Forget a deleted topic across every per-topic table."""
+        self._store.purge(chat_id, thread_id)
+
     async def create_topic_session(
         self,
         chat_id: int,
@@ -217,7 +229,9 @@ class Router:
             # The SDK mints the session on the topic's first turn; persist an
             # empty placeholder now so the context binding survives until then.
             session_id = ""
-        self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=name)
+        self._store.set(
+            chat_id, thread_id, session_id, int(time.time() * 1000), context=name, title=title
+        )
         if auto_named:
             # The topic is created already carrying its name, so its first message
             # must not trigger a first-message auto-rename.
@@ -288,6 +302,11 @@ class Router:
             ref.title, directory=ctx.directory, permission=permission, mcp=mcp
         )
         self._store.set(
-            ref.chat_id, ref.thread_id, session_id, int(time.time() * 1000), context=context_name
+            ref.chat_id,
+            ref.thread_id,
+            session_id,
+            int(time.time() * 1000),
+            context=context_name,
+            title=ref.title,
         )
         return session_id

@@ -203,6 +203,19 @@ class ContextsConfig(BaseModel):
         """The context name :meth:`get` would use — for persisting the binding."""
         return name if (name and name in self.contexts) else self.default_context
 
+    def match_name(self, name: str | None) -> str | None:
+        """Canonical context key matching ``name`` case-insensitively, or ``None``.
+
+        An exact match wins first, so case-colliding keys (``Balam`` and ``balam``
+        both defined) stay individually addressable; otherwise the first key whose
+        lowercase form matches is returned (``/new Balam`` → ``balam``)."""
+        if not name:
+            return None
+        if name in self.contexts:
+            return name
+        lowered = name.lower()
+        return next((key for key in self.contexts if key.lower() == lowered), None)
+
 
 class ContextsConfigError(Exception):
     """Raised when ``config.yaml`` is missing or malformed."""

@@ -44,6 +44,35 @@ def test_split_provider_model_allows_bare_id_for_the_sdk() -> None:
     assert split_provider_model("opus") == (None, "opus")
 
 
+def test_match_name_is_case_insensitive(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG))
+    # Typed casing is normalized to the canonical config key (/new Balam → balam).
+    assert cfg.match_name("Balam") == "balam"
+    assert cfg.match_name("BALAM") == "balam"
+    assert cfg.match_name("balam") == "balam"
+    assert cfg.match_name("Scratch") == "scratch"
+
+
+def test_match_name_returns_none_for_unknown_or_empty(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG))
+    assert cfg.match_name("nope") is None
+    assert cfg.match_name("") is None
+    assert cfg.match_name(None) is None
+
+
+def test_match_name_prefers_exact_when_keys_collide_by_case() -> None:
+    # Both casings defined: an exact match must win so each stays addressable.
+    cfg = ContextsConfig(
+        default_context="balam",
+        contexts={
+            "balam": {"directory": "/a", "description": "lower"},
+            "Balam": {"directory": "/b", "description": "upper"},
+        },
+    )
+    assert cfg.match_name("Balam") == "Balam"
+    assert cfg.match_name("balam") == "balam"
+
+
 def test_loads_and_validates(tmp_path) -> None:
     cfg = load_contexts(_write(tmp_path, CONFIG))
     assert sorted(cfg.contexts) == ["balam", "scratch"]

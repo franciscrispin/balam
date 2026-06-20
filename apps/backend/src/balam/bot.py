@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 from balam.agent.backend import AgentBackend
-from balam.approvals import Choice, PendingApprovals, PendingQuestions
+from balam.approvals import Choice, PendingApprovals, PendingDeletions, PendingQuestions
 from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
 from balam.contexts import EFFORT_LEVELS, split_provider_model
@@ -122,6 +122,7 @@ async def _auto_name_topic(
         logger.debug("failed to auto-name topic", exc_info=True)
         return
     router.mark_topic_auto_named(ref)
+    router.set_topic_title(ref.chat_id, ref.thread_id, name)
 
 
 async def _create_topic_from_general(
@@ -490,10 +491,10 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("\n".join(lines))
         return
 
-    name = args[0]
-    if name not in contexts.contexts:
+    name = contexts.match_name(args[0])
+    if name is None:
         available = ", ".join(sorted(contexts.contexts))
-        await message.reply_text(f"Unknown context {name!r}. Available: {available}")
+        await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
         return
 
     await _open_context_topic(message, context.bot, router, name)
@@ -539,10 +540,10 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     router: Router = context.application.bot_data["router"]
     args = context.args or []
     if args:
-        name = args[0]
-        if name not in router.contexts.contexts:
+        name = router.contexts.match_name(args[0])
+        if name is None:
             available = ", ".join(sorted(router.contexts.contexts))
-            await message.reply_text(f"Unknown context {name!r}. Available: {available}")
+            await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
             return
     else:
         ref = TopicRef(
@@ -779,6 +780,7 @@ async def _handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             title=_topic_title(message, message.message_thread_id),
         )
     )
+    router.set_topic_title(message.chat_id, message.message_thread_id, new_name)
     await message.reply_text(f"Renamed topic to {new_name}.")
 
 
@@ -1060,6 +1062,224 @@ async def _handle_question_custom_callback(
     await _clear_keyboard(query, note=r"Reply with your answer\.")
 
 
+#: Cap the picker at a single keyboard's worth of topics — Telegram allows ~100
+#: inline buttons; we keep one topic per row and reserve a row for the actions.
+_DELETE_PICKER_LIMIT = 90
+
+
+def _topic_label(title: str | None, context_name: str | None, thread_id: int) -> str:
+    """Button label for a topic: its title, else the bound context + thread id
+    (topics created before titles were tracked have no stored title)."""
+    base = title or (f"{context_name} · #{thread_id}" if context_name else f"#{thread_id}")
+    return base if len(base) <= 48 else base[:47] + "…"
+
+
+def _delete_keyboard(token: str, entries: list[tuple[int, str, bool]]) -> InlineKeyboardMarkup:
+    """Checklist of topics (``del:<token>:<thread_id>``) plus the confirm/cancel row."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                f"{'☑️' if selected else '☐'} {label}",
+                callback_data=f"del:{token}:{thread_id}",
+            )
+        ]
+        for thread_id, label, selected in entries
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton("🗑 Delete selected", callback_data=f"deld:{token}"),
+            InlineKeyboardButton("Cancel", callback_data=f"delx:{token}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _callback_authorized(query: Any, config: Config) -> bool:
+    """Re-check the trust boundary (ADR-0008) for a callback: owner id, plus the
+    configured chat when set. Callbacks carry no handler filter, so each must
+    verify the sender itself."""
+    user = query.from_user
+    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+        return False
+    if config.allowed_telegram_chat_id is not None:
+        chat = query.message.chat if query.message else None
+        if chat is None or chat.id != config.allowed_telegram_chat_id:
+            return False
+    return True
+
+
+async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/delete`` — pick forum topics to remove from an inline checklist.
+
+    Lists the topics this bot tracks for the chat; the General topic is never
+    listed (the Bot API can't delete it). Confirming deletes each selected Telegram
+    topic and forgets it locally (all per-topic tables) — the OpenCode session is
+    left warm on the server.
+    """
+    message = update.message
+    if message is None:
+        return
+    router: Router = context.application.bot_data["router"]
+    topics = router.list_topics(message.chat_id)
+    if not topics:
+        await message.reply_text("No topics to delete.")
+        return
+
+    capped = topics[:_DELETE_PICKER_LIMIT]
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    token = pending_deletions.register(
+        message.chat_id,
+        [(thread_id, _topic_label(title, ctx, thread_id)) for thread_id, title, ctx in capped],
+    )
+    text = "🗑 Select topics to delete, then tap “Delete selected”."
+    if len(topics) > len(capped):
+        text += (
+            f"\n\nShowing the first {len(capped)} of {len(topics)} topics — "
+            "run /delete again for the rest."
+        )
+    await message.reply_text(
+        text, reply_markup=_delete_keyboard(token, pending_deletions.entries(token) or [])
+    )
+
+
+async def _handle_delete_toggle_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Toggle a topic's checkbox in the /delete picker (``del:<token>:<thread_id>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("del:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed selection.")
+        return
+    _, token, thread_id_raw = parts
+    try:
+        thread_id = int(thread_id_raw)
+    except ValueError:
+        await query.answer("Malformed selection.")
+        return
+
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    state = pending_deletions.toggle(token, thread_id)
+    if state is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer("Selected." if state else "Unselected.")
+    entries = pending_deletions.entries(token)
+    message = getattr(query, "message", None)
+    if entries is None or message is None:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=_delete_keyboard(token, entries))
+    except Exception:
+        logger.debug("failed to refresh delete keyboard", exc_info=True)
+
+
+async def _handle_delete_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Delete the topics selected in the picker (``deld:<token>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("deld:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 1)
+    if len(parts) != 2:
+        await query.answer("Malformed request.")
+        return
+    token = parts[1]
+
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    thread_ids = pending_deletions.selected_thread_ids(token)
+    chat_id = pending_deletions.chat_id(token)
+    if thread_ids is None or chat_id is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    if not thread_ids:
+        await query.answer("Select at least one topic.")
+        return
+    pending_deletions.discard(token)
+
+    router: Router = context.application.bot_data["router"]
+    deleted = 0
+    failed = 0
+    for thread_id in thread_ids:
+        try:
+            await context.bot.delete_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+        except Exception:
+            logger.exception("failed to delete forum topic %s", thread_id)
+            failed += 1
+            continue
+        # The Telegram topic is gone, so drop every local trace of it.
+        router.purge_topic(chat_id, thread_id)
+        deleted += 1
+
+    await query.answer(f"Deleted {deleted} topic(s).")
+    summary = f"🗑 Deleted {deleted} topic(s)."
+    if failed:
+        summary += f" {failed} could not be deleted."
+    message = getattr(query, "message", None)
+    if message is not None:
+        # The picker message may itself sit in a just-deleted topic; ignore the edit
+        # failure that follows.
+        try:
+            await message.edit_text(text=summary, reply_markup=None)
+        except Exception:
+            logger.debug("failed to finalize delete message", exc_info=True)
+
+
+async def _handle_delete_cancel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Dismiss the /delete picker without deleting anything (``delx:<token>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("delx:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 1)
+    if len(parts) == 2:
+        context.application.bot_data["pending_deletions"].discard(parts[1])
+    await query.answer("Cancelled.")
+    message = getattr(query, "message", None)
+    if message is not None:
+        try:
+            await message.edit_text(text="🗑 Delete cancelled.", reply_markup=None)
+        except Exception:
+            logger.debug("failed to finalize cancel message", exc_info=True)
+
+
+async def _handle_topic_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sync the stored title when a topic is renamed from the Telegram UI.
+
+    Every other title change is set by the bot itself; this service-message update
+    is the one path it doesn't originate, so the /delete picker would otherwise show
+    a stale name."""
+    message = update.message
+    if message is None or message.message_thread_id is None:
+        return
+    edited = message.forum_topic_edited
+    if edited is None or not edited.name:
+        return
+    router: Router = context.application.bot_data["router"]
+    router.set_topic_title(message.chat_id, message.message_thread_id, edited.name)
+
+
 async def _clear_keyboard(query: Any, note: str | None = None) -> bool:
     """Strip a spent approval keyboard, appending a one-line outcome when given.
 
@@ -1143,6 +1363,7 @@ BOT_COMMANDS = [
     BotCommand("plan", "Plan mode for this topic (/plan [request], /plan off)"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
+    BotCommand("delete", "Delete topics — pick which ones to remove"),
 ]
 
 
@@ -1187,6 +1408,8 @@ def build_application(
     app.bot_data["pending"] = PendingApprovals()
     # Outstanding OpenCode question-tool prompts.
     app.bot_data["pending_questions"] = PendingQuestions()
+    # Outstanding /delete topic-picker selections.
+    app.bot_data["pending_deletions"] = PendingDeletions()
     # Anchors fire-and-forget background tasks (e.g. /cancel's server-side abort)
     # so the loop's weak task references can't let them be GC'd mid-flight.
     app.bot_data["background_tasks"] = set()
@@ -1210,11 +1433,18 @@ def build_application(
     app.add_handler(CommandHandler("plan", _handle_plan, filters=allowed))
     app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
     app.add_handler(CommandHandler("browser", _handle_browser, filters=allowed))
+    app.add_handler(CommandHandler("delete", _handle_delete, filters=allowed))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & allowed,
             _handle_message,
         )
+    )
+    # Keep the stored title in step with renames done from the Telegram UI (the one
+    # title change the bot doesn't itself originate). A service message matches
+    # neither commands nor the text/photo handler above, so it falls through here.
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED & allowed, _handle_topic_edited)
     )
     # CallbackQueryHandler takes no filter; the handler re-checks the trust
     # boundary (ADR-0008) itself before resolving an approval.
@@ -1222,5 +1452,8 @@ def build_application(
     app.add_handler(CallbackQueryHandler(_handle_question_done_callback, pattern=r"^qstd:"))
     app.add_handler(CallbackQueryHandler(_handle_question_callback, pattern=r"^qst:"))
     app.add_handler(CallbackQueryHandler(_handle_question_custom_callback, pattern=r"^qstc:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_confirm_callback, pattern=r"^deld:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_cancel_callback, pattern=r"^delx:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_toggle_callback, pattern=r"^del:"))
 
     return app

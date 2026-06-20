@@ -33,6 +33,7 @@ class SessionStore:
                 session_id TEXT    NOT NULL,
                 created_at INTEGER NOT NULL,
                 context    TEXT,
+                title      TEXT,
                 PRIMARY KEY (chat_id, thread_id)
             );
             """
@@ -79,6 +80,7 @@ class SessionStore:
             """
         )
         self._migrate_auto_named()
+        self._migrate_title()
         self._db.commit()
 
     def _migrate_auto_named(self) -> None:
@@ -105,6 +107,20 @@ class SessionStore:
         self._db.execute(f"INSERT OR IGNORE INTO topic_auto_names (chat_id, thread_id) {select}")
         self._db.execute("PRAGMA user_version = 1")
 
+    def _migrate_title(self) -> None:
+        """Add the ``title`` column to :class:`topic_sessions` for databases created
+        before topic titles were tracked. The column drives the ``/delete`` picker
+        (:meth:`list_topics` labels each topic by it); older rows simply carry a
+        ``NULL`` title until the topic is next (re)named."""
+        if self._db.execute("PRAGMA user_version").fetchone()[0] >= 2:
+            return
+        columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(topic_sessions)").fetchall()
+        }
+        if "title" not in columns:
+            self._db.execute("ALTER TABLE topic_sessions ADD COLUMN title TEXT")
+        self._db.execute("PRAGMA user_version = 2")
+
     @staticmethod
     def thread_key(thread_id: int | None) -> int:
         """Normalize an optional ``message_thread_id`` to a concrete key."""
@@ -128,6 +144,7 @@ class SessionStore:
         session_id: str,
         created_at: int,
         context: str | None = None,
+        title: str | None = None,
     ) -> None:
         """Map a topic to a session (and the context it was created in),
         overwriting any existing mapping — used both for first creation and for
@@ -135,20 +152,51 @@ class SessionStore:
 
         Auto-naming state is tracked separately (:meth:`mark_auto_named`) and is
         deliberately untouched here, so recreating a vanished session keeps a
-        topic's existing name."""
+        topic's existing name. ``title`` is likewise preserved when omitted: a
+        title-less call (e.g. :meth:`balam.router.Router.persist_session`) keeps
+        any title already stored, so only :meth:`set_title` and explicit
+        creation/recreation titles change it."""
         self._db.execute(
             """
-            INSERT INTO topic_sessions (chat_id, thread_id, session_id, created_at, context)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO topic_sessions (chat_id, thread_id, session_id, created_at, context, title)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (chat_id, thread_id)
             DO UPDATE SET
                 session_id = excluded.session_id,
                 created_at = excluded.created_at,
-                context = excluded.context
+                context = excluded.context,
+                title = COALESCE(excluded.title, topic_sessions.title)
             """,
-            (chat_id, self.thread_key(thread_id), session_id, created_at, context),
+            (chat_id, self.thread_key(thread_id), session_id, created_at, context, title),
         )
         self._db.commit()
+
+    def set_title(self, chat_id: int, thread_id: int | None, title: str) -> None:
+        """Record a topic's current Telegram title (set on create, auto-name,
+        ``/rename``, and manual ``forum_topic_edited`` updates) so the ``/delete``
+        picker can label it. No-op for an unmapped topic."""
+        self._db.execute(
+            "UPDATE topic_sessions SET title = ? WHERE chat_id = ? AND thread_id = ?",
+            (title, chat_id, self.thread_key(thread_id)),
+        )
+        self._db.commit()
+
+    def list_topics(self, chat_id: int) -> list[tuple[int, str | None, str | None]]:
+        """All mapped topics in a chat as ``(thread_id, title, context)``, ordered
+        by creation. The General topic (``GENERAL_THREAD_ID``) is excluded — it
+        cannot be deleted via the Bot API, so it never appears in the picker."""
+        return [
+            (row[0], row[1], row[2])
+            for row in self._db.execute(
+                """
+                SELECT thread_id, title, context
+                FROM topic_sessions
+                WHERE chat_id = ? AND thread_id != ?
+                ORDER BY created_at
+                """,
+                (chat_id, GENERAL_THREAD_ID),
+            ).fetchall()
+        ]
 
     def is_auto_named(self, chat_id: int, thread_id: int | None) -> bool:
         """Whether automatic topic naming has already been applied or skipped."""
@@ -280,11 +328,27 @@ class SessionStore:
         )
 
     def delete(self, chat_id: int, thread_id: int | None) -> None:
-        """Drop a mapping, e.g. when its session no longer exists server-side."""
+        """Drop a mapping, e.g. when its session no longer exists server-side.
+
+        Touches only ``topic_sessions`` — the auto-naming / plan-mode / override
+        tables are left intact so a recreated session keeps its name and settings.
+        For deleting a topic outright, use :meth:`purge`."""
         self._db.execute(
             "DELETE FROM topic_sessions WHERE chat_id = ? AND thread_id = ?",
             (chat_id, self.thread_key(thread_id)),
         )
+        self._db.commit()
+
+    def purge(self, chat_id: int, thread_id: int | None) -> None:
+        """Forget a topic entirely — used when the Telegram forum topic itself is
+        deleted (``/delete`` picker), so every trace is removed from all four
+        per-topic tables."""
+        key = self.thread_key(thread_id)
+        for table in ("topic_sessions", "topic_auto_names", "topic_plan_modes", "topic_overrides"):
+            self._db.execute(
+                f"DELETE FROM {table} WHERE chat_id = ? AND thread_id = ?",
+                (chat_id, key),
+            )
         self._db.commit()
 
     def close(self) -> None:

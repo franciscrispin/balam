@@ -396,3 +396,72 @@ class PendingQuestions:
                     self.discard(token)
                 return "resolved"
         return None
+
+
+@dataclass
+class _PendingDeletion:
+    chat_id: int
+    thread_ids: list[int]
+    labels: list[str]
+    selected: set[int] = field(default_factory=set)
+
+
+class PendingDeletions:
+    """Outstanding ``/delete`` topic-picker selections, keyed by callback token.
+
+    Unlike :class:`PendingApprovals` / :class:`PendingQuestions` there is no future
+    to resolve — the picker is a purely Telegram-side multi-select, and the confirm
+    callback reads the chosen thread ids and deletes the topics itself. One instance
+    lives in ``bot_data`` for the bot's lifetime; tokens are discarded on confirm or
+    cancel.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[str, _PendingDeletion] = {}
+
+    def register(self, chat_id: int, topics: list[tuple[int, str]]) -> str:
+        """Open a picker over ``topics`` (``(thread_id, label)`` pairs); return its
+        callback token. Nothing is selected initially."""
+        token = uuid.uuid4().hex[:16]
+        self._pending[token] = _PendingDeletion(
+            chat_id=chat_id,
+            thread_ids=[thread_id for thread_id, _ in topics],
+            labels=[label for _, label in topics],
+        )
+        return token
+
+    def discard(self, token: str) -> None:
+        self._pending.pop(token, None)
+
+    def chat_id(self, token: str) -> int | None:
+        pending = self._pending.get(token)
+        return pending.chat_id if pending else None
+
+    def entries(self, token: str) -> list[tuple[int, str, bool]] | None:
+        """``(thread_id, label, is_selected)`` for each topic, in display order."""
+        pending = self._pending.get(token)
+        if pending is None:
+            return None
+        return [
+            (thread_id, label, thread_id in pending.selected)
+            for thread_id, label in zip(pending.thread_ids, pending.labels, strict=True)
+        ]
+
+    def toggle(self, token: str, thread_id: int) -> bool | None:
+        """Flip a topic's selection; ``True``/``False`` for the new state, or
+        ``None`` if the token expired or the thread isn't in this picker."""
+        pending = self._pending.get(token)
+        if pending is None or thread_id not in pending.thread_ids:
+            return None
+        if thread_id in pending.selected:
+            pending.selected.discard(thread_id)
+            return False
+        pending.selected.add(thread_id)
+        return True
+
+    def selected_thread_ids(self, token: str) -> list[int] | None:
+        """Selected thread ids in display order, or ``None`` if the token expired."""
+        pending = self._pending.get(token)
+        if pending is None:
+            return None
+        return [t for t in pending.thread_ids if t in pending.selected]

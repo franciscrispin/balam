@@ -5,6 +5,7 @@ from balam.approvals import (
     READ_CATEGORIES,
     Choice,
     PendingApprovals,
+    PendingDeletions,
     Verdict,
     decide,
     is_edit,
@@ -197,3 +198,41 @@ async def test_discard_makes_token_unresolvable() -> None:
     token, _future = pending.register("ses_1")
     pending.discard(token)
     assert pending.resolve(token, Choice.ALLOW) is False
+
+
+# --- PendingDeletions: /delete topic picker -----------------------------------
+
+
+def test_deletions_register_starts_with_nothing_selected() -> None:
+    pending = PendingDeletions()
+    token = pending.register(100, [(5, "First"), (7, "Second")])
+    assert pending.chat_id(token) == 100
+    assert pending.entries(token) == [(5, "First", False), (7, "Second", False)]
+    assert pending.selected_thread_ids(token) == []
+
+
+def test_deletions_toggle_flips_and_reports_selection_in_order() -> None:
+    pending = PendingDeletions()
+    token = pending.register(100, [(5, "First"), (7, "Second")])
+    assert pending.toggle(token, 7) is True
+    assert pending.toggle(token, 5) is True
+    assert pending.toggle(token, 7) is False  # toggling again unselects
+    # Reported in display order, not selection order.
+    assert pending.selected_thread_ids(token) == [5]
+    assert pending.entries(token) == [(5, "First", True), (7, "Second", False)]
+
+
+def test_deletions_toggle_unknown_thread_or_token_returns_none() -> None:
+    pending = PendingDeletions()
+    token = pending.register(100, [(5, "First")])
+    assert pending.toggle(token, 999) is None
+    assert pending.toggle("nope", 5) is None
+
+
+def test_deletions_discard_expires_the_token() -> None:
+    pending = PendingDeletions()
+    token = pending.register(100, [(5, "First")])
+    pending.discard(token)
+    assert pending.entries(token) is None
+    assert pending.selected_thread_ids(token) is None
+    assert pending.chat_id(token) is None
