@@ -8,6 +8,58 @@ Status legend: 🔴 open · 🟡 in progress · 🟢 done
 
 ---
 
+## 2026-06-21 — `/delete` topic picker caps at 90 with no pagination
+
+**Status:** 🟢 done — fixed via real pagination (no cap). `list_topics` now orders
+newest-first (`store.py`, `ORDER BY created_at DESC`); `PendingDeletions`
+(`approvals.py`) snapshots the **full** topic list and pages it `PAGE_SIZE=8` at a
+time (`page_info`/`set_page`), tracking selection by `thread_id` across the whole
+snapshot. The picker grew a `◀ Prev / Page k/n / Next ▶` nav row
+(`delp:<token>:<page>`, handled by `_handle_delete_page_callback`) and a selected
+count on the confirm button; selections persist across pages and all delete
+together on confirm. The misleading "run /delete again for the rest" message is
+gone. `_DELETE_PICKER_LIMIT` removed.
+
+**Area:** Bot commands · `/delete` topic picker (`apps/backend/src/balam/bot.py`)
+
+**Summary.** The `/delete` picker caps at `_DELETE_PICKER_LIMIT = 90` topics and,
+when there are more, tells the user *"Showing the first N of M topics — run
+/delete again for the rest."* But that promise can't be kept: `_handle_delete`
+always slices `topics[:_DELETE_PICKER_LIMIT]` with **no offset/cursor**, and
+`SessionStore.list_topics` orders by `created_at` **ascending**. So re-running
+`/delete` returns the *identical* first 90 (oldest) topics, and everything beyond
+the cap is permanently unreachable from the picker.
+
+**Impact.** With >90 topics the **newest** topics can never be selected for
+deletion — including a topic you just made. Verified live 2026-06-20 in the
+workspace supergroup (98–99 topics): a freshly created `/new` topic (`#2137`)
+never appeared in the picker and there was no way to reach it. The cap message
+actively misleads.
+
+**Why it matters.** The whole point of `/delete` is letting the owner clean up
+topics; the topics most likely to need cleanup (recent test/throwaway ones) are
+exactly the ones the cap+ordering hide. Everything else about `/delete` works
+end-to-end (picker render, General excluded, toggle, cancel, confirm →
+`deleteForumTopic` + `purge()` across all four per-topic tables).
+
+**Possible direction (not yet decided).**
+- Order `list_topics` **newest-first** so the cap at least surfaces the topics
+  most likely to be deleted (simplest fix; drops the "rest" promise).
+- Or add real pagination: a stored offset/cursor per picker token so "run
+  /delete again" (or a Next/Prev row) advances through batches.
+- Either way, only claim "run /delete again for the rest" if a subsequent run
+  actually shows different topics.
+
+**Pointers.**
+- `apps/backend/src/balam/bot.py` — `_handle_delete` (~L1118), `_DELETE_PICKER_LIMIT`
+  (L1067), the `topics[:_DELETE_PICKER_LIMIT]` slice (~L1128) and the
+  "run /delete again for the rest" message (~L1138).
+- `apps/backend/src/balam/store.py` — `SessionStore.list_topics` (`ORDER BY created_at`).
+- Picker state lives in `PendingDeletions` (`apps/backend/src/balam/approvals.py`) —
+  a cursor/offset would attach here per token.
+
+---
+
 ## 2026-06-20 — `AskUserQuestion` rich-content fields lost in the question abstraction
 
 **Status:** 🔴 open

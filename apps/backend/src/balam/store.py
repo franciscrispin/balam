@@ -182,9 +182,11 @@ class SessionStore:
         self._db.commit()
 
     def list_topics(self, chat_id: int) -> list[tuple[int, str | None, str | None]]:
-        """All mapped topics in a chat as ``(thread_id, title, context)``, ordered
-        by creation. The General topic (``GENERAL_THREAD_ID``) is excluded — it
-        cannot be deleted via the Bot API, so it never appears in the picker."""
+        """All mapped topics in a chat as ``(thread_id, title, context)``, newest
+        first. The General topic (``GENERAL_THREAD_ID``) is excluded — it cannot be
+        deleted via the Bot API, so it never appears in the picker. Newest-first
+        ordering ensures the /delete picker's cap surfaces the topics most likely to
+        need cleanup (recent throwaway ones) rather than the oldest, unreachable."""
         return [
             (row[0], row[1], row[2])
             for row in self._db.execute(
@@ -192,7 +194,7 @@ class SessionStore:
                 SELECT thread_id, title, context
                 FROM topic_sessions
                 WHERE chat_id = ? AND thread_id != ?
-                ORDER BY created_at
+                ORDER BY created_at DESC
                 """,
                 (chat_id, GENERAL_THREAD_ID),
             ).fetchall()

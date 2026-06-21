@@ -25,6 +25,7 @@ from telegram import (
     Message,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -1062,11 +1063,6 @@ async def _handle_question_custom_callback(
     await _clear_keyboard(query, note=r"Reply with your answer\.")
 
 
-#: Cap the picker at a single keyboard's worth of topics — Telegram allows ~100
-#: inline buttons; we keep one topic per row and reserve a row for the actions.
-_DELETE_PICKER_LIMIT = 90
-
-
 def _topic_label(title: str | None, context_name: str | None, thread_id: int) -> str:
     """Button label for a topic: its title, else the bound context + thread id
     (topics created before titles were tracked have no stored title)."""
@@ -1074,8 +1070,17 @@ def _topic_label(title: str | None, context_name: str | None, thread_id: int) ->
     return base if len(base) <= 48 else base[:47] + "…"
 
 
-def _delete_keyboard(token: str, entries: list[tuple[int, str, bool]]) -> InlineKeyboardMarkup:
-    """Checklist of topics (``del:<token>:<thread_id>``) plus the confirm/cancel row."""
+def _delete_keyboard(
+    token: str,
+    entries: list[tuple[int, str, bool]],
+    page: int = 0,
+    page_count: int = 1,
+    selected_count: int = 0,
+) -> InlineKeyboardMarkup:
+    """Checklist for the current page of topics (``del:<token>:<thread_id>``), a
+    Prev/Next navigation row when the snapshot spans more than one page
+    (``delp:<token>:<page>``), and the confirm/cancel row. ``selected_count`` spans
+    the whole snapshot, so the confirm button reflects picks made on other pages."""
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
@@ -1085,13 +1090,42 @@ def _delete_keyboard(token: str, entries: list[tuple[int, str, bool]]) -> Inline
         ]
         for thread_id, label, selected in entries
     ]
+    if page_count > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"delp:{token}:{page - 1}"))
+        # The indicator points at the current page, so tapping it is a harmless no-op.
+        nav.append(
+            InlineKeyboardButton(
+                f"Page {page + 1}/{page_count}", callback_data=f"delp:{token}:{page}"
+            )
+        )
+        if page < page_count - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"delp:{token}:{page + 1}"))
+        rows.append(nav)
+    confirm_label = "🗑 Delete selected"
+    if selected_count:
+        confirm_label += f" ({selected_count})"
     rows.append(
         [
-            InlineKeyboardButton("🗑 Delete selected", callback_data=f"deld:{token}"),
+            InlineKeyboardButton(confirm_label, callback_data=f"deld:{token}"),
             InlineKeyboardButton("Cancel", callback_data=f"delx:{token}"),
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def _delete_markup(
+    pending_deletions: PendingDeletions, token: str
+) -> InlineKeyboardMarkup | None:
+    """Build the picker keyboard from current snapshot state, or ``None`` if the
+    token expired."""
+    entries = pending_deletions.entries(token)
+    info = pending_deletions.page_info(token)
+    if entries is None or info is None:
+        return None
+    page, page_count, _total, selected = info
+    return _delete_keyboard(token, entries, page, page_count, selected)
 
 
 def _callback_authorized(query: Any, config: Config) -> bool:
@@ -1125,21 +1159,19 @@ async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("No topics to delete.")
         return
 
-    capped = topics[:_DELETE_PICKER_LIMIT]
     pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
     token = pending_deletions.register(
         message.chat_id,
-        [(thread_id, _topic_label(title, ctx, thread_id)) for thread_id, title, ctx in capped],
+        [(thread_id, _topic_label(title, ctx, thread_id)) for thread_id, title, ctx in topics],
     )
     text = "🗑 Select topics to delete, then tap “Delete selected”."
-    if len(topics) > len(capped):
+    info = pending_deletions.page_info(token)
+    if info and info[1] > 1:
         text += (
-            f"\n\nShowing the first {len(capped)} of {len(topics)} topics — "
-            "run /delete again for the rest."
+            f"\n\n{info[2]} topics across {info[1]} pages — use ◀ ▶ to browse. "
+            "Selections persist across pages."
         )
-    await message.reply_text(
-        text, reply_markup=_delete_keyboard(token, pending_deletions.entries(token) or [])
-    )
+    await message.reply_text(text, reply_markup=_delete_markup(pending_deletions, token))
 
 
 async def _handle_delete_toggle_callback(
@@ -1172,14 +1204,52 @@ async def _handle_delete_toggle_callback(
         await _clear_keyboard(query)
         return
     await query.answer("Selected." if state else "Unselected.")
-    entries = pending_deletions.entries(token)
+    markup = _delete_markup(pending_deletions, token)
     message = getattr(query, "message", None)
-    if entries is None or message is None:
+    if markup is None or message is None:
         return
     try:
-        await message.edit_reply_markup(reply_markup=_delete_keyboard(token, entries))
+        await message.edit_reply_markup(reply_markup=markup)
     except Exception:
         logger.debug("failed to refresh delete keyboard", exc_info=True)
+
+
+async def _handle_delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Flip the /delete picker to another page (``delp:<token>:<page>``). Selections
+    are kept in the snapshot, so paging never loses what's already checked."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("delp:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed request.")
+        return
+    _, token, page_raw = parts
+    try:
+        page = int(page_raw)
+    except ValueError:
+        await query.answer("Malformed request.")
+        return
+
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    if pending_deletions.set_page(token, page) is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer()
+    markup = _delete_markup(pending_deletions, token)
+    message = getattr(query, "message", None)
+    if markup is None or message is None:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        logger.debug("failed to page delete keyboard", exc_info=True)
 
 
 async def _handle_delete_confirm_callback(
@@ -1218,6 +1288,17 @@ async def _handle_delete_confirm_callback(
     for thread_id in thread_ids:
         try:
             await context.bot.delete_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+        except BadRequest as exc:
+            # A topic deleted straight from the Telegram UI (Telegram sends no
+            # "topic deleted" update, so its row lingers locally) makes the API
+            # reject re-deletion with TOPIC_ID_INVALID. The topic is already gone,
+            # which is what the user wanted — so fall through and purge the stale
+            # row instead of counting it as a permanent, un-clearable failure.
+            if "topic_id_invalid" not in (exc.message or "").lower():
+                logger.exception("failed to delete forum topic %s", thread_id)
+                failed += 1
+                continue
+            logger.info("topic %s already gone from Telegram; purging stale row", thread_id)
         except Exception:
             logger.exception("failed to delete forum topic %s", thread_id)
             failed += 1
@@ -1454,6 +1535,7 @@ def build_application(
     app.add_handler(CallbackQueryHandler(_handle_question_custom_callback, pattern=r"^qstc:"))
     app.add_handler(CallbackQueryHandler(_handle_delete_confirm_callback, pattern=r"^deld:"))
     app.add_handler(CallbackQueryHandler(_handle_delete_cancel_callback, pattern=r"^delx:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_page_callback, pattern=r"^delp:"))
     app.add_handler(CallbackQueryHandler(_handle_delete_toggle_callback, pattern=r"^del:"))
 
     return app

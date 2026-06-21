@@ -4,15 +4,18 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from telegram import Chat, Message, MessageEntity, PhotoSize, Update, User
+from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
 from balam.agent.opencode_backend import OpenCodeBackend
-from balam.approvals import Choice, PendingApprovals, PendingQuestions
+from balam.approvals import Choice, PendingApprovals, PendingDeletions, PendingQuestions
 from balam.bot import (
     BOT_COMMANDS,
     _handle_approval_callback,
     _handle_cancel,
     _handle_context,
+    _handle_delete_confirm_callback,
+    _handle_delete_page_callback,
     _handle_effort,
     _handle_message,
     _handle_model,
@@ -977,6 +980,9 @@ class _FakeCBMessage:
         self.edited.append(text)
         self.reply_markups.append(reply_markup)
 
+    async def edit_reply_markup(self, *, reply_markup=None, **_: object) -> None:
+        self.reply_markups.append(reply_markup)
+
     async def delete(self) -> None:
         self.deleted += 1
 
@@ -1441,3 +1447,138 @@ def test_message_handler_accepts_photo_from_owner() -> None:
     # The broadened filter (§4) lets photos through, not just text.
     handler = _message_handler(_build(SUPERGROUP))
     assert handler.check_update(_photo_update(SUPERGROUP, OWNER)) is not False
+
+
+class _DeleteBot(_FakeBot):
+    """A bot whose ``delete_forum_topic`` rejects the given thread ids the way the
+    Telegram API does for a topic that no longer exists."""
+
+    def __init__(self, *, stale: set[int]) -> None:
+        super().__init__()
+        self._stale = stale
+
+    async def delete_forum_topic(self, *, chat_id: int, message_thread_id: int) -> None:
+        if message_thread_id in self._stale:
+            raise BadRequest("Topic_id_invalid")
+        await super().delete_forum_topic(chat_id=chat_id, message_thread_id=message_thread_id)
+
+
+def _delete_callback_env(query: _FakeQuery, pending_deletions: PendingDeletions, bot: _FakeBot):
+    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=None)
+    router = _router()
+    update = SimpleNamespace(callback_query=query)
+    context = SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={
+                "config": config,
+                "pending_deletions": pending_deletions,
+                "router": router,
+            }
+        ),
+        bot=bot,
+    )
+    return update, context, router
+
+
+async def test_delete_confirm_purges_topics_already_gone_from_telegram() -> None:
+    # A topic deleted straight from the Telegram UI leaves a stale local row
+    # (Telegram sends no delete update). Re-deleting it via /delete used to be a
+    # permanent failure — the API answers TOPIC_ID_INVALID and the row was never
+    # purged, so it kept reappearing in the picker, un-clearable. Now the stale
+    # row is purged and the deletion counts as success.
+    pending = PendingDeletions()
+    token = pending.register(SUPERGROUP, [(101, "live"), (202, "stale")])
+    assert pending.toggle(token, 101) is True
+    assert pending.toggle(token, 202) is True
+
+    bot = _DeleteBot(stale={202})
+    message = _FakeCBMessage()
+    query = _FakeQuery(f"deld:{token}", OWNER, message)
+    update, context, router = _delete_callback_env(query, pending, bot)
+    # Seed both rows so we can assert the stale one is purged.
+    router._store.set(SUPERGROUP, 101, "ses_live", 1)
+    router._store.set(SUPERGROUP, 202, "ses_stale", 2)
+
+    await _handle_delete_confirm_callback(update, context)
+
+    # The live topic was deleted via the API; the stale one was not re-attempted
+    # past its rejection — but both local rows are gone.
+    assert bot.deleted_topics == [(SUPERGROUP, 101)]
+    assert router._store.get_row(SUPERGROUP, 101) is None
+    assert router._store.get_row(SUPERGROUP, 202) is None
+    # Both count as removed; nothing is reported as un-deletable.
+    assert message.edited and message.edited[-1] == "🗑 Deleted 2 topic(s)."
+
+
+def _topics(n: int) -> list[tuple[int, str]]:
+    return [(i, f"t{i}") for i in range(1, n + 1)]
+
+
+def test_delete_picker_pages_the_snapshot() -> None:
+    # The picker windows the full snapshot PAGE_SIZE topics at a time.
+    pending = PendingDeletions()
+    size = PendingDeletions.PAGE_SIZE
+    token = pending.register(SUPERGROUP, _topics(size * 2 + 1))
+
+    page, page_count, total, selected = pending.page_info(token)
+    assert (page, page_count, total, selected) == (0, 3, size * 2 + 1, 0)
+    # First page shows the first window only.
+    assert [tid for tid, _, _ in pending.entries(token)] == list(range(1, size + 1))
+
+    assert pending.set_page(token, 2) == 2
+    # Last page holds the remainder.
+    assert [tid for tid, _, _ in pending.entries(token)] == [size * 2 + 1]
+    # set_page clamps out-of-range requests instead of going blank.
+    assert pending.set_page(token, 99) == 2
+    assert pending.set_page(token, -5) == 0
+
+
+def test_delete_picker_selection_persists_across_pages() -> None:
+    # A topic checked on one page stays selected after paging away and is included
+    # at confirm — the whole point of real pagination over the old cap.
+    pending = PendingDeletions()
+    size = PendingDeletions.PAGE_SIZE
+    token = pending.register(SUPERGROUP, _topics(size + 2))
+
+    assert pending.toggle(token, 1) is True  # page 0
+    pending.set_page(token, 1)
+    assert pending.toggle(token, size + 2) is True  # page 1
+    # Selection count spans the snapshot, not just the visible page.
+    assert pending.page_info(token)[3] == 2
+    assert pending.selected_thread_ids(token) == [1, size + 2]
+
+
+def test_delete_picker_expired_token_is_inert() -> None:
+    pending = PendingDeletions()
+    assert pending.entries("nope") is None
+    assert pending.page_info("nope") is None
+    assert pending.set_page("nope", 0) is None
+
+
+async def test_delete_page_callback_flips_page_keeping_selection() -> None:
+    pending = PendingDeletions()
+    size = PendingDeletions.PAGE_SIZE
+    token = pending.register(SUPERGROUP, _topics(size + 1))
+    assert pending.toggle(token, 1) is True
+
+    message = _FakeCBMessage()
+    query = _FakeQuery(f"delp:{token}:1", OWNER, message)
+    update, context, _ = _delete_callback_env(query, pending, _FakeBot())
+
+    await _handle_delete_page_callback(update, context)
+
+    # The picker advanced and re-rendered; the selection survived the page flip.
+    assert pending.page_info(token)[0] == 1
+    assert pending.selected_thread_ids(token) == [1]
+    assert message.reply_markups  # keyboard was refreshed
+
+
+async def test_delete_page_callback_on_expired_token_clears_keyboard() -> None:
+    pending = PendingDeletions()
+    message = _FakeCBMessage()
+    query = _FakeQuery("delp:gone:1", OWNER, message)
+    update, context, _ = _delete_callback_env(query, pending, _FakeBot())
+
+    await _handle_delete_page_callback(update, context)
+
+    assert query.answers and query.answers[-1] == "This picker has expired."

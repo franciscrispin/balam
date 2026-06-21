@@ -286,12 +286,12 @@ def test_set_title_noop_for_unmapped_topic() -> None:
     assert store.list_topics(100) == []
 
 
-def test_list_topics_excludes_general_and_orders_by_creation() -> None:
+def test_list_topics_excludes_general_and_orders_newest_first() -> None:
     store = fresh_store()
     store.set(100, None, "ses_general", 1, context="balam", title="General")
     store.set(100, 7, "ses_b", 3, context="scratch", title="Second")
     store.set(100, 5, "ses_a", 2, context="balam", title="First")
-    assert store.list_topics(100) == [(5, "First", "balam"), (7, "Second", "scratch")]
+    assert store.list_topics(100) == [(7, "Second", "scratch"), (5, "First", "balam")]
 
 
 def test_list_topics_is_scoped_per_chat() -> None:

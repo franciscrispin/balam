@@ -404,6 +404,7 @@ class _PendingDeletion:
     thread_ids: list[int]
     labels: list[str]
     selected: set[int] = field(default_factory=set)
+    page: int = 0
 
 
 class PendingDeletions:
@@ -414,14 +415,24 @@ class PendingDeletions:
     callback reads the chosen thread ids and deletes the topics itself. One instance
     lives in ``bot_data`` for the bot's lifetime; tokens are discarded on confirm or
     cancel.
+
+    The full topic list is snapshotted at ``/delete`` time and paged one
+    :data:`PAGE_SIZE`-sized window at a time; selection is tracked by ``thread_id``
+    across the whole snapshot, so topics chosen on different pages are all deleted
+    together on confirm.
     """
+
+    #: Topics shown per picker page. Small enough that the keyboard stays tappable
+    #: and Prev/Next is meaningful, well under Telegram's ~100-button cap.
+    PAGE_SIZE = 8
 
     def __init__(self) -> None:
         self._pending: dict[str, _PendingDeletion] = {}
 
     def register(self, chat_id: int, topics: list[tuple[int, str]]) -> str:
         """Open a picker over ``topics`` (``(thread_id, label)`` pairs); return its
-        callback token. Nothing is selected initially."""
+        callback token. The full list is kept and paged; nothing is selected
+        initially and the picker opens on the first page."""
         token = uuid.uuid4().hex[:16]
         self._pending[token] = _PendingDeletion(
             chat_id=chat_id,
@@ -437,15 +448,43 @@ class PendingDeletions:
         pending = self._pending.get(token)
         return pending.chat_id if pending else None
 
+    def _page_count(self, pending: _PendingDeletion) -> int:
+        return max(1, -(-len(pending.thread_ids) // self.PAGE_SIZE))
+
     def entries(self, token: str) -> list[tuple[int, str, bool]] | None:
-        """``(thread_id, label, is_selected)`` for each topic, in display order."""
+        """``(thread_id, label, is_selected)`` for the current page's window, in
+        display order. Selection state reflects the whole snapshot, not just this
+        page. ``None`` if the token expired."""
         pending = self._pending.get(token)
         if pending is None:
             return None
-        return [
-            (thread_id, label, thread_id in pending.selected)
-            for thread_id, label in zip(pending.thread_ids, pending.labels, strict=True)
+        start = pending.page * self.PAGE_SIZE
+        window = list(zip(pending.thread_ids, pending.labels, strict=True))[
+            start : start + self.PAGE_SIZE
         ]
+        return [(thread_id, label, thread_id in pending.selected) for thread_id, label in window]
+
+    def page_info(self, token: str) -> tuple[int, int, int, int] | None:
+        """``(page, page_count, total_topics, selected_count)`` for the picker, or
+        ``None`` if the token expired. ``page`` is zero-based."""
+        pending = self._pending.get(token)
+        if pending is None:
+            return None
+        return (
+            pending.page,
+            self._page_count(pending),
+            len(pending.thread_ids),
+            len(pending.selected),
+        )
+
+    def set_page(self, token: str, page: int) -> int | None:
+        """Move to ``page`` (zero-based, clamped to the valid range); return the
+        resulting page, or ``None`` if the token expired."""
+        pending = self._pending.get(token)
+        if pending is None:
+            return None
+        pending.page = max(0, min(page, self._page_count(pending) - 1))
+        return pending.page
 
     def toggle(self, token: str, thread_id: int) -> bool | None:
         """Flip a topic's selection; ``True``/``False`` for the new state, or
@@ -460,7 +499,8 @@ class PendingDeletions:
         return True
 
     def selected_thread_ids(self, token: str) -> list[int] | None:
-        """Selected thread ids in display order, or ``None`` if the token expired."""
+        """Selected thread ids across the whole snapshot, in display order, or
+        ``None`` if the token expired."""
         pending = self._pending.get(token)
         if pending is None:
             return None
