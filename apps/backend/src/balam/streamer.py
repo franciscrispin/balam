@@ -33,13 +33,24 @@ import asyncio
 import logging
 import os
 import random
-import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from balam.agent.backend import AgentBackend, TurnRequest
+from balam.agent.events import (
+    PermissionRequested,
+    QuestionAsked,
+    ReasoningUpdated,
+    RetryNotice,
+    SessionStarted,
+    TextUpdated,
+    ToolUpdated,
+    TurnFailed,
+    TurnFinished,
+)
 from balam.approvals import (
     Choice,
     PendingApprovals,
@@ -51,8 +62,7 @@ from balam.approvals import (
 )
 from balam.attachments import PromptFile
 from balam.markdown import gfm_to_telegram
-from balam.opencode import OpenCode
-from balam.opencode_tools import Permission, Tool
+from balam.opencode_tools import Tool
 from balam.telegram_utils import thread_kwargs
 
 logger = logging.getLogger(__name__)
@@ -241,20 +251,6 @@ class DraftSession:
                 await self._transport.send_message(chunk)
 
 
-def _describe_error(error: Any) -> str:
-    """Extract a readable line from an OpenCode session error payload."""
-    if isinstance(error, dict):
-        name = error.get("name")
-        message = (error.get("data") or {}).get("message")
-        if name and message:
-            return f"{name}: {message}"
-        if message:
-            return message
-        if name:
-            return name
-    return "The agent reported an error."
-
-
 #: One streamed fragment: ``(arrival_order, kind, rendered_text)`` where ``kind``
 #: is ``"text"`` (assistant prose), ``"tool"`` (a rendered tool-call line), or
 #: ``"narration"`` (an earlier step's interim text, demoted to progress).
@@ -282,43 +278,6 @@ def _join_stream(parts: dict[str, StreamPart]) -> str:
         out += text
         prev_kind = kind
     return out
-
-
-def _is_answer_text_part(part: dict[str, Any]) -> bool:
-    """Whether an OpenCode text part should be shown to the user.
-
-    OpenCode exposes model reasoning as its own ``type: "reasoning"`` part in
-    v1.15.x. This also rejects defensive legacy/future shapes where a text part is
-    explicitly marked ignored or reasoning-like in metadata.
-    """
-    if part.get("type") != "text" or part.get("ignored") is True:
-        return False
-    metadata = part.get("metadata")
-    if not isinstance(metadata, dict):
-        return True
-    return not (
-        metadata.get("reasoning") is True
-        or metadata.get("thinking") is True
-        or metadata.get("kind") in {"reasoning", "thinking"}
-        or metadata.get("type") in {"reasoning", "thinking"}
-    )
-
-
-def _is_reasoning_part(part: dict[str, Any]) -> bool:
-    """Whether an OpenCode part is model reasoning/thinking text."""
-    if part.get("type") == "reasoning":
-        return True
-    if part.get("type") != "text":
-        return False
-    metadata = part.get("metadata")
-    if not isinstance(metadata, dict):
-        return False
-    return (
-        metadata.get("reasoning") is True
-        or metadata.get("thinking") is True
-        or metadata.get("kind") in {"reasoning", "thinking"}
-        or metadata.get("type") in {"reasoning", "thinking"}
-    )
 
 
 def _relpath(path: str, directory: str | None) -> str:
@@ -408,20 +367,24 @@ def _coerce_output(output: Any) -> str:
 
 
 def _render_tool_part(
-    tool: str, tool_input: dict[str, Any], state: dict[str, Any], directory: str | None
+    tool: str,
+    tool_input: dict[str, Any],
+    status: str,
+    output: Any,
+    error: Any,
+    directory: str | None,
 ) -> str:
     """Render a terminal tool part as a compact GFM line for the stream.
 
     Bash is special-cased to show the command and its (truncated) output in
     fenced blocks; everything else is a one-liner like ``🔧 Read src/foo.py``.
     """
-    status = state.get("status")
     if tool == Tool.BASH:
         command = tool_input.get("command", "")
         line = "🔧 Bash"
         if command:
             line += f"\n```\n{command}\n```"
-        payload = state.get("error") if status == "error" else state.get("output")
+        payload = error if status == "error" else output
         body = _truncate_output(_coerce_output(payload))
         if body:
             line += f"\n```\n{body}\n```"
@@ -529,47 +492,6 @@ def _format_question(question: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-#: OpenCode's plan_exit tool asks its approval question with this exact text
-#: (tool/plan.ts) — the worktree-relative plan path appears nowhere else.
-_PLAN_QUESTION_RE = re.compile(r"Plan at (.+?) is complete")
-
-
-def plan_path_from_question(
-    request: dict[str, Any],
-    tool_parts: dict[str, tuple[str, dict[str, Any], str | None]],
-    directory: str | None,
-) -> str | None:
-    """The plan file behind a ``plan_exit`` approval question, or ``None``.
-
-    OpenCode's native plan agent finishes by calling ``plan_exit``, which asks
-    "Plan at <path> is complete. …" through the question service. The request's
-    ``tool.callID`` identifies the owning tool via the tool-part cache (primary
-    detection); the path itself only exists in the question text, so the regex
-    does the extraction either way — and doubles as the fallback detector when
-    the cache hasn't seen the part yet. The path is worktree-relative
-    (git projects: ``.opencode/plans/…``; non-git: an upward-relative path into
-    OpenCode's global plans dir), so it resolves against the context directory.
-    """
-    questions = request.get("questions")
-    if not isinstance(questions, list) or not questions:
-        return None
-    first = questions[0] if isinstance(questions[0], dict) else {}
-    match = _PLAN_QUESTION_RE.search(str(first.get("question") or ""))
-    if match is None:
-        return None
-    tool = request.get("tool")
-    if isinstance(tool, dict):
-        cached = tool_parts.get(str(tool.get("callID") or ""))
-        if cached is not None and cached[0] != "plan_exit":
-            return None  # some other tool's question merely matched the regex
-    rel = match.group(1).strip()
-    if os.path.isabs(rel):
-        return rel
-    if directory is None:
-        return None
-    return os.path.normpath(os.path.join(directory, rel))
-
-
 def _make_transport(
     bot: Any,
     chat_id: int,
@@ -632,8 +554,8 @@ def _make_transport(
 async def stream_reply(
     *,
     bot: Any,
-    opencode: OpenCode,
-    session_id: str,
+    backend: AgentBackend,
+    session_id: str | None,
     chat_id: int,
     thread_id: int | None,
     prompt: str,
@@ -644,40 +566,46 @@ async def stream_reply(
     pending: PendingApprovals | None = None,
     pending_questions: PendingQuestions | None = None,
     allowed_dirs: list[str] | None = None,
+    additional_directories: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
+    mcp: dict[str, Any] | None = None,
     files: list[PromptFile] | None = None,
-    agent: str | None = None,
+    plan_mode: bool = False,
     plan_view: Callable[[str, str], InlineKeyboardButton | None] | None = None,
     on_plan_approved: Callable[[], None] | None = None,
+    on_session_started: Callable[[str], None] | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
 ) -> None:
-    """Prompt the agent and stream its reply into the topic.
+    """Run one turn through ``backend`` and stream its reply into the topic.
 
     ``directory``/``provider``/``model``/``effort`` come from the topic's
-    resolved context (:class:`balam.router.ResolvedSession`) and are forwarded to
-    the prompt so the agent runs in the right workspace with the right model.
+    resolved context (:class:`balam.router.ResolvedSession`) and ride the
+    :class:`~balam.agent.backend.TurnRequest` so the agent runs in the right
+    workspace with the right model. The backend owns subscribing/prompting and
+    yields the normalized :mod:`balam.agent.events` stream; this function renders
+    it, animates a draft as text grows, and finalizes into real message(s) when
+    the turn finishes (or fails).
 
-    Subscribes to the event stream *before* prompting so no early deltas are
-    missed, animates a draft as text grows, and finalizes into real message(s)
-    on ``session.idle`` (or ``session.error``).
-
-    When ``pending`` is given, ``permission.asked`` events are handled (ADR-0012):
-    each is dispatched to a background task that recovers the call's tool/input
-    from the tool-part cache, runs :func:`balam.approvals.decide` against
-    ``allowed_dirs``, and either auto-replies to OpenCode or sends an inline
-    keyboard and awaits the user's choice. Without ``pending`` the events are
-    ignored (e.g. unit tests of the text/tool path).
+    When ``pending`` is given, a :class:`~balam.agent.events.PermissionRequested`
+    is dispatched to a background task that runs :func:`balam.approvals.decide`
+    against ``allowed_dirs`` and either auto-allows or shows an inline keyboard and
+    awaits the user's choice (ADR-0012). Without ``pending`` the request is left
+    unhandled (e.g. unit tests of the text/tool path).
 
     ``plan_view`` (see :func:`balam.miniapp.make_plan_view_button`) maps a plan
-    ``(title, content)`` to a Mini App button; when a question request turns out
-    to be OpenCode's ``plan_exit`` approval, the plan file is snapshotted and the
-    button rides the question keyboard as an extra row.
+    ``(title, content)`` to a Mini App button; when a question carries a
+    ``plan_path`` (a plan-approval), the plan file is snapshotted and the button
+    rides the question keyboard as an extra row.
 
-    ``agent`` is forwarded to the prompt (``"plan"`` while the topic is in plan
-    mode). ``on_plan_approved`` fires when the ``plan_exit`` question is answered
-    "Yes" — the server then switches the session to the build agent, so the
-    caller uses this to drop its sticky plan-mode flag and stop sending
-    ``agent="plan"``.
+    ``plan_mode`` puts the turn in plan mode (the backend maps it to OpenCode's
+    plan agent or the SDK's ``permission_mode="plan"``). ``on_plan_approved``
+    fires when a plan-approval question is answered "Yes", so the caller can drop
+    its sticky plan-mode flag. ``on_session_started`` receives the backend's real
+    session id once known — used to persist a lazily-minted SDK session.
     """
+    # Local session id: known up front for OpenCode, learned from the first
+    # SessionStarted event for a lazily-minted SDK session.
+    sid = session_id
     # The id of the most recent message this turn sent to the topic — live-edit
     # bubbles and finalize chunks (via the transport) as well as approval
     # prompts, question keyboards, and retry notices (noted at their send
@@ -711,53 +639,33 @@ async def stream_reply(
 
     flush_task = asyncio.create_task(flush_loop())
 
-    assistant_message_ids: set[str] = set()
     # Reasoning/progress and answer text are delivered as separate messages.
     # Tool calls are progress, so they live with the reasoning stream.
     reasoning_parts: dict[str, StreamPart] = {}
     answer_parts: dict[str, StreamPart] = {}
-    # The assistant message whose text currently fills the answer draft.
-    # OpenCode opens a new assistant message per step, and a step's interim
+    # The assistant message whose text currently fills the answer draft. The
+    # agent opens a new assistant message per step, and a step's interim
     # narration ("I'll check…") is a plain text part just like the final
     # answer — only the *last* message's text is the answer.
     answer_message_id: str | None = None
-    # Latest ``(tool, input, status)`` per tool callID. Built here so the
-    # interactive-approval step (#3) can recover a call's input by callID.
-    tool_parts: dict[str, tuple[str, dict[str, Any], str | None]] = {}
     order = 0
     error_text: str | None = None
     retry_noticed = False
-    stream_ready = asyncio.Event()
     dirs = allowed_dirs or ([directory] if directory else [])
-    # Per-request approval tasks, so the SSE loop isn't blocked while the user
+    # Per-request approval tasks, so the event loop isn't blocked while the user
     # decides. Torn down with the consumer.
     permission_tasks: set[asyncio.Task[None]] = set()
     question_tasks: set[asyncio.Task[None]] = set()
 
-    async def await_tool_input(call_id: str) -> tuple[str | None, dict[str, Any]]:
-        """Recover a call's ``(tool, input)`` from the tool-part cache, briefly
-        waiting for it: ``permission.asked`` can race ahead of the tool part that
-        carries the input. Falls back to whatever is cached when the wait lapses.
-        """
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + 1.0
-        while True:
-            entry = tool_parts.get(call_id)
-            if entry and entry[1]:
-                return entry[0], entry[1]
-            if loop.time() >= deadline:
-                return (entry[0], entry[1]) if entry else (None, {})
-            await asyncio.sleep(0.05)
-
     async def request_approval(
         request_id: str, category: str, tool: str, tool_input: dict[str, Any]
     ) -> None:
-        """Ask the user via an inline keyboard, then reply to OpenCode. The
+        """Ask the user via an inline keyboard, then reply to the backend. The
         callback handler resolves the future and updates the message; here we
         only translate the choice into a permission reply. ``category`` drives the
         keyboard (whether to offer "accept all edits"); ``tool`` is display-only."""
         assert pending is not None
-        token, future = pending.register(session_id)
+        token, future = pending.register(sid or "")
         gfm = _format_approval_request(tool, tool_input, directory, category)
         keyboard = _approval_keyboard(token, category)
         chunks = gfm_to_telegram(gfm)
@@ -784,63 +692,54 @@ async def stream_reply(
             except Exception:
                 logger.exception("failed to send approval keyboard; denying")
                 pending.discard(token)
-                await opencode.reply_permission(
-                    request_id, "reject", directory=directory, message="Could not prompt the user."
+                await backend.reply_permission(
+                    request_id,
+                    allow=False,
+                    directory=directory,
+                    message="Could not prompt the user.",
                 )
                 return
         try:
             choice = await future
         except asyncio.CancelledError:
             # Turn torn down (e.g. /cancel) before the user answered: unblock the
-            # server so it isn't left waiting on a permission that will never come.
-            await opencode.reply_permission(
-                request_id, "reject", directory=directory, message="Cancelled."
+            # agent so it isn't left waiting on a permission that will never come.
+            await backend.reply_permission(
+                request_id, allow=False, directory=directory, message="Cancelled."
             )
             raise
         finally:
             pending.discard(token)
         if choice is Choice.DENY:
-            await opencode.reply_permission(
-                request_id, "reject", directory=directory, message="Denied by the user."
+            await backend.reply_permission(
+                request_id, allow=False, directory=directory, message="Denied by the user."
             )
         else:
-            await opencode.reply_permission(request_id, "once", directory=directory)
+            await backend.reply_permission(request_id, allow=True, directory=directory)
 
-    async def handle_permission(request: dict[str, Any]) -> None:
-        request_id = request.get("id")
-        if not request_id:
-            return
-        category = request.get("permission") or ""
-        if category == Permission.QUESTION:
-            await opencode.reply_permission(request_id, "once", directory=directory)
-            return
-        metadata = request.get("metadata")
-        metadata = metadata if isinstance(metadata, dict) else {}
-        tool_ref = request.get("tool")
-        call_id = tool_ref.get("callID", "") if isinstance(tool_ref, dict) else ""
-        cached_tool, tool_input = await await_tool_input(call_id) if call_id else (None, {})
+    async def handle_permission(request: PermissionRequested) -> None:
         cwd = dirs[0] if dirs else None
-        # Classify by OpenCode's permission category; take edit targets from the
-        # permission metadata (authoritative for apply_patch) and reads from input.
-        paths = request_target_paths(category, metadata, tool_input, cwd)
+        # Classify by the permission category; take edit targets from the request
+        # metadata (authoritative for apply_patch) and reads from the input.
+        paths = request_target_paths(request.category, request.metadata, request.input, cwd)
         verdict = decide(
-            category,
+            request.category,
             paths,
             allowed_dirs=dirs,
-            accept_all_edits=pending.is_accept_all_edits(session_id) if pending else False,
+            accept_all_edits=pending.is_accept_all_edits(sid or "") if pending else False,
         )
         if verdict is Verdict.ALLOW:
-            await opencode.reply_permission(request_id, "once", directory=directory)
+            await backend.reply_permission(request.request_id, allow=True, directory=directory)
             return
-        await request_approval(request_id, category, cached_tool or category, tool_input)
+        await request_approval(request.request_id, request.category, request.tool, request.input)
 
-    async def request_questions(request: dict[str, Any]) -> None:
+    async def request_questions(request: QuestionAsked) -> None:
         if pending_questions is None:
-            await opencode.reject_question(request["id"], directory=directory)
+            await backend.reject_question(request.request_id, directory=directory)
             return
-        raw_questions = request.get("questions")
-        if not isinstance(raw_questions, list) or not raw_questions:
-            await opencode.reject_question(request["id"], directory=directory)
+        raw_questions = request.questions
+        if not raw_questions:
+            await backend.reject_question(request.request_id, directory=directory)
             return
 
         questions = [q for q in raw_questions if isinstance(q, dict)]
@@ -850,30 +749,36 @@ async def stream_reply(
         for question in questions:
             options = question.get("options")
             if not isinstance(options, list) or not options:
-                await opencode.reject_question(request["id"], directory=directory)
+                await backend.reject_question(request.request_id, directory=directory)
                 return
             labels.append([str(o.get("label") or "") for o in options if isinstance(o, dict)])
             multiples.append(question.get("multiple", False) is True)
             customs.append(question.get("custom", True) is not False)
         if any(not question_labels for question_labels in labels):
-            await opencode.reject_question(request["id"], directory=directory)
+            await backend.reject_question(request.request_id, directory=directory)
             return
 
-        # A plan_exit approval carries the freshly written plan: snapshot it and
-        # ride a "View plan" button on the question keyboard. Strictly
-        # best-effort — any failure (file unreadable, no public URL) must never
-        # block the Yes/No flow, which is what actually answers OpenCode.
-        plan_path = plan_path_from_question(request, tool_parts, directory)
+        # A plan-approval carries the freshly written plan: snapshot it and ride a
+        # "View plan" button on the question keyboard. The backend supplies either
+        # an inline ``plan_text`` (SDK) or a ``plan_path`` to read (OpenCode).
+        # Strictly best-effort — any failure (file unreadable, no public URL) must
+        # never block the Yes/No flow, which is what actually answers the agent.
+        is_plan = request.plan_path is not None or request.plan_text is not None
         plan_button: InlineKeyboardButton | None = None
-        if plan_view is not None and plan_path is not None:
+        if plan_view is not None and is_plan:
             try:
-                plan_text = await asyncio.to_thread(Path(plan_path).read_text, "utf-8", "replace")
-                plan_button = plan_view(os.path.basename(plan_path), plan_text)
+                if request.plan_text is not None:
+                    plan_button = plan_view("Plan", request.plan_text)
+                elif request.plan_path is not None:
+                    text = await asyncio.to_thread(
+                        Path(request.plan_path).read_text, "utf-8", "replace"
+                    )
+                    plan_button = plan_view(os.path.basename(request.plan_path), text)
             except Exception:
-                logger.debug("could not snapshot plan at %s", plan_path, exc_info=True)
+                logger.debug("could not snapshot plan", exc_info=True)
 
         token, futures = pending_questions.register(
-            session_id,
+            sid or "",
             labels,
             multiples=multiples,
             customs=customs,
@@ -904,41 +809,33 @@ async def stream_reply(
             answers = await asyncio.gather(*futures)
         except asyncio.CancelledError:
             pending_questions.discard(token)
-            await opencode.reject_question(request["id"], directory=directory)
+            await backend.reject_question(request.request_id, directory=directory)
             raise
         except Exception:
-            logger.exception("failed to ask OpenCode question in Telegram")
+            logger.exception("failed to ask the agent's question in Telegram")
             pending_questions.discard(token)
-            await opencode.reject_question(request["id"], directory=directory)
+            await backend.reject_question(request.request_id, directory=directory)
             return
-        await opencode.reply_question(request["id"], answers, directory=directory)
-        # "Yes" to plan_exit makes the server switch this session to the build
-        # agent, so the caller's sticky plan-mode flag must drop with it — else
-        # the next Telegram prompt would force the session straight back into
-        # plan mode. "No" keeps both the server and the flag in plan mode.
-        if plan_path is not None and on_plan_approved is not None:
+        await backend.reply_question(request.request_id, answers, directory=directory)
+        # "Yes" to a plan-approval makes the agent switch to building, so the
+        # caller's sticky plan-mode flag must drop with it — else the next prompt
+        # would force it straight back into plan mode. "No" keeps plan mode.
+        if is_plan and on_plan_approved is not None:
             if answers and answers[0] == ["Yes"]:
                 on_plan_approved()
 
-    async def note_retry(status: dict[str, Any]) -> None:
+    async def note_retry(detail: str | None) -> None:
         """Tell the user the turn is being retried (e.g. provider rate limit).
 
-        OpenCode retries some failures (rate limits, transient 5xx) internally
-        without emitting ``session.error``, so the turn can stall for minutes with
-        no visible output. Surface a single notice per turn — enough to explain
-        the silence and point at ``/cancel`` — without spamming one per attempt.
+        Some failures (rate limits, transient 5xx) are retried internally without
+        ending the turn, so it can stall for minutes with no visible output.
+        Surface a single notice per turn — enough to explain the silence and
+        point at ``/cancel`` — without spamming one per attempt.
         """
         nonlocal retry_noticed
         if retry_noticed:
             return
         retry_noticed = True
-        action = status.get("action") if isinstance(status.get("action"), dict) else None
-        detail = ""
-        if action and isinstance(action.get("message"), str):
-            detail = action["message"]
-        elif isinstance(status.get("message"), str):
-            detail = status["message"]
-        detail = detail.strip().splitlines()[0][:300] if detail.strip() else ""
         body = "⏳ The model provider is rate-limited — retrying…"
         if detail:
             body += f"\n{detail}"
@@ -949,115 +846,106 @@ async def stream_reply(
         except Exception:
             logger.debug("failed to post retry notice", exc_info=True)
 
+    turn = TurnRequest(
+        directory=directory,
+        prompt=prompt,
+        session_id=session_id,
+        provider=provider,
+        model=model,
+        effort=effort,
+        files=files,
+        plan_mode=plan_mode,
+        allowed_tools=allowed_tools or [],
+        additional_directories=additional_directories or [],
+        mcp=mcp or {},
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+
     async def consume() -> None:
-        nonlocal order, error_text, answer_message_id
-        async for event in opencode.events(directory=directory, ready=stream_ready):
-            etype = event.get("type")
-            props = event.get("properties", {})
+        nonlocal order, error_text, answer_message_id, sid
+        async for event in backend.run_turn(turn):
+            if isinstance(event, SessionStarted):
+                if sid != event.session_id:
+                    sid = event.session_id
+                    if on_session_started is not None:
+                        on_session_started(sid)
 
-            if etype == "message.updated":
-                info = props.get("info", {})
-                if info.get("sessionID") == session_id and info.get("role") == "assistant":
-                    assistant_message_ids.add(info.get("id"))
-
-            elif etype == "message.part.updated":
-                part = props.get("part", {})
-                if part.get("sessionID") != session_id:
-                    continue
-                ptype = part.get("type")
-                if _is_answer_text_part(part):
-                    # Render only assistant text. Subscribing before prompting
-                    # guarantees we see the assistant's message.updated before its
-                    # parts, so this set is populated by the time they arrive.
-                    message_id = part.get("messageID")
-                    if message_id not in assistant_message_ids:
-                        continue
-                    if message_id != answer_message_id:
-                        # Text from a new step: what the answer draft holds was an
-                        # earlier step's narration, not the answer. Demote it to
-                        # the progress stream (it keeps its arrival order, so it
-                        # interleaves with the tool lines it narrates) and start
-                        # the answer over with the new step's text.
-                        if answer_parts:
-                            for pid, (pos, _kind, prev) in answer_parts.items():
-                                reasoning_parts[pid] = (pos, "narration", prev)
-                            answer_parts.clear()
-                            reasoning_draft.set_text(_join_stream(reasoning_parts))
-                        answer_message_id = message_id
-                    part_id = part.get("id")
-                    text = part.get("text", "")
-                    if part_id in answer_parts:
-                        answer_parts[part_id] = (answer_parts[part_id][0], "text", text)
-                    else:
-                        answer_parts[part_id] = (order, "text", text)
-                        order += 1
-                    answer_draft.set_text(_join_stream(answer_parts))
-                elif _is_reasoning_part(part):
-                    if part.get("messageID") not in assistant_message_ids:
-                        continue
-                    part_id = part.get("id")
-                    text = part.get("text", "")
-                    if part_id in reasoning_parts:
-                        reasoning_parts[part_id] = (reasoning_parts[part_id][0], "text", text)
-                    else:
-                        reasoning_parts[part_id] = (order, "text", text)
-                        order += 1
-                    reasoning_draft.set_text(_join_stream(reasoning_parts))
-                elif ptype == "tool":
-                    call_id = part.get("callID")
-                    if not call_id:
-                        continue
-                    state = part.get("state")
-                    if not isinstance(state, dict):
-                        continue
-                    status = state.get("status")
-                    tool = part.get("tool") or ""
-                    raw_input = state.get("input")
-                    tool_input = raw_input if isinstance(raw_input, dict) else {}
-                    # Cache every update so #3's approval step can read the input.
-                    tool_parts[call_id] = (tool, tool_input, status)
-                    # Reserve a slot at the call's arrival position (so the tool
-                    # line interleaves before any later text), but only render
-                    # once the call finishes.
-                    key = f"tool:{call_id}"
-                    if key not in reasoning_parts:
-                        reasoning_parts[key] = (order, "tool", "")
-                        order += 1
-                    if status in ("completed", "error"):
-                        rendered = _render_tool_part(tool, tool_input, state, directory)
-                        reasoning_parts[key] = (reasoning_parts[key][0], "tool", rendered)
+            elif isinstance(event, TextUpdated):
+                if event.message_id != answer_message_id:
+                    # Text from a new step: what the answer draft holds was an
+                    # earlier step's narration, not the answer. Demote it to the
+                    # progress stream (it keeps its arrival order, so it
+                    # interleaves with the tool lines it narrates) and start the
+                    # answer over with the new step's text.
+                    if answer_parts:
+                        for pid, (pos, _kind, prev) in answer_parts.items():
+                            reasoning_parts[pid] = (pos, "narration", prev)
+                        answer_parts.clear()
                         reasoning_draft.set_text(_join_stream(reasoning_parts))
+                    answer_message_id = event.message_id
+                if event.part_id in answer_parts:
+                    answer_parts[event.part_id] = (
+                        answer_parts[event.part_id][0],
+                        "text",
+                        event.text,
+                    )
+                else:
+                    answer_parts[event.part_id] = (order, "text", event.text)
+                    order += 1
+                answer_draft.set_text(_join_stream(answer_parts))
 
-            elif etype == "permission.asked":
-                # ``props`` is the PermissionRequest. Handle in a child task so a
-                # slow user decision doesn't stall the SSE loop (the session stays
-                # busy — not idle — while a permission is pending).
-                if pending is None or props.get("sessionID") != session_id:
+            elif isinstance(event, ReasoningUpdated):
+                if event.part_id in reasoning_parts:
+                    reasoning_parts[event.part_id] = (
+                        reasoning_parts[event.part_id][0],
+                        "text",
+                        event.text,
+                    )
+                else:
+                    reasoning_parts[event.part_id] = (order, "text", event.text)
+                    order += 1
+                reasoning_draft.set_text(_join_stream(reasoning_parts))
+
+            elif isinstance(event, ToolUpdated):
+                # Reserve a slot at the call's arrival position (so the tool line
+                # interleaves before any later text), but only render once the
+                # call finishes.
+                key = f"tool:{event.call_id}"
+                if key not in reasoning_parts:
+                    reasoning_parts[key] = (order, "tool", "")
+                    order += 1
+                if event.status in ("completed", "error"):
+                    rendered = _render_tool_part(
+                        event.tool, event.input, event.status, event.output, event.error, directory
+                    )
+                    reasoning_parts[key] = (reasoning_parts[key][0], "tool", rendered)
+                    reasoning_draft.set_text(_join_stream(reasoning_parts))
+
+            elif isinstance(event, PermissionRequested):
+                # Handle in a child task so a slow user decision doesn't stall the
+                # event loop (the turn stays busy while a permission is pending).
+                if pending is None:
                     continue
-                ptask = asyncio.create_task(handle_permission(props))
+                ptask = asyncio.create_task(handle_permission(event))
                 permission_tasks.add(ptask)
                 ptask.add_done_callback(permission_tasks.discard)
 
-            elif etype == "question.asked":
-                if props.get("sessionID") != session_id:
-                    continue
-                qtask = asyncio.create_task(request_questions(props))
+            elif isinstance(event, QuestionAsked):
+                qtask = asyncio.create_task(request_questions(event))
                 question_tasks.add(qtask)
                 qtask.add_done_callback(question_tasks.discard)
 
-            elif etype == "session.status" and props.get("sessionID") == session_id:
-                status = props.get("status")
-                if isinstance(status, dict) and status.get("type") == "retry":
-                    await note_retry(status)
+            elif isinstance(event, RetryNotice):
+                await note_retry(event.detail)
 
-            elif etype == "session.error" and props.get("sessionID") == session_id:
-                error_text = _describe_error(props.get("error"))
+            elif isinstance(event, TurnFailed):
+                error_text = event.message
                 break
 
-            elif etype == "session.idle" and props.get("sessionID") == session_id:
+            elif isinstance(event, TurnFinished):
                 break
 
-    # Subscribe *before* prompting so no early deltas are missed (ADR-0010).
     consume_task = asyncio.create_task(consume())
     try:
         try:
@@ -1066,28 +954,11 @@ async def stream_reply(
             pass
 
         try:
-            ready_task = asyncio.create_task(stream_ready.wait())
-            await asyncio.wait({ready_task, consume_task}, return_when=asyncio.FIRST_COMPLETED)
-            if consume_task.done():
-                # Stream failed/closed before opening; surface it without prompting.
-                ready_task.cancel()
-                await consume_task
-            else:
-                await opencode.prompt(
-                    session_id,
-                    prompt,
-                    directory=directory,
-                    provider=provider,
-                    model=model,
-                    effort=effort,
-                    files=files,
-                    agent=agent,
-                )
-                await consume_task
+            await consume_task
         except Exception as exc:
-            # A failed prompt or a broken event stream must still finalize a real
-            # message (ADR-0010): fold the error into the reply instead of letting
-            # it bubble out and skip finalize() below.
+            # A failed turn must still finalize a real message (ADR-0010): fold the
+            # error into the reply instead of letting it bubble out and skip
+            # finalize() below.
             logger.exception("streaming the reply failed")
             error_text = error_text or str(exc) or exc.__class__.__name__
 

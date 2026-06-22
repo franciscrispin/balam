@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from balam.attachments import PromptFile
 from balam.store import SessionStore
@@ -51,13 +52,19 @@ class TurnJob:
     while it waited."""
 
     prompt: str
-    session_id: str
+    #: ``None`` for an SDK topic awaiting its first turn (the id is minted then).
+    session_id: str | None
     directory: str
     provider: str | None
     model: str | None
     effort: str | None
     allowed_dirs: list[str]
     files: list[PromptFile]
+    #: Context capabilities forwarded to a stateless backend (SDK) per turn; the
+    #: OpenCode backend applied these at session creation and ignores them here.
+    allowed_tools: list[str] = field(default_factory=list)
+    additional_directories: list[str] = field(default_factory=list)
+    mcp: dict[str, Any] = field(default_factory=dict)
 
 
 class TurnRegistry:

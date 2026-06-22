@@ -33,6 +33,8 @@ whole filesystem; out-of-workspace writes still prompt.
 
 from __future__ import annotations
 
+import fnmatch
+
 from balam.contexts import ContextConfig
 from balam.opencode_tools import Permission, Tool
 
@@ -161,6 +163,31 @@ def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
         rules.append(_allow(Permission.EXTERNAL_DIRECTORY, _external_directory_pattern(directory)))
 
     return rules
+
+
+def evaluate(permission: str, target: str, ruleset: list[dict[str, str]]) -> str:
+    """The effect (``allow`` / ``ask`` / ``deny``) for ``(permission, target)``
+    under ``ruleset``, ported from OpenCode's evaluator (``core/permission.ts``).
+
+    The **last** matching rule wins (so ``build_ruleset``'s ask-all baseline is
+    overridden by the specific allows after it), and an unmatched request defaults
+    to ``ask``. ``permission`` is the category (``read`` / ``edit`` / ``bash`` /
+    a qualified MCP tool name); ``target`` is the resource it acts on (a path, a
+    command, or ``"*"`` when the category has none). Patterns use ``*`` as a
+    glob (matching across ``/`` too, like the server's matcher).
+
+    Where ``build_ruleset`` is the *opt-in* ruleset Balam ships to the OpenCode
+    server, this evaluates the same ruleset **in process** — the Claude Agent SDK
+    backend has no server to delegate to, so it pre-approves a tool call by
+    mapping it to ``(permission, target)`` and reading the effect here.
+    """
+    effect = "ask"
+    for rule in ruleset:
+        if fnmatch.fnmatchcase(permission, rule.get("permission", "*")) and fnmatch.fnmatchcase(
+            target, rule.get("pattern", "*")
+        ):
+            effect = rule.get("action", "ask")
+    return effect
 
 
 def send_file_rules(server_name: str) -> list[dict[str, str]]:

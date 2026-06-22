@@ -81,17 +81,18 @@ def _expand_env(value: Any, *, where: str) -> Any:
 
 
 def split_provider_model(model: str | None) -> tuple[str | None, str | None]:
-    """Split a context's ``model`` (``provider/model``) into its parts.
+    """Split a context's ``model`` into ``(provider, model)``.
 
-    Returns ``(None, None)`` when no model is set (OpenCode then uses its own
-    default). A non-empty value must be provider-qualified.
+    OpenCode wants ``provider/model`` (e.g. ``anthropic/claude-opus-4-8``); the
+    Claude Agent SDK takes a bare Claude id/alias (e.g. ``claude-opus-4-8`` or
+    ``opus``). A bare value is therefore allowed and returns ``(None, model)`` —
+    OpenCode only sends a model when both parts are present (so a bare value falls
+    back to its default), while the SDK uses the bare id directly.
     """
     if not model:
         return None, None
     if "/" not in model:
-        raise ValueError(
-            f"model {model!r} must be 'provider/model' (e.g. 'anthropic/claude-opus-4-8')"
-        )
+        return None, model
     provider, _, rest = model.partition("/")
     return provider, rest
 
@@ -201,6 +202,19 @@ class ContextsConfig(BaseModel):
     def resolve_name(self, name: str | None) -> str:
         """The context name :meth:`get` would use — for persisting the binding."""
         return name if (name and name in self.contexts) else self.default_context
+
+    def match_name(self, name: str | None) -> str | None:
+        """Canonical context key matching ``name`` case-insensitively, or ``None``.
+
+        An exact match wins first, so case-colliding keys (``Balam`` and ``balam``
+        both defined) stay individually addressable; otherwise the first key whose
+        lowercase form matches is returned (``/new Balam`` → ``balam``)."""
+        if not name:
+            return None
+        if name in self.contexts:
+            return name
+        lowered = name.lower()
+        return next((key for key in self.contexts if key.lower() == lowered), None)
 
 
 class ContextsConfigError(Exception):

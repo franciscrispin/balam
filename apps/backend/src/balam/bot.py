@@ -25,6 +25,7 @@ from telegram import (
     Message,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -35,12 +36,12 @@ from telegram.ext import (
     filters,
 )
 
-from balam.approvals import Choice, PendingApprovals, PendingQuestions
+from balam.agent.backend import AgentBackend
+from balam.approvals import Choice, PendingApprovals, PendingDeletions, PendingQuestions
 from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
 from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.miniapp import make_plan_view_button, mini_app_reply
-from balam.opencode import OpenCode
 from balam.router import Router, TopicRef
 from balam.streamer import _question_keyboard, stream_reply
 from balam.telegram_utils import thread_kwargs
@@ -122,6 +123,7 @@ async def _auto_name_topic(
         logger.debug("failed to auto-name topic", exc_info=True)
         return
     router.mark_topic_auto_named(ref)
+    router.set_topic_title(ref.chat_id, ref.thread_id, name)
 
 
 async def _create_topic_from_general(
@@ -278,6 +280,9 @@ async def _submit_turn(
         effort=resolved.effort,
         allowed_dirs=[resolved.directory, *resolved.additional_directories],
         files=files,
+        allowed_tools=resolved.allowed_tools,
+        additional_directories=resolved.additional_directories,
+        mcp=resolved.mcp,
     )
 
     # One turn per topic at a time (ADR-0009). OpenCode runs a single turn per
@@ -308,7 +313,7 @@ def _start_turn(
     interrupt it (PTB processes updates sequentially, so awaiting in the handler
     would block ``/cancel``).
     """
-    opencode: OpenCode = context.application.bot_data["opencode"]
+    backend: AgentBackend = context.application.bot_data["backend"]
     turns: TurnRegistry = context.application.bot_data["turns"]
     pending: PendingApprovals = context.application.bot_data["pending"]
     router: Router = context.application.bot_data["router"]
@@ -332,14 +337,14 @@ def _start_turn(
     async def run() -> None:
         cancelled = False
         try:
-            # Sticky plan mode (/plan): OpenCode's agent selection is per-prompt,
-            # so every prompt while the flag is set must request the plan agent.
-            # Read at turn start — not at enqueue — so a job that waited in the
-            # queue respects a plan approval or /plan off issued in the meantime.
-            agent = "plan" if router.plan_mode(chat_id, thread_id) else None
+            # Sticky plan mode (/plan): the backend maps it to the plan agent /
+            # plan permission mode per turn. Read at turn start — not at enqueue —
+            # so a job that waited in the queue respects a plan approval or
+            # /plan off issued in the meantime.
+            plan_mode = router.plan_mode(chat_id, thread_id)
             await stream_reply(
                 bot=context.bot,
-                opencode=opencode,
+                backend=backend,
                 session_id=job.session_id,
                 chat_id=chat_id,
                 thread_id=thread_id,
@@ -353,10 +358,14 @@ def _start_turn(
                     "pending_questions", PendingQuestions()
                 ),
                 allowed_dirs=job.allowed_dirs,
+                additional_directories=job.additional_directories,
+                allowed_tools=job.allowed_tools,
+                mcp=job.mcp,
                 files=job.files,
-                agent=agent,
+                plan_mode=plan_mode,
                 plan_view=plan_view,
                 on_plan_approved=_on_plan_approved,
+                on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
@@ -483,32 +492,34 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("\n".join(lines))
         return
 
-    name = args[0]
-    if name not in contexts.contexts:
+    name = contexts.match_name(args[0])
+    if name is None:
         available = ", ".join(sorted(contexts.contexts))
-        await message.reply_text(f"Unknown context {name!r}. Available: {available}")
+        await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
         return
 
     await _open_context_topic(message, context.bot, router, name)
 
 
 def _abort_turn(
-    turn: Any, opencode: OpenCode, tasks: set[asyncio.Task[None]]
+    turn: Any, backend: AgentBackend, tasks: set[asyncio.Task[None]]
 ) -> asyncio.Task[None] | None:
-    """Cancel a running turn locally and abort it server-side (best-effort).
+    """Cancel a running turn locally and abort it on the backend (best-effort).
 
-    Cancelling the local task stops streaming; the abort tells OpenCode to stop
-    generating. The abort runs as a background task so callers needn't await the
-    round-trip before replying — but it is anchored in ``tasks`` (with a done
+    Cancelling the local task stops streaming; the abort tells the backend to
+    stop generating. The abort runs as a background task so callers needn't await
+    the round-trip before replying — but it is anchored in ``tasks`` (with a done
     callback that removes it) because the event loop keeps only a *weak*
     reference to a bare task: an unanchored one can be garbage-collected
-    mid-flight, dropping the abort and leaving OpenCode generating. ``None`` when
-    there is no turn.
-    """
+    mid-flight, dropping the abort. ``None`` when there is no turn (or no session
+    id yet, e.g. an SDK turn that hasn't minted one — cancelling the task is
+    enough to tear down its query)."""
     if turn is None:
         return None
     turn.task.cancel()
-    task = asyncio.create_task(opencode.abort_session(turn.session_id, directory=turn.directory))
+    if not turn.session_id:
+        return None
+    task = asyncio.create_task(backend.abort(turn.session_id, directory=turn.directory))
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     return task
@@ -530,10 +541,10 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     router: Router = context.application.bot_data["router"]
     args = context.args or []
     if args:
-        name = args[0]
-        if name not in router.contexts.contexts:
+        name = router.contexts.match_name(args[0])
+        if name is None:
             available = ", ".join(sorted(router.contexts.contexts))
-            await message.reply_text(f"Unknown context {name!r}. Available: {available}")
+            await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
             return
     else:
         ref = TopicRef(
@@ -607,6 +618,7 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     router: Router = context.application.bot_data["router"]
     turns: TurnRegistry = context.application.bot_data["turns"]
+    config: Config = context.application.bot_data["config"]
     ref = TopicRef(
         chat_id=message.chat_id,
         thread_id=message.message_thread_id,
@@ -625,6 +637,7 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines = [
         f"Context: {name}",
+        f"Backend: {config.agent_backend}",
         f"Directory: {ctx.directory}",
         f"Model: {effective_model}",
         f"Effort: {override_effort or ctx.effort or '(server default)'}",
@@ -768,6 +781,7 @@ async def _handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             title=_topic_title(message, message.message_thread_id),
         )
     )
+    router.set_topic_title(message.chat_id, message.message_thread_id, new_name)
     await message.reply_text(f"Renamed topic to {new_name}.")
 
 
@@ -826,7 +840,7 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message is None:
         return
 
-    opencode: OpenCode = context.application.bot_data["opencode"]
+    backend: AgentBackend = context.application.bot_data["backend"]
     turns: TurnRegistry = context.application.bot_data["turns"]
 
     turn = turns.get(message.chat_id, message.message_thread_id)
@@ -845,7 +859,7 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tasks: set[asyncio.Task[None]] = context.application.bot_data.setdefault(
         "background_tasks", set()
     )
-    _abort_turn(turn, opencode, tasks)
+    _abort_turn(turn, backend, tasks)
     if dropped:
         await message.reply_text(f"🛑 Cancelled. Also cleared {dropped} queued message(s).")
     else:
@@ -1049,6 +1063,304 @@ async def _handle_question_custom_callback(
     await _clear_keyboard(query, note=r"Reply with your answer\.")
 
 
+def _topic_label(title: str | None, context_name: str | None, thread_id: int) -> str:
+    """Button label for a topic: its title, else the bound context + thread id
+    (topics created before titles were tracked have no stored title)."""
+    base = title or (f"{context_name} · #{thread_id}" if context_name else f"#{thread_id}")
+    return base if len(base) <= 48 else base[:47] + "…"
+
+
+def _delete_keyboard(
+    token: str,
+    entries: list[tuple[int, str, bool]],
+    page: int = 0,
+    page_count: int = 1,
+    selected_count: int = 0,
+) -> InlineKeyboardMarkup:
+    """Checklist for the current page of topics (``del:<token>:<thread_id>``), a
+    Prev/Next navigation row when the snapshot spans more than one page
+    (``delp:<token>:<page>``), and the confirm/cancel row. ``selected_count`` spans
+    the whole snapshot, so the confirm button reflects picks made on other pages."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                f"{'☑️' if selected else '☐'} {label}",
+                callback_data=f"del:{token}:{thread_id}",
+            )
+        ]
+        for thread_id, label, selected in entries
+    ]
+    if page_count > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"delp:{token}:{page - 1}"))
+        # The indicator points at the current page, so tapping it is a harmless no-op.
+        nav.append(
+            InlineKeyboardButton(
+                f"Page {page + 1}/{page_count}", callback_data=f"delp:{token}:{page}"
+            )
+        )
+        if page < page_count - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"delp:{token}:{page + 1}"))
+        rows.append(nav)
+    confirm_label = "🗑 Delete selected"
+    if selected_count:
+        confirm_label += f" ({selected_count})"
+    rows.append(
+        [
+            InlineKeyboardButton(confirm_label, callback_data=f"deld:{token}"),
+            InlineKeyboardButton("Cancel", callback_data=f"delx:{token}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _delete_markup(
+    pending_deletions: PendingDeletions, token: str
+) -> InlineKeyboardMarkup | None:
+    """Build the picker keyboard from current snapshot state, or ``None`` if the
+    token expired."""
+    entries = pending_deletions.entries(token)
+    info = pending_deletions.page_info(token)
+    if entries is None or info is None:
+        return None
+    page, page_count, _total, selected = info
+    return _delete_keyboard(token, entries, page, page_count, selected)
+
+
+def _callback_authorized(query: Any, config: Config) -> bool:
+    """Re-check the trust boundary (ADR-0008) for a callback: owner id, plus the
+    configured chat when set. Callbacks carry no handler filter, so each must
+    verify the sender itself."""
+    user = query.from_user
+    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+        return False
+    if config.allowed_telegram_chat_id is not None:
+        chat = query.message.chat if query.message else None
+        if chat is None or chat.id != config.allowed_telegram_chat_id:
+            return False
+    return True
+
+
+async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/delete`` — pick forum topics to remove from an inline checklist.
+
+    Lists the topics this bot tracks for the chat; the General topic is never
+    listed (the Bot API can't delete it). Confirming deletes each selected Telegram
+    topic and forgets it locally (all per-topic tables) — the OpenCode session is
+    left warm on the server.
+    """
+    message = update.message
+    if message is None:
+        return
+    router: Router = context.application.bot_data["router"]
+    topics = router.list_topics(message.chat_id)
+    if not topics:
+        await message.reply_text("No topics to delete.")
+        return
+
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    token = pending_deletions.register(
+        message.chat_id,
+        [(thread_id, _topic_label(title, ctx, thread_id)) for thread_id, title, ctx in topics],
+    )
+    text = "🗑 Select topics to delete, then tap “Delete selected”."
+    info = pending_deletions.page_info(token)
+    if info and info[1] > 1:
+        text += (
+            f"\n\n{info[2]} topics across {info[1]} pages — use ◀ ▶ to browse. "
+            "Selections persist across pages."
+        )
+    await message.reply_text(text, reply_markup=_delete_markup(pending_deletions, token))
+
+
+async def _handle_delete_toggle_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Toggle a topic's checkbox in the /delete picker (``del:<token>:<thread_id>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("del:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed selection.")
+        return
+    _, token, thread_id_raw = parts
+    try:
+        thread_id = int(thread_id_raw)
+    except ValueError:
+        await query.answer("Malformed selection.")
+        return
+
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    state = pending_deletions.toggle(token, thread_id)
+    if state is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer("Selected." if state else "Unselected.")
+    markup = _delete_markup(pending_deletions, token)
+    message = getattr(query, "message", None)
+    if markup is None or message is None:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        logger.debug("failed to refresh delete keyboard", exc_info=True)
+
+
+async def _handle_delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Flip the /delete picker to another page (``delp:<token>:<page>``). Selections
+    are kept in the snapshot, so paging never loses what's already checked."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("delp:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed request.")
+        return
+    _, token, page_raw = parts
+    try:
+        page = int(page_raw)
+    except ValueError:
+        await query.answer("Malformed request.")
+        return
+
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    if pending_deletions.set_page(token, page) is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer()
+    markup = _delete_markup(pending_deletions, token)
+    message = getattr(query, "message", None)
+    if markup is None or message is None:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        logger.debug("failed to page delete keyboard", exc_info=True)
+
+
+async def _handle_delete_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Delete the topics selected in the picker (``deld:<token>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("deld:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 1)
+    if len(parts) != 2:
+        await query.answer("Malformed request.")
+        return
+    token = parts[1]
+
+    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    thread_ids = pending_deletions.selected_thread_ids(token)
+    chat_id = pending_deletions.chat_id(token)
+    if thread_ids is None or chat_id is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    if not thread_ids:
+        await query.answer("Select at least one topic.")
+        return
+    pending_deletions.discard(token)
+
+    router: Router = context.application.bot_data["router"]
+    deleted = 0
+    failed = 0
+    for thread_id in thread_ids:
+        try:
+            await context.bot.delete_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+        except BadRequest as exc:
+            # A topic deleted straight from the Telegram UI (Telegram sends no
+            # "topic deleted" update, so its row lingers locally) makes the API
+            # reject re-deletion with TOPIC_ID_INVALID. The topic is already gone,
+            # which is what the user wanted — so fall through and purge the stale
+            # row instead of counting it as a permanent, un-clearable failure.
+            if "topic_id_invalid" not in (exc.message or "").lower():
+                logger.exception("failed to delete forum topic %s", thread_id)
+                failed += 1
+                continue
+            logger.info("topic %s already gone from Telegram; purging stale row", thread_id)
+        except Exception:
+            logger.exception("failed to delete forum topic %s", thread_id)
+            failed += 1
+            continue
+        # The Telegram topic is gone, so drop every local trace of it.
+        router.purge_topic(chat_id, thread_id)
+        deleted += 1
+
+    await query.answer(f"Deleted {deleted} topic(s).")
+    summary = f"🗑 Deleted {deleted} topic(s)."
+    if failed:
+        summary += f" {failed} could not be deleted."
+    message = getattr(query, "message", None)
+    if message is not None:
+        # The picker message may itself sit in a just-deleted topic; ignore the edit
+        # failure that follows.
+        try:
+            await message.edit_text(text=summary, reply_markup=None)
+        except Exception:
+            logger.debug("failed to finalize delete message", exc_info=True)
+
+
+async def _handle_delete_cancel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Dismiss the /delete picker without deleting anything (``delx:<token>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("delx:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 1)
+    if len(parts) == 2:
+        context.application.bot_data["pending_deletions"].discard(parts[1])
+    await query.answer("Cancelled.")
+    message = getattr(query, "message", None)
+    if message is not None:
+        try:
+            await message.edit_text(text="🗑 Delete cancelled.", reply_markup=None)
+        except Exception:
+            logger.debug("failed to finalize cancel message", exc_info=True)
+
+
+async def _handle_topic_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sync the stored title when a topic is renamed from the Telegram UI.
+
+    Every other title change is set by the bot itself; this service-message update
+    is the one path it doesn't originate, so the /delete picker would otherwise show
+    a stale name."""
+    message = update.message
+    if message is None or message.message_thread_id is None:
+        return
+    edited = message.forum_topic_edited
+    if edited is None or not edited.name:
+        return
+    router: Router = context.application.bot_data["router"]
+    router.set_topic_title(message.chat_id, message.message_thread_id, edited.name)
+
+
 async def _clear_keyboard(query: Any, note: str | None = None) -> bool:
     """Strip a spent approval keyboard, appending a one-line outcome when given.
 
@@ -1132,6 +1444,7 @@ BOT_COMMANDS = [
     BotCommand("plan", "Plan mode for this topic (/plan [request], /plan off)"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
+    BotCommand("delete", "Delete topics — pick which ones to remove"),
 ]
 
 
@@ -1154,7 +1467,7 @@ async def register_commands(bot: Bot, chat_id: int | None = None) -> None:
 
 def build_application(
     config: Config,
-    opencode: OpenCode,
+    backend: AgentBackend,
     router: Router,
     *,
     post_init: Any = None,
@@ -1168,7 +1481,7 @@ def build_application(
     app = builder.build()
 
     app.bot_data["config"] = config
-    app.bot_data["opencode"] = opencode
+    app.bot_data["backend"] = backend
     app.bot_data["router"] = router
     # In-flight turns, keyed by topic, so /cancel can interrupt a running reply.
     app.bot_data["turns"] = TurnRegistry()
@@ -1176,6 +1489,8 @@ def build_application(
     app.bot_data["pending"] = PendingApprovals()
     # Outstanding OpenCode question-tool prompts.
     app.bot_data["pending_questions"] = PendingQuestions()
+    # Outstanding /delete topic-picker selections.
+    app.bot_data["pending_deletions"] = PendingDeletions()
     # Anchors fire-and-forget background tasks (e.g. /cancel's server-side abort)
     # so the loop's weak task references can't let them be GC'd mid-flight.
     app.bot_data["background_tasks"] = set()
@@ -1199,11 +1514,18 @@ def build_application(
     app.add_handler(CommandHandler("plan", _handle_plan, filters=allowed))
     app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
     app.add_handler(CommandHandler("browser", _handle_browser, filters=allowed))
+    app.add_handler(CommandHandler("delete", _handle_delete, filters=allowed))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & allowed,
             _handle_message,
         )
+    )
+    # Keep the stored title in step with renames done from the Telegram UI (the one
+    # title change the bot doesn't itself originate). A service message matches
+    # neither commands nor the text/photo handler above, so it falls through here.
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED & allowed, _handle_topic_edited)
     )
     # CallbackQueryHandler takes no filter; the handler re-checks the trust
     # boundary (ADR-0008) itself before resolving an approval.
@@ -1211,5 +1533,9 @@ def build_application(
     app.add_handler(CallbackQueryHandler(_handle_question_done_callback, pattern=r"^qstd:"))
     app.add_handler(CallbackQueryHandler(_handle_question_callback, pattern=r"^qst:"))
     app.add_handler(CallbackQueryHandler(_handle_question_custom_callback, pattern=r"^qstc:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_confirm_callback, pattern=r"^deld:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_cancel_callback, pattern=r"^delx:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_page_callback, pattern=r"^delp:"))
+    app.add_handler(CallbackQueryHandler(_handle_delete_toggle_callback, pattern=r"^del:"))
 
     return app

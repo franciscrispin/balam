@@ -250,3 +250,90 @@ def test_overrides_normalize_general_thread() -> None:
         "claude-sonnet-4",
         "xhigh",
     )
+
+
+# --- titles + /delete picker ---------------------------------------------------
+
+
+def _titles(store: SessionStore, chat_id: int) -> dict[int, str | None]:
+    return {thread_id: title for thread_id, title, _ in store.list_topics(chat_id)}
+
+
+def test_set_persists_title() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_abc", 1, context="balam", title="My topic")
+    assert _titles(store, 100) == {5: "My topic"}
+
+
+def test_set_without_title_preserves_existing() -> None:
+    # persist_session re-saves the row without a title; the stored one must stay.
+    store = fresh_store()
+    store.set(100, 5, "ses_abc", 1, context="balam", title="My topic")
+    store.set(100, 5, "ses_def", 2, context="balam")
+    assert _titles(store, 100) == {5: "My topic"}
+
+
+def test_set_title_updates_in_place() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_abc", 1, context="balam", title="Old")
+    store.set_title(100, 5, "New")
+    assert _titles(store, 100) == {5: "New"}
+
+
+def test_set_title_noop_for_unmapped_topic() -> None:
+    store = fresh_store()
+    store.set_title(100, 5, "Whatever")  # no row yet — must not raise or create one
+    assert store.list_topics(100) == []
+
+
+def test_list_topics_excludes_general_and_orders_newest_first() -> None:
+    store = fresh_store()
+    store.set(100, None, "ses_general", 1, context="balam", title="General")
+    store.set(100, 7, "ses_b", 3, context="scratch", title="Second")
+    store.set(100, 5, "ses_a", 2, context="balam", title="First")
+    assert store.list_topics(100) == [(7, "Second", "scratch"), (5, "First", "balam")]
+
+
+def test_list_topics_is_scoped_per_chat() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_a", 1, context="balam", title="A")
+    store.set(200, 6, "ses_b", 1, context="balam", title="B")
+    assert store.list_topics(100) == [(5, "A", "balam")]
+
+
+def test_purge_clears_every_per_topic_table() -> None:
+    store = fresh_store()
+    store.set(100, 5, "ses_abc", 1, context="balam", title="Doomed")
+    store.mark_auto_named(100, 5)
+    store.set_plan_mode(100, 5, True)
+    store.set_effort_override(100, 5, "high")
+
+    store.purge(100, 5)
+
+    assert store.get_row(100, 5) is None
+    assert store.is_auto_named(100, 5) is False
+    assert store.is_plan_mode(100, 5) is False
+    assert store.get_overrides(100, 5) == (None, None, None)
+    assert store.list_topics(100) == []
+
+
+def test_migrates_schema_without_title_column(tmp_path) -> None:
+    # A DB predating the title column gains it on open, with NULL for old rows.
+    path = str(tmp_path / "no_title.db")
+    db = sqlite3.connect(path)
+    db.execute(
+        """
+        CREATE TABLE topic_sessions (
+            chat_id INTEGER, thread_id INTEGER, session_id TEXT, created_at INTEGER,
+            context TEXT, PRIMARY KEY (chat_id, thread_id)
+        )
+        """
+    )
+    db.execute("INSERT INTO topic_sessions VALUES (100, 5, 'ses_old', 1, 'balam')")
+    db.commit()
+    db.close()
+
+    store = SessionStore(path)
+    assert store.list_topics(100) == [(5, None, "balam")]
+    store.set_title(100, 5, "Backfilled")
+    assert _titles(store, 100) == {5: "Backfilled"}

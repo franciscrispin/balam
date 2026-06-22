@@ -587,6 +587,65 @@ Conditions (all enforced):
 
 ---
 
+## ADR-0014: Pluggable agent backend — OpenCode or the Claude Agent SDK
+
+Status: Accepted Date: 2026-06-16
+
+### Context
+
+ADR-0001/0002/0011 made Balam a thin client of a long-lived OpenCode server over
+HTTP. That contract leaked into the codebase: the streamer parsed OpenCode SSE
+dicts inline, `permissions.py` emitted OpenCode's ruleset wire format, and the
+router called the OpenCode client directly. Running Balam on the **Python Claude
+Agent SDK** instead (e.g. to use Claude models directly rather than OpenCode's
+configured provider) had no seam to slot into.
+
+### Decision
+
+Introduce an `AgentBackend` protocol and a normalized internal event vocabulary
+(`balam.agent.events`, adapted from OpenCode's `LLMEvent`), and select the backend
+with `AGENT_BACKEND` (`opencode` default, or `claude_sdk`). Two implementations:
+
+- **`OpenCodeBackend`** wraps the existing HTTP/SSE client and translates its
+  stream into `AgentEvent`s; session config (ruleset + MCP) is applied eagerly by
+  the router at session creation, as before.
+- **`ClaudeSdkBackend`** drives the SDK with a fresh, stateless `query(resume=…)`
+  per turn — which is what lets model, reasoning effort, and `permission_mode`
+  vary per turn (a persistent `ClaudeSDKClient` cannot change effort mid-session).
+  Sessions are minted lazily and resume from the SDK's on-disk transcripts.
+
+The streamer, approval keyboard, and question flow consume only `AgentEvent`s and
+answer via the backend's reply methods, so they are backend-agnostic.
+
+### Consequences
+
+- **Claude-only in SDK mode.** The SDK runs Claude models, so `AGENT_BACKEND=claude_sdk`
+  necessarily switches the model family to Claude; the `provider` half of a
+  context's `model` is ignored (a bare Claude id/alias is accepted).
+- **Permissions, one intent, two enforcement points.** `build_ruleset` is shipped
+  to the OpenCode server; the same ruleset is evaluated **in process** by the SDK
+  backend's `can_use_tool` via the ported `evaluate()` (last-match-wins). Tools the
+  user pre-approved auto-allow; everything else falls through to Balam's
+  symlink-safe directory boundary (`approvals.decide`) and the human keyboard —
+  identical policy on both backends.
+- **send_file & MCP.** Under OpenCode, `send_file` is a per-topic remote MCP server
+  (scope-token URL); under the SDK it is an in-process SDK tool (closure over the
+  topic) and context MCP servers are coerced to the SDK's `mcp_servers` shape — no
+  HTTP server or token needed.
+- **Plan mode.** OpenCode uses its plan agent; the SDK uses `permission_mode="plan"`
+  and surfaces `ExitPlanMode` as the same Yes/No plan-approval question. Both keep
+  the existing `/plan` flow. Native natural-language planning ("plan feature X" in
+  a normal turn) is preserved on the SDK and is an upgrade over OpenCode/codex,
+  where autonomous plan entry is compiled out.
+- **Coarser live reasoning on the SDK.** Text streams as deltas, but extended
+  thinking is not streamed token-by-token, so the "thinking…" narration is less
+  granular than OpenCode's.
+- **Different process model.** No agent daemon: the SDK spawns the bundled `claude`
+  CLI per turn (auth via `ANTHROPIC_API_KEY` or an already-authenticated CLI), so
+  the OpenCode systemd unit is not needed in SDK mode.
+
+---
+
 ## Summary
 
 | ADR  | Decision                                                                    | Core reason                                                     |
@@ -603,3 +662,4 @@ Conditions (all enforced):
 | 0011 | Backend in Python (FastAPI + PTB), OpenCode over HTTP                       | Reference reuse (zog/open-shrimp); HTTP is the contract (0002)  |
 | 0012 | Workspace contexts in a required `config.yaml`                              | Per-project dir/model/effort/tools; structured config, not env  |
 | 0013 | Expose only the Mini App via an authenticated Cloudflare tunnel (amends 0007) | Mini App needs a public HTTPS origin; `initData` is the boundary |
+| 0014 | Pluggable agent backend (OpenCode or the Claude Agent SDK) via `AGENT_BACKEND` | One seam, normalized events; SDK = Claude models + per-turn config |

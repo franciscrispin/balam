@@ -41,7 +41,9 @@ class TopicRef:
 class ResolvedSession:
     """Everything the streamer needs to prompt a topic's session in context."""
 
-    session_id: str
+    #: ``None`` when a lazily-minted backend (the Claude Agent SDK) hasn't created
+    #: the session yet — the streamer persists the real id on its first turn.
+    session_id: str | None
     context_name: str
     directory: str
     provider: str | None
@@ -50,13 +52,18 @@ class ResolvedSession:
     #: Extra directories the context grants access to, beyond ``directory``;
     #: forwarded to the approval layer's directory boundary (ADR-0012).
     additional_directories: list[str]
+    #: The context's tool opt-ins and MCP servers, forwarded to the turn so a
+    #: stateless backend (SDK) can configure each query; the OpenCode backend
+    #: already applied these at session creation and ignores them per turn.
+    allowed_tools: list[str]
+    mcp: dict[str, Any]
 
 
 class Router:
     def __init__(
         self,
         store: SessionStore,
-        opencode: OpenCode,
+        opencode: OpenCode | None,
         contexts: ContextsConfig,
         *,
         tool_scopes: ToolScopes | None = None,
@@ -64,11 +71,19 @@ class Router:
         qualify_chat: bool = False,
     ) -> None:
         self._store = store
+        # ``None`` for the Claude Agent SDK backend, which mints sessions lazily
+        # per turn rather than eagerly here; the router then only maps rows.
         self._opencode = opencode
         self._contexts = contexts
         self._tool_scopes = tool_scopes
         self._mcp_base_url = mcp_base_url
         self._qualify_chat = qualify_chat
+
+    @property
+    def _eager(self) -> bool:
+        """Whether the backend creates sessions up front (OpenCode) vs lazily
+        on the first turn (the SDK)."""
+        return self._opencode is not None
 
     @property
     def contexts(self) -> ContextsConfig:
@@ -111,10 +126,19 @@ class Router:
         return self._contexts.resolve_name(row[1] if row else None)
 
     def current_session_id(self, ref: TopicRef) -> str | None:
-        """The OpenCode session a topic maps to, or ``None`` if it has none yet
-        (no message has been sent in it). Used by ``/status``."""
+        """The agent session a topic maps to, or ``None`` if it has none yet (no
+        message sent, or an SDK topic still awaiting its first turn). Used by
+        ``/status``. The empty-string placeholder (an SDK topic created by
+        ``/context`` before any turn) reads as ``None``."""
         row = self._store.get_row(ref.chat_id, ref.thread_id)
-        return row[0] if row else None
+        return (row[0] or None) if row else None
+
+    def persist_session(self, chat_id: int, thread_id: int | None, session_id: str) -> None:
+        """Record the real session id a lazily-minted backend (SDK) returned on a
+        topic's first turn, keeping the topic's bound context."""
+        row = self._store.get_row(chat_id, thread_id)
+        context = self._contexts.resolve_name(row[1] if row else None)
+        self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=context)
 
     def plan_mode(self, chat_id: int, thread_id: int | None) -> bool:
         """Whether the topic's prompts should run OpenCode's plan agent (/plan)."""
@@ -161,6 +185,18 @@ class Router:
         """Prevent future first-message auto-renames for this topic."""
         self._store.mark_auto_named(ref.chat_id, ref.thread_id)
 
+    def set_topic_title(self, chat_id: int, thread_id: int | None, title: str) -> None:
+        """Record a topic's current Telegram title (for the ``/delete`` picker)."""
+        self._store.set_title(chat_id, thread_id, title)
+
+    def list_topics(self, chat_id: int) -> list[tuple[int, str | None, str | None]]:
+        """Mapped topics in a chat as ``(thread_id, title, context)`` (no General)."""
+        return self._store.list_topics(chat_id)
+
+    def purge_topic(self, chat_id: int, thread_id: int | None) -> None:
+        """Forget a deleted topic across every per-topic table."""
+        self._store.purge(chat_id, thread_id)
+
     async def create_topic_session(
         self,
         chat_id: int,
@@ -181,11 +217,21 @@ class Router:
         caller validates that ``name`` exists.
         """
         ctx = self._contexts.contexts[name]
-        mcp, permission, _ = self._session_setup(ctx.mcp, build_ruleset(ctx), chat_id, thread_id)
-        session_id = await self._opencode.create_session(
-            title, directory=ctx.directory, permission=permission, mcp=mcp
+        if self._eager:
+            assert self._opencode is not None
+            mcp, permission, _ = self._session_setup(
+                ctx.mcp, build_ruleset(ctx), chat_id, thread_id
+            )
+            session_id = await self._opencode.create_session(
+                title, directory=ctx.directory, permission=permission, mcp=mcp
+            )
+        else:
+            # The SDK mints the session on the topic's first turn; persist an
+            # empty placeholder now so the context binding survives until then.
+            session_id = ""
+        self._store.set(
+            chat_id, thread_id, session_id, int(time.time() * 1000), context=name, title=title
         )
-        self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=name)
         if auto_named:
             # The topic is created already carrying its name, so its first message
             # must not trigger a first-message auto-rename.
@@ -199,41 +245,15 @@ class Router:
         bound_name = row[1] if row else None
         ctx = self._contexts.get(bound_name)
         context_name = self._contexts.resolve_name(bound_name)
-        mcp, permission, balam_server = self._session_setup(
-            ctx.mcp, build_ruleset(ctx), ref.chat_id, ref.thread_id
-        )
+        existing = (row[0] or None) if row else None
 
-        existing = row[0] if row else None
-        if existing and await self._opencode.session_exists(existing, directory=ctx.directory):
-            session_id = existing
-            await self._opencode.update_session_permission(
-                session_id, directory=ctx.directory, permission=permission
-            )
-            if balam_server is not None:
-                # OpenCode's MCP registry is in-memory while sessions persist on
-                # disk, so a reused session may have lost its tool server to an
-                # OpenCode restart. The name is deterministic and the token stable,
-                # so re-registering is an idempotent overwrite (cheap: a remote
-                # client handshake against our own localhost endpoint). Best-effort
-                # like update_session_permission — never blocks the turn.
-                name, config = balam_server
-                await self._opencode.register_mcp(name, config, directory=ctx.directory)
+        if self._eager:
+            session_id: str | None = await self._resolve_opencode(ref, ctx, context_name, existing)
         else:
-            if existing:
-                # Mapped session is gone server-side: clear the stale row, recreate.
-                # The auto-naming marker is kept (it lives in its own table), so the
-                # topic's name carries across the recreate.
-                self._store.delete(ref.chat_id, ref.thread_id)
-            session_id = await self._opencode.create_session(
-                ref.title, directory=ctx.directory, permission=permission, mcp=mcp
-            )
-            self._store.set(
-                ref.chat_id,
-                ref.thread_id,
-                session_id,
-                int(time.time() * 1000),
-                context=context_name,
-            )
+            # The SDK mints/resumes the session itself per turn; just forward the
+            # persisted id (or None for a topic awaiting its first turn). The
+            # streamer persists the real id via persist_session on SessionStarted.
+            session_id = existing
 
         provider, model = ctx.provider_model
         override_provider, override_model, override_effort = self._store.get_overrides(
@@ -247,4 +267,46 @@ class Router:
             model=override_model or model,
             effort=override_effort or ctx.effort,
             additional_directories=list(ctx.additional_directories),
+            allowed_tools=list(ctx.allowed_tools),
+            mcp=dict(ctx.mcp),
         )
+
+    async def _resolve_opencode(
+        self, ref: TopicRef, ctx: Any, context_name: str, existing: str | None
+    ) -> str:
+        """Eagerly create or reuse the topic's OpenCode session (and its MCP /
+        permission setup), returning the live session id."""
+        assert self._opencode is not None
+        mcp, permission, balam_server = self._session_setup(
+            ctx.mcp, build_ruleset(ctx), ref.chat_id, ref.thread_id
+        )
+        if existing and await self._opencode.session_exists(existing, directory=ctx.directory):
+            await self._opencode.update_session_permission(
+                existing, directory=ctx.directory, permission=permission
+            )
+            if balam_server is not None:
+                # OpenCode's MCP registry is in-memory while sessions persist on
+                # disk, so a reused session may have lost its tool server to an
+                # OpenCode restart. The name is deterministic and the token stable,
+                # so re-registering is an idempotent overwrite (cheap: a remote
+                # client handshake against our own localhost endpoint). Best-effort
+                # like update_session_permission — never blocks the turn.
+                name, config = balam_server
+                await self._opencode.register_mcp(name, config, directory=ctx.directory)
+            return existing
+        if existing:
+            # Mapped session is gone server-side: clear the stale row, recreate.
+            # The auto-naming marker is kept (its own table), so the name carries.
+            self._store.delete(ref.chat_id, ref.thread_id)
+        session_id = await self._opencode.create_session(
+            ref.title, directory=ctx.directory, permission=permission, mcp=mcp
+        )
+        self._store.set(
+            ref.chat_id,
+            ref.thread_id,
+            session_id,
+            int(time.time() * 1000),
+            context=context_name,
+            title=ref.title,
+        )
+        return session_id

@@ -24,7 +24,10 @@ import sys
 import uvicorn
 from telegram.ext import Application
 
-from balam.agent_tools import ToolScopes
+from balam.agent.backend import AgentBackend
+from balam.agent.claude_sdk_backend import ClaudeSdkBackend
+from balam.agent.opencode_backend import OpenCodeBackend
+from balam.agent_tools import ToolScopes, create_send_file_tool
 from balam.bot import build_application, register_commands
 from balam.config import ConfigError, load_config
 from balam.content_store import ContentStore
@@ -55,26 +58,44 @@ def main() -> None:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
 
-    opencode = OpenCode(
-        base_url=config.opencode_base_url,
-        username=config.opencode_server_username,
-        password=config.opencode_server_password,
-    )
     store = SessionStore(config.db_path)
     # The viewer snapshots + per-topic tool scopes feed both the bot (buttons,
     # send_file delivery) and the FastAPI server (the /api + /mcp routes).
     content_store = ContentStore()
     tool_scopes = ToolScopes()
-    router = Router(
-        store,
-        opencode,
-        contexts,
-        tool_scopes=tool_scopes,
-        # OpenCode dials Balam's own Mini App server for agent tools (ADR-0007:
-        # both live on this VM, loopback only).
-        mcp_base_url=f"http://127.0.0.1:{config.balam_port}",
-        qualify_chat=config.allowed_telegram_chat_id is None,
-    )
+
+    # Select the agent backend (ADR-0013). OpenCode is a long-lived server we
+    # configure per session (router eagerly creates sessions + registers MCP);
+    # the Claude Agent SDK mints sessions lazily per turn and serves send_file
+    # as an in-process tool, so the router maps rows only and the OpenCode client
+    # is absent.
+    backend: AgentBackend
+    opencode: OpenCode | None
+    if config.agent_backend == "claude_sdk":
+        opencode = None
+        sdk_backend = ClaudeSdkBackend(
+            api_key=config.anthropic_api_key,
+            cli_path=config.claude_sdk_cli_path,
+        )
+        backend = sdk_backend
+        router = Router(store, None, contexts)
+    else:
+        opencode = OpenCode(
+            base_url=config.opencode_base_url,
+            username=config.opencode_server_username,
+            password=config.opencode_server_password,
+        )
+        backend = OpenCodeBackend(opencode)
+        router = Router(
+            store,
+            opencode,
+            contexts,
+            tool_scopes=tool_scopes,
+            # OpenCode dials Balam's own Mini App server for agent tools (ADR-0007:
+            # both live on this VM, loopback only).
+            mcp_base_url=f"http://127.0.0.1:{config.balam_port}",
+            qualify_chat=config.allowed_telegram_chat_id is None,
+        )
 
     # The Mini App server runs in the bot's event loop (one asyncio task), so the
     # bot, OpenCode SSE, and HTTP share a process (ADR-0007). Created in
@@ -88,9 +109,26 @@ def main() -> None:
         # registered list, not just by delivery).
         await register_commands(application.bot, config.allowed_telegram_chat_id)
         logger.info("registered bot commands (chat scope %s)", config.allowed_telegram_chat_id)
-        logger.info("waiting for OpenCode at %s ...", config.opencode_base_url)
-        await opencode.wait_for_ready()
-        logger.info("OpenCode is ready.")
+        logger.info("waiting for the %s backend ...", config.agent_backend)
+        await backend.wait_for_ready()
+        logger.info("%s backend is ready.", config.agent_backend)
+
+        # The SDK serves send_file as an in-process tool; wire its per-topic
+        # factory now that the bot (and its username) exists.
+        if isinstance(backend, ClaudeSdkBackend):
+            bot_username = application.bot.username
+
+            def _send_file_factory(chat_id: int, thread_id: int | None):
+                return create_send_file_tool(
+                    application.bot,
+                    chat_id,
+                    thread_id,
+                    config=config,
+                    bot_username=bot_username,
+                    content_store=content_store,
+                )
+
+            backend.set_send_file_factory(_send_file_factory)
 
         # The bot is initialized by post_init time, so its username is available
         # for t.me Mini App links; bot_data carries the store to the streamer's
@@ -122,12 +160,12 @@ def main() -> None:
         finally:
             # Always release process resources, even if the server task raised
             # (e.g. a bind failure surfacing here) — its exception must not skip
-            # OpenCode/SQLite teardown.
-            await opencode.aclose()
+            # backend/SQLite teardown.
+            await backend.aclose()
             store.close()
 
     app = build_application(
-        config, opencode, router, post_init=_post_init, post_shutdown=_post_shutdown
+        config, backend, router, post_init=_post_init, post_shutdown=_post_shutdown
     )
 
     logger.info(

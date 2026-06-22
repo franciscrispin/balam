@@ -3,14 +3,17 @@ from types import SimpleNamespace
 
 from telegram import InlineKeyboardButton
 
+from balam.agent.opencode_backend import OpenCodeBackend, _plan_path_from_question
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile
 from balam.streamer import (
     DraftSession,
     _make_transport,
-    plan_path_from_question,
     stream_reply,
 )
+
+# The plan-path helper moved to the OpenCode backend; keep the old name for tests.
+plan_path_from_question = _plan_path_from_question
 
 
 class FakeTransport:
@@ -402,7 +405,7 @@ async def _run(events: list[dict[str, object]], *, directory: str | None = None)
     bot = FakeBot()
     await stream_reply(
         bot=bot,
-        opencode=FakeOpenCode(events),
+        backend=OpenCodeBackend(FakeOpenCode(events)),
         session_id=SID,
         chat_id=1,
         thread_id=99,
@@ -427,12 +430,14 @@ async def test_stream_reply_in_group_chat_never_attempts_a_native_draft() -> Non
     bot = DraftRecordingBot()
     await stream_reply(
         bot=bot,
-        opencode=FakeOpenCode(
-            [
-                _msg_updated("assistant", AID),
-                _text_part(AID, "hey there"),
-                _ev("session.idle", sessionID=SID),
-            ]
+        backend=OpenCodeBackend(
+            FakeOpenCode(
+                [
+                    _msg_updated("assistant", AID),
+                    _text_part(AID, "hey there"),
+                    _ev("session.idle", sessionID=SID),
+                ]
+            )
         ),
         session_id=SID,
         chat_id=-1003953430909,
@@ -646,17 +651,19 @@ async def test_stream_reply_answer_ends_the_turn_after_progress_overflow() -> No
     bot = TimelineBot()
     await stream_reply(
         bot=bot,
-        opencode=PacedOpenCode(
-            [
-                _msg_updated("assistant", AID),
-                _reasoning_part(AID, "thinking"),
-                "SLEEP",  # flush → reasoning bubble created
-                _text_part(AID, "the answer"),
-                "SLEEP",  # flush → answer bubble created below it
-                _reasoning_part(AID, long_reasoning),
-                "SLEEP",  # flush defers (overflows one chunk)
-                _ev("session.idle", sessionID=SID),
-            ]
+        backend=OpenCodeBackend(
+            PacedOpenCode(
+                [
+                    _msg_updated("assistant", AID),
+                    _reasoning_part(AID, "thinking"),
+                    "SLEEP",  # flush → reasoning bubble created
+                    _text_part(AID, "the answer"),
+                    "SLEEP",  # flush → answer bubble created below it
+                    _reasoning_part(AID, long_reasoning),
+                    "SLEEP",  # flush defers (overflows one chunk)
+                    _ev("session.idle", sessionID=SID),
+                ]
+            )
         ),
         session_id=SID,
         chat_id=-1003953430909,  # supergroup → live-edit streaming
@@ -684,15 +691,17 @@ async def test_stream_reply_answer_bubble_is_reused_when_nothing_landed_below() 
     bot = TimelineBot()
     await stream_reply(
         bot=bot,
-        opencode=PacedOpenCode(
-            [
-                _msg_updated("assistant", AID),
-                _reasoning_part(AID, "thinking"),
-                "SLEEP",  # flush → reasoning bubble created
-                _text_part(AID, "the answer"),
-                "SLEEP",  # flush → answer bubble created (and stays last)
-                _ev("session.idle", sessionID=SID),
-            ]
+        backend=OpenCodeBackend(
+            PacedOpenCode(
+                [
+                    _msg_updated("assistant", AID),
+                    _reasoning_part(AID, "thinking"),
+                    "SLEEP",  # flush → reasoning bubble created
+                    _text_part(AID, "the answer"),
+                    "SLEEP",  # flush → answer bubble created (and stays last)
+                    _ev("session.idle", sessionID=SID),
+                ]
+            )
         ),
         session_id=SID,
         chat_id=-1003953430909,
@@ -758,7 +767,7 @@ async def test_stream_reply_forwards_context_to_prompt() -> None:
     )
     await stream_reply(
         bot=bot,
-        opencode=oc,
+        backend=OpenCodeBackend(oc),
         session_id=SID,
         chat_id=1,
         thread_id=99,
@@ -796,7 +805,7 @@ async def test_stream_reply_forwards_files_to_prompt() -> None:
 
     await stream_reply(
         bot=bot,
-        opencode=oc,
+        backend=OpenCodeBackend(oc),
         session_id=SID,
         chat_id=1,
         thread_id=99,
@@ -934,7 +943,7 @@ async def test_permission_auto_allows_read_in_workspace() -> None:
     bot = FakeBot()
     await stream_reply(
         bot=bot,
-        opencode=oc,
+        backend=OpenCodeBackend(oc),
         session_id=SID,
         chat_id=1,
         thread_id=99,
@@ -964,7 +973,7 @@ async def test_permission_asks_and_denies_out_of_scope_read() -> None:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1009,7 +1018,7 @@ async def test_permission_prompt_includes_category_when_different_from_tool() ->
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1049,7 +1058,7 @@ async def test_permission_accept_all_edits_unblocks_session() -> None:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1088,7 +1097,7 @@ async def test_question_permission_auto_allows_without_keyboard() -> None:
 
     await stream_reply(
         bot=bot,
-        opencode=oc,
+        backend=OpenCodeBackend(oc),
         session_id=SID,
         chat_id=1,
         thread_id=99,
@@ -1118,7 +1127,7 @@ async def test_question_asked_sends_inline_questions_and_replies() -> None:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1162,7 +1171,7 @@ async def test_question_asked_multi_select_preserves_multiple_answers() -> None:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1282,7 +1291,7 @@ async def test_plan_exit_question_carries_view_plan_button(tmp_path) -> None:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1329,7 +1338,7 @@ async def test_plan_exit_question_without_plan_file_sends_plain_keyboard(tmp_pat
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1373,7 +1382,7 @@ async def test_ordinary_question_does_not_call_plan_view() -> None:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1409,7 +1418,7 @@ async def test_stream_reply_subscribes_before_prompting() -> None:
     try:
         await stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1424,18 +1433,18 @@ async def test_stream_reply_subscribes_before_prompting() -> None:
 # --- sticky plan mode (/plan): agent forwarding + on_plan_approved ------------
 
 
-async def test_stream_reply_forwards_agent_to_prompt() -> None:
+async def test_stream_reply_plan_mode_forwards_plan_agent_to_prompt() -> None:
     bot = FakeBot()
     oc = PromptGatedOpenCode([_ev("session.idle", sessionID=SID)])
     await stream_reply(
         bot=bot,
-        opencode=oc,
+        backend=OpenCodeBackend(oc),
         session_id=SID,
         chat_id=1,
         thread_id=99,
         prompt="plan it",
         directory="/work/proj",
-        agent="plan",
+        plan_mode=True,
         draft_interval=0.01,
     )
     assert oc.prompt_kwargs["agent"] == "plan"
@@ -1463,7 +1472,7 @@ async def _run_plan_question_turn(answer_label: str, tmp_path) -> list[str]:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,
@@ -1514,7 +1523,7 @@ async def test_ordinary_question_does_not_fire_on_plan_approved() -> None:
     task = asyncio.create_task(
         stream_reply(
             bot=bot,
-            opencode=oc,
+            backend=OpenCodeBackend(oc),
             session_id=SID,
             chat_id=1,
             thread_id=99,

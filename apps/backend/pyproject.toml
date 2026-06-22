@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.4",
     # config.yaml workspace contexts (adapted from OpenShrimp).
     "pyyaml>=6.0",
+    "claude-agent-sdk>=0.2.102",
 ]
 
 [project.scripts]

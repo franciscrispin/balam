@@ -9,6 +9,7 @@ systemd unit) take precedence over the repo-root ``.env`` used in local dev.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -47,10 +48,24 @@ class Config(BaseSettings):
     # legacy owner-anywhere behavior.
     allowed_telegram_chat_id: int | None = None
 
+    # --- Agent backend (ADR-0013) ---
+    # Which coding-agent runtime drives Balam: the OpenCode server (default) or
+    # the in-process Claude Agent SDK. The OpenCode settings below matter only for
+    # "opencode"; the SDK auth below matters only for "claude_sdk".
+    agent_backend: Literal["opencode", "claude_sdk"] = "opencode"
+
     # --- OpenCode server (ADR-0001/0002/0007) ---
     opencode_base_url: str = "http://127.0.0.1:4096"
     opencode_server_username: str = "opencode"
     opencode_server_password: str | None = None
+
+    # --- Claude Agent SDK (ADR-0013) ---
+    # API key for the SDK's subprocess. Optional: if unset, the SDK falls back to
+    # ANTHROPIC_API_KEY in the environment or an already-authenticated Claude CLI
+    # (e.g. a subscription login), so we never hard-require it here.
+    anthropic_api_key: str | None = None
+    # Override the bundled `claude` CLI path the SDK spawns, if needed.
+    claude_sdk_cli_path: str | None = None
 
     # --- Balam backend ---
     balam_db_path: str | None = None
@@ -79,6 +94,8 @@ class Config(BaseSettings):
 
     @field_validator(
         "opencode_server_password",
+        "anthropic_api_key",
+        "claude_sdk_cli_path",
         "balam_db_path",
         "balam_config_path",
         "allowed_telegram_chat_id",
