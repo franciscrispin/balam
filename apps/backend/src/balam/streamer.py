@@ -376,18 +376,26 @@ def _render_tool_part(
 ) -> str:
     """Render a terminal tool part as a compact GFM line for the stream.
 
-    Bash is special-cased to show the command and its (truncated) output in
-    fenced blocks; everything else is a one-liner like ``🔧 Read src/foo.py``.
+    Bash is special-cased to show its natural-language ``description`` and the
+    command in a fenced block; successful output is omitted (it is the noise the
+    stream drowns in, and the full output is available in the Mini App), and only
+    a failed call's tail is kept. Everything else is a one-liner like
+    ``🔧 Read src/foo.py``.
     """
     if tool == Tool.BASH:
         command = tool_input.get("command", "")
-        line = "🔧 Bash"
+        description = tool_input.get("description", "")
+        line = f"🔧 Bash — {description}" if description else "🔧 Bash"
         if command:
             line += f"\n```\n{command}\n```"
-        payload = error if status == "error" else output
-        body = _truncate_output(_coerce_output(payload))
-        if body:
-            line += f"\n```\n{body}\n```"
+        # Only a failed call's output is actionable. ``status == "error"`` is the
+        # backends' authoritative signal (SDK: tool_result.is_error; OpenCode:
+        # tool-state status), with the payload in ``error`` (``output`` as a
+        # fallback, since OpenCode may carry partial output alongside the error).
+        if status == "error":
+            body = _truncate_output(_coerce_output(error) or _coerce_output(output))
+            if body:
+                line += f"\n```\n{body}\n```"
         return line
 
     display = _TOOL_DISPLAY.get(tool, tool)
@@ -415,7 +423,16 @@ def _format_approval_request(
         header += f"\nPermission: `{category}`"
     if tool == Tool.BASH:
         command = tool_input.get("command", "")
-        return f"{header}\n```\n{command}\n```" if command else header
+        # The tool's natural-language ``description`` (e.g. "Install acli via apt
+        # repository") is the *reason* for the call — surface it so the prompt
+        # explains what it's approving, not just the raw command.
+        description = tool_input.get("description", "")
+        body = header
+        if description:
+            body += f"\n_{description}_"
+        if command:
+            body += f"\n```\n{command}\n```"
+        return body
     summary = _tool_summary(tool, tool_input, directory)
     return f"{header}\n`{summary}`" if summary else header
 
