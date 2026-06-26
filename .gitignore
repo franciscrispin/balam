@@ -46,3 +46,6 @@ __pycache__/
 
 # Generated public-mode overlay (holds the current tunnel URL; ADR-0013 deploy)
 deploy/balam.env
+
+# Google Calendar OAuth client + token files
+.secrets/
