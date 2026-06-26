@@ -8,6 +8,7 @@ from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile
 from balam.streamer import (
     DraftSession,
+    _format_approval_request,
     _make_transport,
     stream_reply,
 )
@@ -713,7 +714,7 @@ async def test_stream_reply_answer_bubble_is_reused_when_nothing_landed_below() 
     assert len([op for op in bot.timeline if op[0] == "send"]) == 2
 
 
-async def test_stream_reply_truncates_bash_output() -> None:
+async def test_stream_reply_omits_successful_bash_output() -> None:
     long_output = "\n".join(f"line {i}" for i in range(200))
     bot = await _run(
         [
@@ -721,7 +722,31 @@ async def test_stream_reply_truncates_bash_output() -> None:
             _tool_part(
                 "call_b",
                 "bash",
-                {"status": "completed", "input": {"command": "seq 200"}, "output": long_output},
+                {
+                    "status": "completed",
+                    "input": {"command": "seq 200", "description": "Print the numbers"},
+                    "output": long_output,
+                },
+            ),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    final = bot.messages[0]
+    assert "🔧 Bash — Print the numbers" in final  # the description is the reason
+    assert "seq 200" in final  # the command is shown
+    assert "line 199" not in final  # successful output is omitted (noise)
+    assert "line 0" not in final
+
+
+async def test_stream_reply_keeps_failed_bash_output_tail() -> None:
+    long_output = "\n".join(f"line {i}" for i in range(200))
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "call_b",
+                "bash",
+                {"status": "error", "input": {"command": "seq 200"}, "error": long_output},
             ),
             _ev("session.idle", sessionID=SID),
         ]
@@ -729,9 +754,27 @@ async def test_stream_reply_truncates_bash_output() -> None:
     final = bot.messages[0]
     assert "🔧 Bash" in final
     assert "seq 200" in final  # the command is shown
-    assert "truncated" in final
+    assert "truncated" in final  # a failed call keeps its (truncated) tail
     assert "line 199" in final  # the tail is kept
     assert "line 0" not in final  # the head is dropped
+
+
+def test_format_approval_request_bash_shows_description_reason() -> None:
+    gfm = _format_approval_request(
+        "bash",
+        {"command": "sudo apt install -y acli", "description": "Install acli via apt repository"},
+        directory="/work/proj",
+        category="bash",
+    )
+    assert "Install acli via apt repository" in gfm  # the reason for the call
+    assert "sudo apt install -y acli" in gfm  # the command itself
+
+
+def test_format_approval_request_bash_without_description() -> None:
+    gfm = _format_approval_request(
+        "bash", {"command": "ls -la"}, directory="/work/proj", category="bash"
+    )
+    assert "ls -la" in gfm
 
 
 class PromptGatedOpenCode(FakeOpenCode):
