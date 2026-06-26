@@ -19,7 +19,7 @@ from claude_agent_sdk import (
 )
 
 from balam.agent.backend import TurnRequest
-from balam.agent.claude_sdk_backend import ClaudeSdkBackend, coerce_sdk_mcp_config
+from balam.agent.claude_sdk_backend import ClaudeSdkBackend, _category, coerce_sdk_mcp_config
 from balam.agent.events import (
     PermissionRequested,
     QuestionAsked,
@@ -346,6 +346,30 @@ async def test_ask_user_question_multiselect_comma_joins_and_decline_denies() ->
     assert isinstance(captured[0], PermissionResultAllow)
     assert captured[0].updated_input["answers"] == {"Pick features": "A, B"}
     assert isinstance(captured[1], PermissionResultDeny)
+
+
+def test_category_collapses_mcp_name_to_ruleset_form() -> None:
+    # An MCP tool must collapse to the OpenCode ``server_tool`` wire form so it
+    # matches a ``build_ruleset`` rule (parse_allowed_tool collapses entries the
+    # same way); the qualified ``mcp__server__tool`` name would never match.
+    assert _category("mcp__google_calendar__list-events") == "google_calendar_list-events"
+    assert _category("mcp__github__create_issue") == "github_create_issue"
+    # Non-MCP tools keep their existing category mapping.
+    assert _category("Read") == "read"
+    assert _category("Bash") == "bash"
+
+
+def test_mcp_wildcard_allow_pre_approves_via_evaluate() -> None:
+    from balam.contexts import ContextConfig
+    from balam.permissions import build_ruleset, evaluate
+
+    ctx = ContextConfig(
+        directory="/tmp/ws", description="x", allowed_tools=["mcp__google_calendar__*"]
+    )
+    ruleset = build_ruleset(ctx)
+    assert evaluate(_category("mcp__google_calendar__list-events"), "*", ruleset) == "allow"
+    # An unrelated server stays gated.
+    assert evaluate(_category("mcp__notion__search"), "*", ruleset) == "ask"
 
 
 def test_coerce_mcp_local_to_stdio() -> None:

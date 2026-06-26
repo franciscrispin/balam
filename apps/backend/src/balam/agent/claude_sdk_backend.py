@@ -112,6 +112,15 @@ def _wire_tool(name: str) -> str:
 
 
 def _category(name: str) -> str:
+    # MCP tools evaluate against the same ruleset OpenCode ships, which keys them
+    # by the collapsed ``server_tool`` form (see :func:`parse_allowed_tool`). The
+    # SDK hands us the qualified ``mcp__server__tool`` name, so collapse it the
+    # same way or no ``allowed_tools`` MCP entry could ever match (it would always
+    # fall through to "ask").
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        if len(parts) == 3:
+            return f"{parts[1]}_{parts[2]}"
     return _CATEGORY.get(name, name)
 
 
@@ -490,7 +499,7 @@ class ClaudeSdkBackend:
             # answers is one label-list per question; the tool keys its result on
             # the question text and wants multi-select answers comma-joined.
             answers_record: dict[str, str] = {}
-            for question, selected in zip(raw_questions, answers):
+            for question, selected in zip(raw_questions, answers, strict=False):
                 if isinstance(question, dict):
                     answers_record[question.get("question", "")] = ", ".join(selected)
             updated = dict(input_data)
