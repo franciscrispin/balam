@@ -3,7 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { ErrorState } from "@/components/states/error-state";
 import { Button } from "@/components/ui/button";
-import { ApiError, getBrowserStatus, getInitData } from "@/lib/api";
+import { ApiError, AUTH_ERROR_MESSAGE, getBrowserStatus, getInitData } from "@/lib/api";
 
 type Conn =
   | "checking" // probing /api/browser/status
@@ -101,7 +101,7 @@ export default function BrowserView() {
               </p>
             </>
           ) : conn === "auth-error" ? (
-            <ErrorState message="Couldn't verify this Mini App session." />
+            <ErrorState message={AUTH_ERROR_MESSAGE} />
           ) : (
             <ErrorState
               message={

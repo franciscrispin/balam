@@ -61,7 +61,8 @@ from balam.agent.events import (
 )
 from balam.agent_tools import AgentTool
 from balam.contexts import ContextConfig
-from balam.permissions import build_ruleset, evaluate
+from balam.mcp_config import parse_mcp_config
+from balam.permissions import build_ruleset, collapse_mcp_name, evaluate
 
 logger = logging.getLogger(__name__)
 
@@ -88,22 +89,11 @@ _WIRE_TOOL: dict[str, str] = {
 }
 
 #: SDK tool name → Balam permission *category* (what :func:`balam.approvals.decide`
-#: keys on). Every file mutation collapses to ``edit``; unknown tools keep their
-#: name so the boundary policy treats them as "ask".
+#: keys on). Derived from ``_WIRE_TOOL``: every file mutation collapses to
+#: ``edit``; unknown tools keep their name so the boundary policy treats them as
+#: "ask".
 _CATEGORY: dict[str, str] = {
-    "Read": "read",
-    "Bash": "bash",
-    "Edit": "edit",
-    "Write": "edit",
-    "MultiEdit": "edit",
-    "NotebookEdit": "edit",
-    "Glob": "glob",
-    "Grep": "grep",
-    "LS": "list",
-    "WebFetch": "webfetch",
-    "WebSearch": "websearch",
-    "Task": "task",
-    "TodoWrite": "todowrite",
+    sdk: "edit" if wire in {"write", "edit"} else wire for sdk, wire in _WIRE_TOOL.items()
 }
 
 
@@ -113,15 +103,11 @@ def _wire_tool(name: str) -> str:
 
 def _category(name: str) -> str:
     # MCP tools evaluate against the same ruleset OpenCode ships, which keys them
-    # by the collapsed ``server_tool`` form (see :func:`parse_allowed_tool`). The
-    # SDK hands us the qualified ``mcp__server__tool`` name, so collapse it the
-    # same way or no ``allowed_tools`` MCP entry could ever match (it would always
-    # fall through to "ask").
-    if name.startswith("mcp__"):
-        parts = name.split("__", 2)
-        if len(parts) == 3:
-            return f"{parts[1]}_{parts[2]}"
-    return _CATEGORY.get(name, name)
+    # by the collapsed ``server_tool`` form. The SDK hands us the qualified
+    # ``mcp__server__tool`` name, so collapse it the same way (shared with
+    # :func:`balam.permissions.parse_allowed_tool`) or no ``allowed_tools`` MCP
+    # entry could ever match (it would always fall through to "ask").
+    return collapse_mcp_name(name) or _CATEGORY.get(name, name)
 
 
 def _normalize_input(tool_input: dict[str, Any]) -> dict[str, Any]:
@@ -137,57 +123,32 @@ def _normalize_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return tool_input
 
 
-def coerce_sdk_mcp_config(name: str, raw_config: Any) -> dict[str, Any]:
+def coerce_sdk_mcp_config(name: str, raw_config: Any) -> dict[str, Any] | None:
     """Normalise one context MCP server entry into the SDK's ``mcp_servers`` shape.
 
-    Mirrors :func:`balam.opencode.coerce_mcp_config` but targets the SDK's TypedDicts:
-    stdio ``{"type":"stdio","command","args","env"}`` and remote
-    ``{"type":"sse"|"http","url","headers"}``. The same loose ``config.yaml``
-    spellings are accepted (already env-expanded + shape-validated at load).
+    Parsing/validation lives in :func:`balam.mcp_config.parse_mcp_config` (shared
+    with :func:`balam.opencode.coerce_mcp_config`); this projects the spec onto
+    the SDK's TypedDicts: stdio ``{"type":"stdio","command","args","env"}`` and
+    remote ``{"type":"sse"|"http","url","headers"}``. ``type: remote`` defaults
+    to http; OpenCode's ``oauth`` toggle has no SDK counterpart. ``enabled: false``
+    returns None — the SDK has no wire toggle, so the disable is honored by not
+    registering the server at all.
     """
-    if not isinstance(raw_config, dict):
-        raise ValueError(f"MCP server {name!r} config must be a mapping")
-    config = dict(raw_config)
-
-    # `command: "uvx"` + `args: [...]` shorthand → an stdio server.
-    if "command" in config and config.get("type") not in {"local", "remote", "http", "sse"}:
-        command = config["command"]
-        if not isinstance(command, str) or not command:
-            raise ValueError(f"MCP server {name!r} command must be a non-empty string")
-        out: dict[str, Any] = {"type": "stdio", "command": command}
-        args = config.get("args", [])
-        if args:
-            out["args"] = [str(a) for a in args]
-        env = config.get("env", config.get("environment"))
-        if env:
-            out["env"] = {str(k): str(v) for k, v in env.items()}
+    spec = parse_mcp_config(name, raw_config)
+    if spec.enabled is False:
+        return None
+    out: dict[str, Any]
+    if spec.kind == "local":
+        out = {"type": "stdio", "command": spec.command[0]}
+        if len(spec.command) > 1:
+            out["args"] = list(spec.command[1:])
+        if spec.environment:
+            out["env"] = spec.environment
         return out
-
-    cfg_type = config.get("type")
-    if cfg_type == "local":
-        command = config.get("command")
-        if not isinstance(command, list) or not command:
-            raise ValueError(f"MCP server {name!r} local command must be a non-empty list")
-        out = {"type": "stdio", "command": str(command[0])}
-        if len(command) > 1:
-            out["args"] = [str(a) for a in command[1:]]
-        env = config.get("environment", config.get("env"))
-        if env:
-            out["env"] = {str(k): str(v) for k, v in env.items()}
-        return out
-
-    if cfg_type in {"remote", "http", "sse"}:
-        url = config.get("url")
-        if not isinstance(url, str) or not url:
-            raise ValueError(f"MCP server {name!r} remote config requires a url")
-        # OpenCode collapses http/sse to "remote"; default that to http here.
-        out = {"type": "sse" if cfg_type == "sse" else "http", "url": url}
-        headers = config.get("headers")
-        if isinstance(headers, dict):
-            out["headers"] = {str(k): str(v) for k, v in headers.items()}
-        return out
-
-    raise ValueError(f"MCP server {name!r} must be local (command) or remote (url)")
+    out = {"type": "sse" if spec.transport == "sse" else "http", "url": spec.url}
+    if spec.headers:
+        out["headers"] = spec.headers
+    return out
 
 
 def _content_blocks(prompt: str, files: list[Any]) -> str | list[dict[str, Any]]:
@@ -324,9 +285,12 @@ class ClaudeSdkBackend:
         servers: dict[str, Any] = {}
         for name, raw in (turn.mcp or {}).items():
             try:
-                servers[name] = coerce_sdk_mcp_config(name, raw)
+                coerced = coerce_sdk_mcp_config(name, raw)
             except ValueError:
                 logger.warning("skipping unusable MCP server %r for the SDK backend", name)
+                continue
+            if coerced is not None:
+                servers[name] = coerced
 
         allowed: list[str] = []
         if self._send_file_factory is not None and turn.chat_id is not None:

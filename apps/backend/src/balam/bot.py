@@ -1115,9 +1115,7 @@ def _delete_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def _delete_markup(
-    pending_deletions: PendingDeletions, token: str
-) -> InlineKeyboardMarkup | None:
+def _delete_markup(pending_deletions: PendingDeletions, token: str) -> InlineKeyboardMarkup | None:
     """Build the picker keyboard from current snapshot state, or ``None`` if the
     token expired."""
     entries = pending_deletions.entries(token)

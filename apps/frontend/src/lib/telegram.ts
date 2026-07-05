@@ -7,17 +7,15 @@
 
 const PAPER = "#faf9f5";
 
-export interface TelegramInitResult {
-  /** Deep-link payload (Mini App `start_param`), used to pick the initial view. */
-  startParam: string | undefined;
-  /** False when running outside the Telegram webview (e.g. plain browser dev). */
-  available: boolean;
-}
-
-export function initTelegram(): TelegramInitResult {
+/**
+ * Init the webview and return the deep-link payload (Mini App `start_param`),
+ * used to pick the initial view. Outside the Telegram webview (e.g. plain
+ * browser dev) there is nothing to init and no payload.
+ */
+export function initTelegram(): string | undefined {
   const tg = window.Telegram?.WebApp;
   if (!tg) {
-    return { startParam: undefined, available: false };
+    return undefined;
   }
 
   tg.ready();
@@ -25,5 +23,5 @@ export function initTelegram(): TelegramInitResult {
   tg.setBackgroundColor(PAPER);
   tg.setHeaderColor(PAPER);
 
-  return { startParam: tg.initDataUnsafe?.start_param, available: true };
+  return tg.initDataUnsafe?.start_param;
 }

@@ -7,7 +7,7 @@ import { useLaunchContext } from "@/components/launch-context";
 import { EmptyState } from "@/components/states/empty-state";
 import { ErrorState } from "@/components/states/error-state";
 import { LoadingState } from "@/components/states/loading-state";
-import { ApiError, getMarkdownContent } from "@/lib/api";
+import { classifyApiError, getMarkdownContent } from "@/lib/api";
 import { fenceLanguages, getHighlighterWith, HIGHLIGHT_THEME } from "@/lib/shiki";
 
 // Prose element styling keyed to the design tokens (design-system §6.3). Code
@@ -78,16 +78,12 @@ export default function MarkdownView() {
       })
       .catch((err) => {
         if (cancelled) return;
-        const apiErr = err instanceof ApiError ? err : null;
-        const message = apiErr?.isAuth
-          ? "Couldn't verify this Mini App session."
-          : apiErr?.status === 404
-            ? "This content has expired — ask the agent to send it again."
-            : "Couldn't load the document.";
         setState({
           status: "error",
-          message,
-          recoverable: !apiErr || apiErr.status >= 500,
+          ...classifyApiError(err, {
+            fallback: "Couldn't load the document.",
+            notFound: "This content has expired — ask the agent to send it again.",
+          }),
         });
       });
     return () => {

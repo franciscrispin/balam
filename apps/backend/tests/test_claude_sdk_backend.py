@@ -389,6 +389,38 @@ def test_coerce_mcp_remote_variants() -> None:
     assert coerce_sdk_mcp_config("x", {"type": "remote", "url": "http://h"})["type"] == "http"
 
 
+def test_coerce_mcp_disabled_returns_none() -> None:
+    # The SDK has no wire toggle for `enabled: false`; the disable is honored by
+    # not registering the server (OpenCode passes the flag through instead).
+    assert coerce_sdk_mcp_config("x", {"command": "uvx", "enabled": False}) is None
+    assert coerce_sdk_mcp_config("x", {"command": "uvx", "enabled": True}) is not None
+
+
+async def test_disabled_context_mcp_server_not_registered() -> None:
+    seen: list = []
+
+    def query_fn(*, prompt, options):
+        seen.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    await _collect(
+        backend,
+        _turn(
+            mcp={
+                "on": {"command": "uvx", "args": ["mcp-on"]},
+                "off": {"command": "uvx", "args": ["mcp-off"], "enabled": False},
+            }
+        ),
+    )
+    assert "on" in seen[0].mcp_servers
+    assert "off" not in seen[0].mcp_servers
+
+
 async def test_context_mcp_servers_passed_as_sdk_shape() -> None:
     seen: list = []
 
