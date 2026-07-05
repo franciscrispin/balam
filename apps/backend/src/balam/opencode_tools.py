@@ -43,7 +43,14 @@ class Tool(StrEnum):
 
 class Permission(StrEnum):
     """OpenCode permission categories (the ``permission`` field on a request and
-    the ``permission`` key of a ruleset rule)."""
+    the ``permission`` key of a ruleset rule).
+
+    Not every member is referenced from code: ``allowed_tools`` entries flow
+    through :func:`balam.permissions.parse_allowed_tool` as plain lowercased
+    strings, so some members (``bash``, ``webfetch``, ``websearch``, ``skill``)
+    exist purely to document OpenCode's vocabulary — they are matched by raw
+    string, not enforced via the enum.
+    """
 
     READ = "read"
     EDIT = "edit"
@@ -58,7 +65,6 @@ class Permission(StrEnum):
     QUESTION = "question"
     TODOWRITE = "todowrite"
     EXTERNAL_DIRECTORY = "external_directory"
-    DOOM_LOOP = "doom_loop"
     SKILL = "skill"
     PLAN_ENTER = "plan_enter"
     PLAN_EXIT = "plan_exit"
