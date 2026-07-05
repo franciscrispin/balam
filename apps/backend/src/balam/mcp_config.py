@@ -44,7 +44,7 @@ class McpServerSpec:
     transport: Literal["remote", "http", "sse"] | None = None
     #: Remote: OpenCode's oauth toggle (pass-through; the SDK shape drops it).
     oauth: bool | None = None
-    #: OpenCode's enabled toggle (pass-through; the SDK shape drops it).
+    #: The enabled toggle (OpenCode: pass-through; SDK: false skips registration).
     enabled: bool | None = None
 
 

@@ -123,16 +123,20 @@ def _normalize_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return tool_input
 
 
-def coerce_sdk_mcp_config(name: str, raw_config: Any) -> dict[str, Any]:
+def coerce_sdk_mcp_config(name: str, raw_config: Any) -> dict[str, Any] | None:
     """Normalise one context MCP server entry into the SDK's ``mcp_servers`` shape.
 
     Parsing/validation lives in :func:`balam.mcp_config.parse_mcp_config` (shared
     with :func:`balam.opencode.coerce_mcp_config`); this projects the spec onto
     the SDK's TypedDicts: stdio ``{"type":"stdio","command","args","env"}`` and
     remote ``{"type":"sse"|"http","url","headers"}``. ``type: remote`` defaults
-    to http; OpenCode's ``oauth``/``enabled`` toggles have no SDK counterpart.
+    to http; OpenCode's ``oauth`` toggle has no SDK counterpart. ``enabled: false``
+    returns None — the SDK has no wire toggle, so the disable is honored by not
+    registering the server at all.
     """
     spec = parse_mcp_config(name, raw_config)
+    if spec.enabled is False:
+        return None
     out: dict[str, Any]
     if spec.kind == "local":
         out = {"type": "stdio", "command": spec.command[0]}
@@ -281,9 +285,12 @@ class ClaudeSdkBackend:
         servers: dict[str, Any] = {}
         for name, raw in (turn.mcp or {}).items():
             try:
-                servers[name] = coerce_sdk_mcp_config(name, raw)
+                coerced = coerce_sdk_mcp_config(name, raw)
             except ValueError:
                 logger.warning("skipping unusable MCP server %r for the SDK backend", name)
+                continue
+            if coerced is not None:
+                servers[name] = coerced
 
         allowed: list[str] = []
         if self._send_file_factory is not None and turn.chat_id is not None:
