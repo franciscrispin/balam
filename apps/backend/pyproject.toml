@@ -4,8 +4,8 @@ version = "0.0.0"
 description = "Telegram bot backed by the OpenCode coding agent (ADR-0011: Python backend)."
 requires-python = ">=3.12"
 dependencies = [
-    # Telegram bot; [httpx] transport + [job-queue] for scheduled work later.
-    "python-telegram-bot[httpx,job-queue]>=22.6",
+    # Telegram bot; [httpx] transport.
+    "python-telegram-bot[httpx]>=22.6",
     # OpenCode HTTP/SSE client (ADR-0002 — we call the HTTP API directly).
     "httpx>=0.27",
     # GFM → Telegram MarkdownV2 rendering (ADR-0010).
