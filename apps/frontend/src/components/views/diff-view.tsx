@@ -4,7 +4,7 @@ import { useLaunchContext } from "@/components/launch-context";
 import { EmptyState } from "@/components/states/empty-state";
 import { ErrorState } from "@/components/states/error-state";
 import { LoadingState } from "@/components/states/loading-state";
-import { ApiError, getDiff } from "@/lib/api";
+import { classifyApiError, getDiff } from "@/lib/api";
 import { HunkCard } from "./hunk-card";
 
 type State =
@@ -27,16 +27,9 @@ export default function DiffView() {
       })
       .catch((err) => {
         if (cancelled) return;
-        const apiErr = err instanceof ApiError ? err : null;
-        const isAuth = apiErr?.isAuth ?? false;
-        // A 4xx won't change on an identical retry (bad/absent session, unknown
-        // context, not a git repo), so no Retry — per design-system §7. Only
-        // network failures and 5xx server errors are worth retrying.
-        const recoverable = !apiErr || apiErr.status >= 500;
         setState({
           status: "error",
-          message: isAuth ? "Couldn't verify this Mini App session." : "Couldn't load changes.",
-          recoverable,
+          ...classifyApiError(err, { fallback: "Couldn't load changes." }),
         });
       });
     return () => {

@@ -35,6 +35,29 @@ export class ApiError extends Error {
   }
 }
 
+/** The one auth-failure wording, shared by every view (incl. the noVNC one). */
+export const AUTH_ERROR_MESSAGE = "Couldn't verify this Mini App session.";
+
+/**
+ * Map a failed request to error-state props. A 4xx won't change on an identical
+ * retry (bad/absent session, unknown context, expired content), so it is not
+ * recoverable — per design-system §7 only network failures and 5xx server
+ * errors get a Retry. `notFound` overrides the 404 wording where the view has
+ * something more helpful to say than the generic fallback.
+ */
+export function classifyApiError(
+  err: unknown,
+  messages: { fallback: string; notFound?: string },
+): { message: string; recoverable: boolean } {
+  const apiErr = err instanceof ApiError ? err : null;
+  const message = apiErr?.isAuth
+    ? AUTH_ERROR_MESSAGE
+    : apiErr?.status === 404 && messages.notFound
+      ? messages.notFound
+      : messages.fallback;
+  return { message, recoverable: !apiErr || apiErr.status >= 500 };
+}
+
 async function apiFetch<T>(path: string): Promise<T> {
   const initData = getInitData();
   // Only send the header when we actually have initData: an empty `tma ` is
