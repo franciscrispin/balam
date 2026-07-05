@@ -85,6 +85,21 @@ def _external_directory_pattern(directory: str) -> str:
     return "/" + _strip_leading_slash(directory).rstrip("/") + "/*"
 
 
+def collapse_mcp_name(name: str) -> str | None:
+    """Collapse a qualified ``mcp__server__tool`` name to OpenCode's ``server_tool``.
+
+    That collapsed form is what OpenCode keys MCP tools by in permission rules,
+    so every place that matches tool names against a ruleset must apply the same
+    transform (here and the SDK backend's ``_category``). Returns ``None`` when
+    ``name`` is not a well-formed qualified MCP name.
+    """
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        if len(parts) == 3:
+            return f"{parts[1]}_{parts[2]}"
+    return None
+
+
 def parse_allowed_tool(entry: str) -> tuple[str | None, str | None]:
     """Parse an ``allowed_tools`` entry into ``(permission, pattern)``.
 
@@ -102,10 +117,7 @@ def parse_allowed_tool(entry: str) -> tuple[str | None, str | None]:
         text = head.strip()
         pattern = tail[:-1].strip() or None
     if text.startswith("mcp__"):
-        parts = text.split("__", 2)
-        if len(parts) == 3:
-            return f"{parts[1]}_{parts[2]}", pattern
-        return text, pattern
+        return collapse_mcp_name(text) or text, pattern
     if text.startswith("_"):  # already an OpenCode-internal permission name
         return text, pattern
     return text.lower(), pattern
