@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 
 from balam.attachments import PromptFile
+from balam.mcp_config import parse_mcp_config
 from balam.opencode_tools import Permission
 
 logger = logging.getLogger(__name__)
@@ -60,72 +61,26 @@ def coerce_mcp_config(name: str, raw_config: Any) -> dict[str, Any]:
       * **local** (stdio) — ``{"type": "local", "command": [...], "environment": {...}}``
       * **remote** (http/sse) — ``{"type": "remote", "url": ..., "headers": {...}}``
 
-    To keep ``config.yaml`` friendly we also accept the looser ``opencode.json``
-    spellings and convert them: a bare ``command`` *string* with ``args``/``env``
-    becomes a local ``command`` list, and ``type: http``/``sse`` collapse to
-    ``remote``. A malformed entry raises :class:`ValueError`, which the context
-    loader turns into a fatal, fail-fast boot error (so a bad server is caught at
-    startup, never silently mid-conversation). Adapted from the open-shrimp client.
+    Parsing/validation of the looser ``config.yaml`` spellings lives in
+    :func:`balam.mcp_config.parse_mcp_config` (shared with the SDK backend);
+    ``type: http``/``sse`` collapse to ``remote`` here. Adapted from the
+    open-shrimp client.
     """
-    if not isinstance(name, str) or not name:
-        raise ValueError("MCP server name must be a non-empty string")
-    if not isinstance(raw_config, dict):
-        raise ValueError(f"MCP server {name!r} config must be a mapping")
-    config = dict(raw_config)
-
-    # `command: "uvx"` + `args: [...]` shorthand → a single local command list.
-    if "command" in config and config.get("type") not in {"local", "remote", "http", "sse"}:
-        command = config.pop("command")
-        if not isinstance(command, str) or not command:
-            raise ValueError(f"MCP server {name!r} command must be a non-empty string")
-        args = config.pop("args", [])
-        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-            raise ValueError(f"MCP server {name!r} args must be a list of strings")
-        env = config.pop("env", config.pop("environment", None))
-        out: dict[str, Any] = {"type": "local", "command": [command, *args]}
-        if env is not None:
-            if not isinstance(env, dict):
-                raise ValueError(f"MCP server {name!r} environment must be a mapping")
-            out["environment"] = {str(k): str(v) for k, v in env.items()}
-        if "enabled" in config:
-            out["enabled"] = bool(config["enabled"])
-        return out
-
-    cfg_type = config.get("type")
-    if cfg_type in {"remote", "http", "sse"}:
-        url = config.get("url")
-        if not isinstance(url, str) or not url:
-            raise ValueError(f"MCP server {name!r} remote config requires a url")
-        out = {"type": "remote", "url": url}
-        if "headers" in config:
-            headers = config["headers"]
-            if not isinstance(headers, dict):
-                raise ValueError(f"MCP server {name!r} headers must be a mapping")
-            out["headers"] = {str(k): str(v) for k, v in headers.items()}
-        if "oauth" in config:
-            out["oauth"] = bool(config["oauth"])
-        if "enabled" in config:
-            out["enabled"] = bool(config["enabled"])
-        return out
-
-    if cfg_type == "local":
-        command = config.get("command")
-        if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
-            raise ValueError(f"MCP server {name!r} local command must be a list of strings")
-        out = {"type": "local", "command": command}
-        env = config.get("environment", config.get("env"))
-        if env is not None:
-            if not isinstance(env, dict):
-                raise ValueError(f"MCP server {name!r} environment must be a mapping")
-            out["environment"] = {str(k): str(v) for k, v in env.items()}
-        if "enabled" in config:
-            out["enabled"] = bool(config["enabled"])
-        return out
-
-    raise ValueError(
-        f"MCP server {name!r} must be a local server (command) or a remote server "
-        f"(type: remote/http/sse + url); got {raw_config!r}"
-    )
+    spec = parse_mcp_config(name, raw_config)
+    out: dict[str, Any]
+    if spec.kind == "local":
+        out = {"type": "local", "command": list(spec.command)}
+        if spec.environment is not None:
+            out["environment"] = spec.environment
+    else:
+        out = {"type": "remote", "url": spec.url}
+        if spec.headers is not None:
+            out["headers"] = spec.headers
+        if spec.oauth is not None:
+            out["oauth"] = spec.oauth
+    if spec.enabled is not None:
+        out["enabled"] = spec.enabled
+    return out
 
 
 class OpenCode:

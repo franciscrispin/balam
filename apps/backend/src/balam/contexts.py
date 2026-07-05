@@ -29,7 +29,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from balam.opencode import coerce_mcp_config
+from balam.mcp_config import parse_mcp_config
 
 #: Thinking-effort levels OpenCode accepts (sent as the ``variant`` on a prompt).
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
@@ -118,11 +118,12 @@ class ContextConfig(BaseModel):
     @field_validator("mcp", mode="after")
     @classmethod
     def _mcp_resolved_and_valid(cls, value: dict[str, Any]) -> dict[str, Any]:
-        # Expand ${VAR} secrets first, then validate the resolved shape against
-        # OpenCode's wire format so a malformed server fails fast at boot.
+        # Expand ${VAR} secrets first, then validate the resolved shape (the
+        # parser both backends serialize from) so a malformed server fails fast
+        # at boot.
         expanded = _expand_env(value, where="mcp")
         for name, server in expanded.items():
-            coerce_mcp_config(name, server)  # raises ValueError on a bad entry
+            parse_mcp_config(name, server)  # raises ValueError on a bad entry
         return expanded
 
     @field_validator("model")
