@@ -19,10 +19,14 @@ throttled ``editMessageText`` path ADR-0010 specifies. Approach follows zog
   4. On turn completion, send the real message(s). A live-edit message is reused
      for the first chunk (no duplicate); overflow goes to new messages. Drafts and
      final messages render GFM as Telegram MarkdownV2 (ADR-0010), ≤4096-char chunks.
-  5. The answer ends the turn. If other messages landed below the streamed answer
-     bubble while it was open (progress overflow at finalize, approval prompts,
-     retry notices — Telegram cannot insert above them), the stale bubble is
-     deleted and the answer is re-sent at the bottom.
+  5. The answer ends the turn: it is the topic's bottom layer and always streams
+     last. Whenever another message lands below the streamed answer bubble — a
+     question keyboard or approval prompt mid-stream, progress overflow at
+     finalize, a retry notice (Telegram cannot insert above them) — the stale
+     bubble is deleted and the answer re-sent at the bottom. The same tail check
+     drives this on every live-edit flush and at finalize (see
+     ``DraftSession._drop_if_stale``); the reasoning/progress stream keeps its
+     position (it is the layer above) and is never re-anchored.
 
 The transport-agnostic :class:`DraftSession` is unit-tested with a fake.
 """
@@ -160,17 +164,44 @@ class DraftSession:
             self._raw = text
             self._dirty = True
 
-    async def flush_draft(self) -> None:
+    async def _drop_if_stale(self, latest_message_id: int | None) -> None:
+        """Delete the streamed bubble when another message landed below it.
+
+        ``latest_message_id`` is the id of the most recent message the turn sent
+        to the topic (its "tail"). When it isn't this draft's live-edit bubble,
+        something landed below the bubble — Telegram can't move it, so the bubble
+        is deleted and the caller re-sends the text at the bottom. If the delete
+        fails the bubble is kept and edited in place instead, so content is never
+        duplicated. This is the single re-anchor primitive shared by the live-edit
+        flush (mid-stream) and finalize (turn end)."""
+        if (
+            self._live_edit_message_id is not None
+            and latest_message_id is not None
+            and latest_message_id != self._live_edit_message_id
+        ):
+            try:
+                await self._transport.delete_message(self._live_edit_message_id)
+            except Exception:
+                logger.debug("could not delete stale streamed bubble", exc_info=True)
+            else:
+                self._live_edit_message_id = None
+                self._live_edit_last = None
+
+    async def flush_draft(self, latest_message_id: int | None = None) -> None:
         """Flush the current text as a streaming preview, if dirty.
 
         Uses native ``sendMessageDraft`` until it fails (e.g. a group chat, which
         Telegram refuses), then switches permanently to live-edit streaming. Only
         the first chunk is previewed; the full content is split at finalize.
-        """
+
+        ``latest_message_id`` is the topic's tail (see :meth:`_drop_if_stale`);
+        pass it for a stream that must stay at the bottom (the answer) so the
+        live-edit bubble re-anchors below any intervening message, and omit it for
+        one that keeps its position (the progress stream)."""
         if not self._dirty:
             return
         if self._disabled:
-            await self._flush_live_edit()
+            await self._flush_live_edit(latest_message_id)
             return
         chunks = self._render(self._raw)
         if not chunks:
@@ -185,18 +216,25 @@ class DraftSession:
             # so log without the traceback.
             logger.info("draft streaming unavailable; switching to live-edit streaming")
             self._disabled = True
-            await self._flush_live_edit()
+            await self._flush_live_edit(latest_message_id)
 
-    async def _flush_live_edit(self) -> None:
+    async def _flush_live_edit(self, latest_message_id: int | None = None) -> None:
         """Live-edit fallback: send one message, then edit it in place as text
-        grows. Defers while the text overflows one chunk (handled at finalize)."""
+        grows. Defers while the text overflows one chunk (handled at finalize).
+
+        Before editing, re-anchors below the topic tail (:meth:`_drop_if_stale`)
+        so the bubble never edits in place *above* a message that landed under it
+        — the whole point of ``latest_message_id``."""
         if not self._dirty:
             return
         chunks = self._render(self._raw)
         if not chunks or len(chunks) > 1:
             return
+        # Only re-anchor once we can immediately re-send as one bubble (guarded by
+        # the single-chunk check above); a multi-chunk stream defers to finalize.
+        await self._drop_if_stale(latest_message_id)
         text = chunks[0]
-        if text == self._live_edit_last:
+        if self._live_edit_message_id is not None and text == self._live_edit_last:
             self._dirty = False
             return
         try:
@@ -221,26 +259,15 @@ class DraftSession:
         that message in place (no duplicate of the streamed bubble); any overflow
         chunks are sent as new messages.
 
-        ``latest_message_id`` is the id of the most recent message the turn sent
-        to the topic. When given and it isn't the live-edit message, other
-        messages landed *below* the streamed bubble — and since this text must
-        end the turn, the stale bubble is deleted and the text re-sent at the
-        bottom. If the delete fails the bubble is edited in place instead, so
-        the content is never duplicated.
+        ``latest_message_id`` is the topic tail (:meth:`_drop_if_stale`): when it
+        isn't the live-edit message, other messages landed *below* the streamed
+        bubble — and since this text must end the turn, the stale bubble is
+        deleted and the text re-sent at the bottom (same primitive the live-edit
+        flush uses mid-stream). If the delete fails the bubble is edited in place
+        instead, so the content is never duplicated.
         """
         text = self._raw if self._raw.strip() else fallback
-        if (
-            self._live_edit_message_id is not None
-            and latest_message_id is not None
-            and latest_message_id != self._live_edit_message_id
-        ):
-            try:
-                await self._transport.delete_message(self._live_edit_message_id)
-            except Exception:
-                logger.debug("could not delete stale streamed bubble", exc_info=True)
-            else:
-                self._live_edit_message_id = None
-                self._live_edit_last = None
+        await self._drop_if_stale(latest_message_id)
         for i, chunk in enumerate(self._render(text)):
             if i == 0 and self._live_edit_message_id is not None:
                 # Skip the edit when the streamed bubble already shows this text —
@@ -623,11 +650,14 @@ async def stream_reply(
     # Local session id: known up front for OpenCode, learned from the first
     # SessionStarted event for a lazily-minted SDK session.
     sid = session_id
-    # The id of the most recent message this turn sent to the topic — live-edit
-    # bubbles and finalize chunks (via the transport) as well as approval
-    # prompts, question keyboards, and retry notices (noted at their send
-    # sites). The answer's finalize compares its streamed bubble against this to
-    # know whether other messages landed below it (Telegram ids are monotonic).
+    # The topic's tail: the id of the most recent message this turn sent to it —
+    # live-edit bubbles and finalize chunks (via the transport's on_sent) plus
+    # approval prompts, question keyboards, and retry notices (noted at their send
+    # sites). The answer stream compares its streamed bubble against this on every
+    # flush and at finalize to know whether anything landed below it (Telegram ids
+    # are monotonic); if so it re-anchors at the bottom so the answer stays last.
+    # Every send must update it — an edit (in place) must not, or a stream would
+    # think its own bubble displaced it.
     last_sent_id: int | None = None
 
     def note_sent(message_id: int | None) -> None:
@@ -651,8 +681,12 @@ async def stream_reply(
             await asyncio.sleep(draft_interval)
             if not streaming:
                 break
+            # The reasoning stream keeps its position (no tail); the answer stream
+            # re-anchors below anything that landed under it (the topic tail), so
+            # it always streams at the bottom rather than above an intervening
+            # question/approval prompt.
             await reasoning_draft.flush_draft()
-            await answer_draft.flush_draft()
+            await answer_draft.flush_draft(latest_message_id=last_sent_id)
 
     flush_task = asyncio.create_task(flush_loop())
 

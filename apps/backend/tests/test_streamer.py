@@ -219,6 +219,63 @@ async def test_finalize_edits_in_place_when_stale_bubble_delete_fails() -> None:
     assert t.ops == [("message", None, "hi"), ("edit", 100, "the answer")]
 
 
+async def test_live_edit_reanchors_below_the_topic_tail_mid_stream() -> None:
+    # A message (id 999) landed below the streamed bubble mid-turn: the next flush
+    # deletes the stale bubble and re-sends the current text so the stream
+    # continues below the intervening prompt, never editing in place above it.
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_identity)
+    session.set_text("partial")
+    await session.flush_draft()  # live-edit bubble id 100, no tail → no re-anchor
+    session.set_text("partial and more")
+    await session.flush_draft(latest_message_id=999)  # 999 is now the tail, below 100
+    assert t.ops == [
+        ("message", None, "partial"),
+        ("delete", 100, ""),
+        ("message", None, "partial and more"),  # re-sent as bubble id 101
+    ]
+    # Once it is the tail again (id 101), it is edited in place as text grows.
+    session.set_text("partial and more still")
+    await session.flush_draft(latest_message_id=101)
+    assert t.ops[-1] == ("edit", 101, "partial and more still")
+
+
+async def test_live_edit_edits_in_place_when_still_the_topic_tail() -> None:
+    # Nothing landed below the bubble (it is still the tail) → edit in place, no
+    # churn. This is the common case and the reasoning stream's only case.
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_identity)
+    session.set_text("partial")
+    await session.flush_draft()  # bubble id 100
+    session.set_text("partial and more")
+    await session.flush_draft(latest_message_id=100)  # still the tail
+    assert t.ops == [("message", None, "partial"), ("edit", 100, "partial and more")]
+
+
+async def test_live_edit_without_a_tail_never_reanchors() -> None:
+    # The reasoning stream flushes with no tail: it keeps its position and edits
+    # in place regardless of what else the turn sent.
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_identity)
+    session.set_text("thinking")
+    await session.flush_draft()  # bubble id 100
+    session.set_text("thinking harder")
+    await session.flush_draft()  # latest_message_id defaults to None
+    assert t.ops == [("message", None, "thinking"), ("edit", 100, "thinking harder")]
+
+
+async def test_live_edit_defers_reanchor_while_text_overflows_one_chunk() -> None:
+    # Can't re-anchor a multi-chunk render as a single live-edit bubble → leave it
+    # for finalize (which re-sends the stale bubble at the bottom).
+    t = FakeTransport(fail_drafts=True)
+    session = DraftSession(t, draft_id=7, render=_chunk5)
+    session.set_text("hi")
+    await session.flush_draft()  # live-edit bubble id 100
+    session.set_text("a much longer answer")  # renders to several chunks
+    await session.flush_draft(latest_message_id=999)
+    assert not any(op[0] == "delete" for op in t.ops)
+
+
 async def test_finalize_sends_real_message() -> None:
     t = FakeTransport()
     session = DraftSession(t, draft_id=1, render=_identity)
@@ -1247,6 +1304,76 @@ async def test_question_asked_multi_select_preserves_multiple_answers() -> None:
     await task
     assert oc.question_replies == [("q_1", [["Sunny", "Rainy"], ["Chips"]])]
     assert oc.question_rejections == []
+
+
+class PacedQuestionOpenCode(PermissionOpenCode):
+    """PermissionOpenCode + the ``"SLEEP"`` sentinel, so answer bubbles are
+    created mid-stream and the question posts *below* an already-open bubble."""
+
+    async def events(self, *, directory=None, ready=None):  # type: ignore[override]
+        self.events_directory = directory
+        if ready is not None:
+            ready.set()
+        for event in self._script:
+            if event == "SLEEP":
+                await asyncio.sleep(0.05)
+                continue
+            if event == "WAIT_QUESTION_REPLY":
+                await self._question_replied.wait()
+                continue
+            yield event
+
+
+async def test_stream_reply_answer_streamed_before_a_question_re_anchors_below_it() -> None:
+    # Regression: an answer bubble opened before a question was edited in place
+    # *above* the question as the answer continued, forcing the user to scroll up.
+    # The bubble must re-anchor below the question so the stream reads in order.
+    pending_questions = PendingQuestions()
+    oc = PacedQuestionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _text_part(AID, "Here is some context."),
+            "SLEEP",  # answer bubble created BEFORE the question
+            _question("q_1"),
+            "WAIT_QUESTION_REPLY",
+            _text_part(AID, "Here is some context. And the answer."),
+            "SLEEP",  # continued answer must land below the question, not above
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = TimelineBot()
+    task = asyncio.create_task(
+        stream_reply(
+            bot=bot,
+            backend=OpenCodeBackend(oc),
+            session_id=SID,
+            chat_id=-1003953430909,  # supergroup → live-edit streaming
+            thread_id=99,
+            prompt="x",
+            directory="/work/proj",
+            pending_questions=pending_questions,
+            draft_interval=0.01,
+        )
+    )
+    for _ in range(200):
+        if len(bot.keyboards) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    for keyboard, label in ((bot.keyboards[0], "Sunny"), (bot.keyboards[1], "Chips")):
+        _, token, q_index, o_index = _question_callback(keyboard, label).split(":")
+        assert pending_questions.resolve(token, int(q_index), int(o_index)) is True
+    await task
+
+    sends = [op for op in bot.timeline if op[0] == "send"]
+    answer_bubble_id = sends[0][1]
+    question_ids = [op[1] for op in sends if op[2].startswith("❓")]
+    # The pre-question bubble is deleted, never edited in place above the question…
+    assert ("delete", answer_bubble_id, "") in bot.timeline
+    assert not any(op[0] == "edit" and op[1] == answer_bubble_id for op in bot.timeline)
+    # …and the final answer is re-sent below the questions (a larger, later id).
+    last_send = [op for op in bot.timeline if op[0] == "send"][-1]
+    assert last_send[2] == "Here is some context\\. And the answer\\."
+    assert last_send[1] > max(question_ids)
 
 
 # --- plan_exit questions ("View plan" Mini App button) ------------------------
