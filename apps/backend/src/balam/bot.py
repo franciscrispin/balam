@@ -37,10 +37,17 @@ from telegram.ext import (
 )
 
 from balam.agent.backend import AgentBackend
-from balam.approvals import Choice, PendingApprovals, PendingDeletions, PendingQuestions
+from balam.approvals import (
+    Choice,
+    CustomAnswer,
+    PendingApprovals,
+    PendingDeletions,
+    PendingQuestions,
+)
 from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
 from balam.contexts import EFFORT_LEVELS, split_provider_model
+from balam.markdown import escape_markdown_v2
 from balam.miniapp import make_plan_view_button, mini_app_reply
 from balam.router import Router, TopicRef
 from balam.streamer import _question_keyboard, stream_reply
@@ -194,10 +201,11 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     if text and pending_questions is not None:
         custom_result = pending_questions.resolve_custom(chat_id, thread_id, text)
-        if custom_result == "resolved":
+        if custom_result is not None and custom_result.status == "resolved":
+            await _show_custom_answer_on_question(context.bot, chat_id, custom_result)
             await message.reply_text("✅ Answer sent.")
             return
-        if custom_result == "added":
+        if custom_result is not None and custom_result.status == "added":
             await message.reply_text("✅ Custom answer added. Select more options or tap Done.")
             return
 
@@ -1357,6 +1365,27 @@ async def _handle_topic_edited(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     router: Router = context.application.bot_data["router"]
     router.set_topic_title(message.chat_id, message.message_thread_id, edited.name)
+
+
+async def _show_custom_answer_on_question(bot: Any, chat_id: int, outcome: CustomAnswer) -> None:
+    """Show a typed custom answer on its original question message, replacing the
+    "Reply with your answer" note. Best-effort: needs the recorded message id and
+    prompt text, and a failed edit (message too old) is logged, not raised — the
+    ``✅ Answer sent.`` reply already confirms the answer landed."""
+    if outcome.message_id is None or outcome.text is None:
+        return
+    answer = escape_markdown_v2(outcome.answer)
+    text = f"{outcome.text}\n\n✅ *Answered:* {answer}"
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=outcome.message_id,
+            text=text,
+            parse_mode="MarkdownV2",
+            reply_markup=None,
+        )
+    except Exception:
+        logger.debug("failed to show custom answer on question message", exc_info=True)
 
 
 async def _clear_keyboard(query: Any, note: str | None = None) -> bool:

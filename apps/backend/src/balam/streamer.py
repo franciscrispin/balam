@@ -857,6 +857,7 @@ async def stream_reply(
                     **topic_kwargs,
                 )
                 note_sent(getattr(msg, "message_id", None))
+                pending_questions.set_message(token, index, getattr(msg, "message_id", None), text)
             answers = await asyncio.gather(*futures)
         except asyncio.CancelledError:
             pending_questions.discard(token)

@@ -232,6 +232,27 @@ class _PendingQuestion:
     awaiting_custom: set[int] = field(default_factory=set)
     selected: list[set[int]] = field(default_factory=list)
     custom_answers: list[list[str]] = field(default_factory=list)
+    # The Telegram message id and rendered (MarkdownV2) prompt text of each
+    # question, recorded once sent, so a typed custom answer can be shown back on
+    # the original question message (replacing its "Reply with your answer" note).
+    message_ids: list[int | None] = field(default_factory=list)
+    texts: list[str | None] = field(default_factory=list)
+
+
+@dataclass
+class CustomAnswer:
+    """The outcome of resolving a typed custom answer to a pending question.
+
+    ``status`` is ``"resolved"`` (a single-select question is now answered) or
+    ``"added"`` (a multi-select accumulated the answer; the keyboard stays open).
+    ``message_id``/``text`` are the question message to edit and its base prompt
+    text, populated only when the answer resolves the question and the message is
+    known — so the caller can show the answer on the original question message."""
+
+    status: str
+    answer: str
+    message_id: int | None = None
+    text: str | None = None
 
 
 class PendingQuestions:
@@ -270,8 +291,21 @@ class PendingQuestions:
             thread_id=thread_id,
             selected=[set() for _ in questions],
             custom_answers=[[] for _ in questions],
+            message_ids=[None for _ in questions],
+            texts=[None for _ in questions],
         )
         return token, futures
+
+    def set_message(
+        self, token: str, question_index: int, message_id: int | None, text: str
+    ) -> None:
+        """Record the Telegram message a question was sent as, so a later typed
+        answer can be shown back on it."""
+        pending = self._pending.get(token)
+        if pending is None or question_index < 0 or question_index >= len(pending.message_ids):
+            return
+        pending.message_ids[question_index] = message_id
+        pending.texts[question_index] = text
 
     def discard(self, token: str) -> None:
         self._pending.pop(token, None)
@@ -377,7 +411,9 @@ class PendingQuestions:
         pending.awaiting_custom.add(question_index)
         return True
 
-    def resolve_custom(self, chat_id: int, thread_id: int | None, answer: str) -> str | None:
+    def resolve_custom(
+        self, chat_id: int, thread_id: int | None, answer: str
+    ) -> CustomAnswer | None:
         for token, pending in list(self._pending.items()):
             if pending.chat_id != chat_id or pending.thread_id != thread_id:
                 continue
@@ -389,12 +425,16 @@ class PendingQuestions:
                 if pending.multiples[question_index]:
                     pending.custom_answers[question_index].append(answer)
                     pending.awaiting_custom.discard(question_index)
-                    return "added"
+                    return CustomAnswer(status="added", answer=answer)
                 future.set_result([answer])
                 pending.awaiting_custom.discard(question_index)
+                message_id = pending.message_ids[question_index]
+                text = pending.texts[question_index]
                 if all(f.done() for f in pending.futures):
                     self.discard(token)
-                return "resolved"
+                return CustomAnswer(
+                    status="resolved", answer=answer, message_id=message_id, text=text
+                )
         return None
 
 

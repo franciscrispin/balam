@@ -28,6 +28,12 @@ def _escape(text: str) -> str:
     return _ESCAPE_RE.sub(r"\\\1", text)
 
 
+def escape_markdown_v2(text: str) -> str:
+    """Escape arbitrary literal text for safe inclusion in a MarkdownV2 message
+    (e.g. embedding a user's typed answer into a prompt built by hand)."""
+    return _escape(text)
+
+
 def _plain_text(token: dict[str, Any]) -> str:
     """Extract plain text from a token subtree (no formatting)."""
     if isinstance(token.get("raw"), str):

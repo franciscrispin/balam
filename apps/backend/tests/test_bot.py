@@ -1239,7 +1239,7 @@ async def test_question_done_callback_resolves_multi_select_with_custom_answer()
     )
     assert pending_questions.toggle(token, 0, 1) is True
     assert pending_questions.await_custom(token, 0, SUPERGROUP, 7) is True
-    assert pending_questions.resolve_custom(SUPERGROUP, 7, "kombucha") == "added"
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "kombucha").status == "added"
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
@@ -1254,7 +1254,7 @@ async def test_question_done_callback_allows_custom_only_multi_select() -> None:
         "ses_x", [["Coffee", "Tea"]], multiples=[True], chat_id=SUPERGROUP, thread_id=7
     )
     assert pending_questions.await_custom(token, 0, SUPERGROUP, 7) is True
-    assert pending_questions.resolve_custom(SUPERGROUP, 7, "sparkling water") == "added"
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "sparkling water").status == "added"
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
@@ -1276,7 +1276,7 @@ async def test_question_custom_callback_arms_next_topic_message() -> None:
     assert not futures[0].done()
     assert query.message.edited
     assert any("next message" in (answer or "") for answer in query.answers)
-    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer") == "resolved"
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer").status == "resolved"
     assert futures[0].result() == ["typed answer"]
 
 
@@ -1294,7 +1294,7 @@ async def test_question_custom_callback_multi_select_keeps_keyboard_visible() ->
     assert not futures[0].done()
     assert not message.edited
     assert query.answers == ["Send your custom answer, then tap Done."]
-    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer") == "added"
+    assert pending_questions.resolve_custom(SUPERGROUP, 7, "typed answer").status == "added"
     assert not futures[0].done()
 
 
@@ -1326,6 +1326,46 @@ async def test_message_resolves_pending_custom_answer_without_starting_turn() ->
     assert futures[0].result() == ["my typed answer"]
     assert replies == ["✅ Answer sent."]
     assert turns.get(SUPERGROUP, 5) is None
+
+
+async def test_message_shows_typed_answer_on_the_original_question_message() -> None:
+    pending_questions = PendingQuestions()
+    token, futures = pending_questions.register(
+        "ses_x", [["Preset"]], chat_id=SUPERGROUP, thread_id=5
+    )
+    pending_questions.set_message(token, 0, 424242, "❓ *Snack*\nPick one\\.")
+    assert pending_questions.await_custom(token, 0, SUPERGROUP, 5)
+
+    edits: list[dict[str, object]] = []
+
+    async def edit_message_text(**kwargs: object) -> None:
+        edits.append(kwargs)
+
+    async def reply_text(text: str) -> None:
+        pass
+
+    bot = SimpleNamespace(edit_message_text=edit_message_text)
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        text="kombucha (please)",
+        caption=None,
+        reply_text=reply_text,
+    )
+    update, context, turns = _message_env(message, bot)
+    context.application.bot_data["pending_questions"] = pending_questions
+
+    await _handle_message(update, context)
+
+    assert futures[0].result() == ["kombucha (please)"]
+    # The original question message is edited to show the answer (its "Reply with
+    # your answer" note replaced) with the keyboard stripped and the answer escaped.
+    assert len(edits) == 1
+    edit = edits[0]
+    assert edit["message_id"] == 424242
+    assert edit["reply_markup"] is None
+    assert "❓ *Snack*" in edit["text"]
+    assert "✅ *Answered:* kombucha \\(please\\)" in edit["text"]
 
 
 async def test_message_adds_pending_multi_select_custom_answer_without_starting_turn() -> None:
