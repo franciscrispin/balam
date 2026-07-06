@@ -330,10 +330,24 @@ class ClaudeSdkBackend:
             "include_partial_messages": True,
             # Keep Claude Code's native behavior (incl. natural-language planning).
             "system_prompt": {"type": "preset", "preset": "claude_code"},
-            # Load NO external settings (user/project/local). Balam is the
-            # permission gate: inheriting the owner's ~/.claude allow-rules would
-            # let tools bypass can_use_tool (and the approval keyboard) entirely.
-            "setting_sources": [],
+            # Load user + project + local settings so filesystem skills are
+            # discovered (both the global ~/.claude/skills and the project's
+            # .claude/skills), matching the interactive session. Skill discovery is
+            # gated on setting sources — there is no skills-only switch for the
+            # loose .claude/skills layout — so the whole source must be loaded.
+            # ``skills="all"`` enables every discovered skill and pre-approves the
+            # Skill tool. TRADE-OFF, accepted by the owner: a ``permissions.allow``
+            # entry in any loaded settings file is evaluated by the CLI *before*
+            # can_use_tool, so it pre-approves that tool and bypasses BOTH the
+            # approval keyboard and the config.yaml ruleset (which only runs when
+            # the CLI's native rules evaluate to "ask"). config.yaml still governs
+            # everything the settings files don't pre-allow. ``defaultMode:
+            # acceptEdits`` in settings.local.json is neutralized because we pass
+            # permission_mode="default" explicitly each turn (an explicit
+            # --permission-mode overrides the settings defaultMode), so edits still
+            # reach the keyboard.
+            "setting_sources": ["user", "project", "local"],
+            "skills": "all",
             "env": env,
         }
         if _is_resumable(turn.session_id):
