@@ -1148,7 +1148,7 @@ async def test_question_callback_single_select_resolves_and_clears_keyboard() ->
     await _handle_question_callback(update, context)
 
     assert futures[0].result() == ["Tea"]
-    assert query.message.edited
+    assert "✅ *Answered:* Tea" in query.message.edited[-1]
     assert query.message.reply_markups[-1] is None
 
 
@@ -1225,6 +1225,7 @@ async def test_question_done_callback_resolves_multi_select() -> None:
     await _handle_question_done_callback(update, context)
 
     assert futures[0].result() == ["Coffee", "Water"]
+    assert "✅ *Answered:* Coffee, Water" in query.message.edited[-1]
     assert query.message.reply_markups[-1] is None
 
 

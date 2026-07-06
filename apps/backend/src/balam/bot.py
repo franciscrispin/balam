@@ -993,12 +993,14 @@ async def _handle_question_callback(update: Update, context: ContextTypes.DEFAUL
         await _refresh_question_keyboard(query, pending_questions, token, q_index)
         return
 
+    labels = pending_questions.labels(token, q_index)
     if not pending_questions.resolve(token, q_index, o_index):
         await query.answer("This question has expired.")
         await _clear_keyboard(query)
         return
+    chosen = [labels[o_index]] if labels and 0 <= o_index < len(labels) else []
     await query.answer("Answered.")
-    await _clear_keyboard(query, note=r"✅ Answered\.")
+    await _clear_keyboard(query, note=_answered_note(chosen))
 
 
 async def _handle_question_done_callback(
@@ -1032,6 +1034,7 @@ async def _handle_question_done_callback(
         return
 
     pending_questions: PendingQuestions = context.application.bot_data["pending_questions"]
+    chosen = pending_questions.selected_answers(token, q_index) or []
     finished = pending_questions.finish_multi(token, q_index)
     if finished is False:
         await query.answer("Select at least one option.")
@@ -1041,7 +1044,7 @@ async def _handle_question_done_callback(
         await _clear_keyboard(query)
         return
     await query.answer("Answered.")
-    await _clear_keyboard(query, note=r"✅ Answered\.")
+    await _clear_keyboard(query, note=_answered_note(chosen))
 
 
 async def _handle_question_custom_callback(
@@ -1405,6 +1408,15 @@ async def _show_custom_answer_on_question(bot: Any, chat_id: int, outcome: Custo
         )
     except Exception:
         logger.debug("failed to show custom answer on question message", exc_info=True)
+
+
+def _answered_note(answers: list[str]) -> str:
+    """A MarkdownV2 outcome line naming what was chosen, for a resolved question
+    keyboard. Falls back to a bare confirmation when the answers are unknown."""
+    if not answers:
+        return r"✅ Answered\."
+    joined = ", ".join(answers)
+    return f"✅ *Answered:* {escape_markdown_v2(joined)}"
 
 
 async def _clear_keyboard(query: Any, note: str | None = None) -> bool:

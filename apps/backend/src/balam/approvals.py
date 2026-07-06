@@ -371,6 +371,17 @@ class PendingQuestions:
         selected.add(option_index)
         return True
 
+    def selected_answers(self, token: str, question_index: int) -> list[str] | None:
+        """The labels (plus any typed custom answers) currently chosen for a
+        multi-select question, in reply order. Read this before ``finish_multi``
+        resolves and discards the token, so the outcome can be shown back."""
+        pending = self._pending.get(token)
+        if pending is None or question_index < 0 or question_index >= len(pending.selected):
+            return None
+        labels = pending.labels[question_index]
+        selected = sorted(pending.selected[question_index])
+        return [labels[index] for index in selected] + pending.custom_answers[question_index]
+
     def finish_multi(self, token: str, question_index: int) -> bool | None:
         pending = self._pending.get(token)
         if pending is None:
