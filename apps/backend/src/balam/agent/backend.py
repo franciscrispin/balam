@@ -17,12 +17,68 @@ implementations satisfy this contract:
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from balam.agent.events import AgentEvent
 from balam.attachments import PromptFile
+
+
+@dataclass
+class FollowUp:
+    """A message that arrived mid-turn, handed to a running turn's follow-up
+    channel for a streaming-input backend to fold into the live session."""
+
+    prompt: str
+    files: list[PromptFile] = field(default_factory=list)
+
+
+class FollowUpChannel:
+    """Race-free hand-off of mid-turn messages from the bot into a running turn
+    (Claude Code-style follow-ups, ADR-0013).
+
+    The bot ``offer``s a message; the backend ``take``s pending messages one per
+    step boundary and ``close``s the channel when the turn goes idle. All three
+    are synchronous, single-block operations, so under the event loop's
+    cooperative scheduling (no ``await`` inside) they never interleave: a message
+    is either accepted into the live turn or bounced (``offer`` → ``False``) once
+    the backend has closed, never both and never lost. A bounced message falls
+    back to the bot's normal turn queue and runs as the next turn.
+
+    Deliberately not an ``asyncio.Queue``: the backend must be the *only* consumer
+    and must decide "forward next vs close" atomically at a step boundary. A queue
+    whose items are ``get()``-en by a separate input-stream task would drain
+    behind the backend's back and reopen the very race this closes.
+    """
+
+    def __init__(self) -> None:
+        self._pending: deque[FollowUp] = deque()
+        self._closed = False
+
+    def offer(self, follow_up: FollowUp) -> bool:
+        """Bot side: hand a mid-turn message to the running turn. Returns
+        ``False`` if the turn is already closing (the caller must fall back to
+        the normal turn queue). Never awaits — safe against ``take``/``close``."""
+        if self._closed:
+            return False
+        self._pending.append(follow_up)
+        return True
+
+    def take(self) -> FollowUp | None:
+        """Backend side: pop the next pending follow-up, or ``None`` if none is
+        waiting. Never awaits."""
+        return self._pending.popleft() if self._pending else None
+
+    def close(self) -> None:
+        """Backend side: refuse further offers (the turn is ending). Never
+        awaits, so the ``take``-empty → ``close`` decision is one atomic block."""
+        self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
 
 @dataclass
@@ -55,11 +111,22 @@ class TurnRequest:
     mcp: dict[str, Any] = field(default_factory=dict)
     chat_id: int | None = None
     thread_id: int | None = None
+    #: Channel for messages that arrive mid-turn (Claude Code-style). Only a
+    #: streaming-input backend (``supports_streaming_input``) drains it — folding
+    #: each :class:`FollowUp` into the live session so the agent picks it up at
+    #: its next step. ``None`` means the turn accepts no mid-turn input.
+    follow_ups: FollowUpChannel | None = None
 
 
 @runtime_checkable
 class AgentBackend(Protocol):
     """A coding-agent runtime Balam can drive (OpenCode or the Claude Agent SDK)."""
+
+    #: Whether the backend can fold a message that arrives mid-turn into the
+    #: running turn's live session (``TurnRequest.follow_ups``). The SDK backend
+    #: holds its stdin channel open for the whole turn, so it can; OpenCode runs
+    #: one prompt per session (ADR-0009), so the bot queues instead.
+    supports_streaming_input: bool = False
 
     async def wait_for_ready(self) -> None:
         """Block until the backend can serve traffic (or raise on misconfig)."""

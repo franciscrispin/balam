@@ -1714,3 +1714,73 @@ async def test_ordinary_question_does_not_fire_on_plan_approved() -> None:
         pending_questions.resolve(token, int(q_index), int(o_index))
     await task
     assert approved == []
+
+
+# --- mid-turn follow-up (TurnStepFinished) -----------------------------------
+
+
+class _ScriptedBackend:
+    """Yields a fixed list of normalized events, so the streamer's handling of a
+    mid-turn step boundary can be driven directly (no backend translation)."""
+
+    supports_streaming_input = True
+
+    def __init__(self, events: list) -> None:
+        self._events = events
+
+    def run_turn(self, turn):
+        events = self._events
+
+        async def gen():
+            for event in events:
+                yield event
+
+        return gen()
+
+    async def reply_permission(self, *a, **k) -> None:  # pragma: no cover - unused
+        pass
+
+    async def reply_question(self, *a, **k) -> None:  # pragma: no cover - unused
+        pass
+
+    async def reject_question(self, *a, **k) -> None:  # pragma: no cover - unused
+        pass
+
+    async def abort(self, *a, **k) -> None:  # pragma: no cover - unused
+        pass
+
+
+async def test_stream_reply_finalizes_each_step_on_turn_step_finished() -> None:
+    # A folded-in follow-up arrives as TurnStepFinished between two responses:
+    # the first answer must be committed as its own message *before* the second
+    # step streams, not demoted to progress narration by the next step's text.
+    from balam.agent.events import (
+        ReasoningUpdated,
+        SessionStarted,
+        TextUpdated,
+        TurnFinished,
+        TurnStepFinished,
+    )
+
+    events = [
+        SessionStarted(SID),
+        TextUpdated(part_id="m1:0", text="first answer", message_id="m1"),
+        TurnStepFinished(),
+        ReasoningUpdated(part_id="m2:1", text="thinking about second", message_id="m2"),
+        TextUpdated(part_id="m2:0", text="second answer", message_id="m2"),
+        TurnFinished(),
+    ]
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=_ScriptedBackend(events),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="hello",
+        draft_interval=0.01,
+    )
+    # Three separate messages: step 1's answer, then step 2's reasoning + answer.
+    # Without the boundary finalize, "first answer" would be folded into step 2's
+    # progress stream and only two messages would land.
+    assert bot.messages == ["first answer", "thinking about second", "second answer"]

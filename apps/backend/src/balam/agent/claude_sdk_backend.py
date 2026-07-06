@@ -58,6 +58,7 @@ from balam.agent.events import (
     ToolUpdated,
     TurnFailed,
     TurnFinished,
+    TurnStepFinished,
 )
 from balam.agent_tools import AgentTool
 from balam.contexts import ContextConfig
@@ -212,6 +213,11 @@ class ClaudeSdkBackend:
     ``claude`` subprocess.
     """
 
+    #: The SDK holds its stdin channel open for the whole turn (streaming-input
+    #: mode), so a message that arrives mid-turn can be folded into the live
+    #: session and picked up at the next step (see ``run_turn``).
+    supports_streaming_input = True
+
     def __init__(
         self,
         *,
@@ -357,11 +363,19 @@ class ClaudeSdkBackend:
         block_text: dict[int, str] = {}
         owned_perms: set[str] = set()
         owned_questions: set[str] = set()
-        # Set when the turn ends, to close the streaming-input channel. The input
-        # stream must stay OPEN for the whole turn: can_use_tool / question control
-        # requests travel back over stdin, so closing it early (after one message)
-        # kills the channel and the CLI denies tools with "Stream closed".
-        turn_done = asyncio.Event()
+        # Messages the driver hands to the streaming-input stream: the initial
+        # prompt, then any mid-turn follow-up the driver forwards at a step
+        # boundary, then a ``None`` sentinel to close. The input stream must stay
+        # OPEN for the whole turn: can_use_tool / question control requests travel
+        # back over stdin, so closing it early (after one message) kills the
+        # channel and the CLI denies tools with "Stream closed". The DRIVER is the
+        # sole producer here so the "forward next follow-up vs end the turn"
+        # decision stays atomic at the boundary (see the ResultMessage handling).
+        outbound: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        # Mid-turn follow-ups from the bot (Claude Code-style). ``None`` when the
+        # topic's transport can't deliver mid-turn (the bot only wires it for the
+        # streaming-input backend, which is us).
+        channel = turn.follow_ups
 
         # The context's opt-in ruleset, evaluated in process to pre-approve tool
         # calls the user allowed (the SDK has no server to delegate this to).
@@ -527,21 +541,24 @@ class ClaudeSdkBackend:
 
         mcp_servers, allowed_tools = self._mcp_setup(turn)
 
-        async def input_stream() -> AsyncIterator[dict[str, Any]]:
-            # can_use_tool requires streaming-input mode: the prompt is an async
-            # iterable of user-message dicts. Send the one turn message, then hold
-            # the stream open until the turn finishes so the bidirectional control
-            # channel (permission/question requests) stays alive.
-            yield {
+        def _user_message(prompt: str, files: list[Any]) -> dict[str, Any]:
+            return {
                 "type": "user",
                 "session_id": "",
-                "message": {
-                    "role": "user",
-                    "content": _content_blocks(turn.prompt, turn.files or []),
-                },
+                "message": {"role": "user", "content": _content_blocks(prompt, files)},
                 "parent_tool_use_id": None,
             }
-            await turn_done.wait()
+
+        async def input_stream() -> AsyncIterator[dict[str, Any]]:
+            # can_use_tool requires streaming-input mode: the prompt is an async
+            # iterable of user-message dicts. Send the turn message, then relay
+            # whatever the driver forwards (mid-turn follow-ups) until it sends the
+            # ``None`` sentinel to close — holding the stream open in between so the
+            # bidirectional control channel (permission/question requests) stays
+            # alive.
+            yield _user_message(turn.prompt, turn.files or [])
+            while (msg := await outbound.get()) is not None:
+                yield msg
 
         async def driver() -> None:
             nonlocal cur_msg_id
@@ -621,21 +638,41 @@ class ClaudeSdkBackend:
                     elif isinstance(message, ResultMessage):
                         maybe_session(message.session_id)
                         if message.is_error:
+                            # An error ends the whole turn, mid-turn follow-ups
+                            # notwithstanding.
                             detail = message.result or "; ".join(message.errors or [])
                             await queue.put(
                                 TurnFailed(
                                     message=detail or f"the agent errored ({message.subtype})"
                                 )
                             )
-                        else:
-                            await queue.put(TurnFinished())
+                            return
+                        # This response finished. If a follow-up arrived mid-turn,
+                        # fold it into the same session: forward it and keep the
+                        # turn open (the streamer finalizes the current answer on
+                        # TurnStepFinished, then streams the next one). Otherwise
+                        # end the turn. take()==None → close() is one atomic block
+                        # (no await between), so a follow-up racing the boundary is
+                        # either taken here or bounced by offer() to the next turn.
+                        follow = channel.take() if channel is not None else None
+                        if follow is not None:
+                            outbound.put_nowait(_user_message(follow.prompt, follow.files))
+                            await queue.put(TurnStepFinished())
+                            continue
+                        if channel is not None:
+                            channel.close()
+                        outbound.put_nowait(None)
+                        await queue.put(TurnFinished())
                         return
             except Exception as exc:
                 logger.exception("Claude Agent SDK query failed")
                 await queue.put(TurnFailed(message=str(exc) or exc.__class__.__name__))
             finally:
-                # Release the input stream so it can close stdin cleanly.
-                turn_done.set()
+                # Refuse further mid-turn offers (they fall back to the bot's turn
+                # queue) and release the input stream so it can close stdin cleanly.
+                if channel is not None:
+                    channel.close()
+                outbound.put_nowait(None)
                 # Close the SDK query generator (and its subprocess) within this
                 # task, so it doesn't aclose at GC time and collide with the loop.
                 if hasattr(stream, "aclose"):

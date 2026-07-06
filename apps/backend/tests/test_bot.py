@@ -1622,3 +1622,76 @@ async def test_delete_page_callback_on_expired_token_clears_keyboard() -> None:
     await _handle_delete_page_callback(update, context)
 
     assert query.answers and query.answers[-1] == "This picker has expired."
+
+
+async def test_mid_turn_message_is_folded_into_live_turn_on_streaming_backend(
+    monkeypatch,
+) -> None:
+    # On a streaming-input backend a message arriving mid-turn is offered to the
+    # running turn's live channel (Claude Code-style), not parked in the queue.
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+
+    async def fake_stream_reply(*, prompt: str, follow_ups=None, **_: object) -> None:
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+    context.application.bot_data["backend"] = SimpleNamespace(supports_streaming_input=True)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    running = turns.get(SUPERGROUP, 5)
+    assert running.follow_ups is not None
+
+    message.text = "second"
+    await _handle_message(update, context)
+
+    # Folded into the live turn, not queued, and acknowledged as such.
+    assert turns.queue_len(SUPERGROUP, 5) == 0
+    assert any("Sent" in r for r in message.replies)
+    folded = running.follow_ups.take()
+    assert folded is not None and folded.prompt == "second"
+
+    gate.set()
+    await running.task
+
+
+async def test_mid_turn_message_falls_back_to_queue_when_turn_is_closing(monkeypatch) -> None:
+    # If the running turn is already closing (its channel refuses offers), the
+    # mid-turn message falls back to the normal queue and runs as the next turn.
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+
+    async def fake_stream_reply(*, prompt: str, follow_ups=None, **_: object) -> None:
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+    context.application.bot_data["backend"] = SimpleNamespace(supports_streaming_input=True)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    running = turns.get(SUPERGROUP, 5)
+    running.follow_ups.close()  # simulate the turn's closing boundary
+
+    message.text = "second"
+    await _handle_message(update, context)
+
+    assert turns.queue_len(SUPERGROUP, 5) == 1
+    assert any("Queued" in r for r in message.replies)
+
+    gate.set()
+    await running.task
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task

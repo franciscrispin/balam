@@ -140,6 +140,20 @@ class TurnFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnStepFinished:
+    """A sub-response completed but more input is already pending, so the turn
+    continues (Claude Code-style mid-turn follow-ups, ADR-0013).
+
+    A streaming-input backend folds a message that arrived mid-turn into the same
+    live session; the agent finishes its current response (a ``ResultMessage``)
+    and then picks up the queued follow-up. The streamer finalizes the current
+    answer/reasoning bubbles and resets its accumulators on this event, so each
+    answered exchange keeps its own bubble instead of the next step's text
+    demoting the prior answer to progress narration.
+    """
+
+
+@dataclass(frozen=True, slots=True)
 class TurnFinished:
     """The turn completed normally (the agent went idle)."""
 
@@ -153,6 +167,7 @@ AgentEvent = (
     | PermissionRequested
     | QuestionAsked
     | RetryNotice
+    | TurnStepFinished
     | TurnFailed
     | TurnFinished
 )

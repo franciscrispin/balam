@@ -554,3 +554,79 @@ async def test_resume_and_model_effort_passed_to_options() -> None:
     assert opts.effort == "high"
     assert opts.cwd == "/ws"
     assert opts.env.get("ANTHROPIC_API_KEY") == "sk-x"
+
+
+# --- mid-turn follow-ups (streaming input) -----------------------------------
+
+
+async def test_follow_up_is_folded_into_the_live_turn() -> None:
+    # A follow-up offered mid-turn is forwarded into the same query at the first
+    # ResultMessage boundary: the driver emits TurnStepFinished, the follow-up
+    # reaches the input stream, and a second response streams before TurnFinished.
+    from balam.agent.backend import FollowUp, FollowUpChannel
+    from balam.agent.events import TurnStepFinished
+
+    forwarded: list = []
+
+    async def query_fn(*, prompt, options):
+        stream = prompt.__aiter__()
+        await stream.__anext__()  # initial user message
+        yield _init()
+        yield _stream({"type": "message_start", "message": {"id": "m1"}})
+        yield _stream(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "answer one"},
+            }
+        )
+        yield _result()  # first response done → driver forwards the follow-up
+        forwarded.append(await stream.__anext__())
+        yield _stream({"type": "message_start", "message": {"id": "m2"}})
+        yield _stream(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "answer two"},
+            }
+        )
+        yield _result()  # no follow-up pending → turn ends
+
+    channel = FollowUpChannel()
+    channel.offer(FollowUp(prompt="the follow-up"))
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    events = await _collect(backend, _turn(follow_ups=channel))
+
+    steps = [e for e in events if isinstance(e, TurnStepFinished)]
+    finished = [e for e in events if isinstance(e, TurnFinished)]
+    texts = [e.text for e in events if isinstance(e, TextUpdated)]
+    assert len(steps) == 1  # exactly one fold
+    assert len(finished) == 1 and isinstance(events[-1], TurnFinished)
+    assert "answer one" in texts and "answer two" in texts
+    # The follow-up actually reached the SDK as a user message.
+    assert forwarded and forwarded[0]["message"]["content"] == "the follow-up"
+    # The channel is drained and closed once the turn ends.
+    assert channel.take() is None and channel.closed
+
+
+async def test_turn_without_follow_ups_ends_after_one_result() -> None:
+    # The common case: no channel wired → the turn ends at the first ResultMessage.
+    from balam.agent.events import TurnStepFinished
+
+    messages = [_init(), _result()]
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query(messages)), _turn())
+    assert not any(isinstance(e, TurnStepFinished) for e in events)
+    assert isinstance(events[-1], TurnFinished)
+
+
+async def test_follow_up_offered_after_close_is_bounced() -> None:
+    # A message racing the turn's end (channel already closed) is refused, so the
+    # bot falls back to queueing it as the next turn.
+    from balam.agent.backend import FollowUp, FollowUpChannel
+
+    channel = FollowUpChannel()
+    assert channel.offer(FollowUp(prompt="in time")) is True
+    channel.close()
+    assert channel.offer(FollowUp(prompt="too late")) is False
+    assert channel.take().prompt == "in time"
+    assert channel.take() is None

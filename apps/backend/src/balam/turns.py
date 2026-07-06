@@ -24,6 +24,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from balam.agent.backend import FollowUpChannel
 from balam.attachments import PromptFile
 from balam.store import SessionStore
 
@@ -31,11 +32,17 @@ from balam.store import SessionStore
 @dataclass
 class Turn:
     """A running turn: its streaming task plus what ``/cancel`` needs to abort it
-    server-side (the OpenCode session and the context directory scoping it)."""
+    server-side (the OpenCode session and the context directory scoping it).
+
+    ``follow_ups`` is the channel the bot offers mid-turn messages onto for a
+    streaming-input backend to fold into this live turn (Claude Code-style);
+    ``None`` when the backend can't (OpenCode), so those messages fall through to
+    the topic queue instead."""
 
     task: asyncio.Task[None]
     session_id: str
     directory: str
+    follow_ups: FollowUpChannel | None = None
 
 
 @dataclass
@@ -83,10 +90,11 @@ class TurnRegistry:
         task: asyncio.Task[None],
         session_id: str,
         directory: str,
+        follow_ups: FollowUpChannel | None = None,
     ) -> None:
         """Record the turn now running in a topic (overwriting any stale entry)."""
         self._turns[self._key(chat_id, thread_id)] = Turn(
-            task=task, session_id=session_id, directory=directory
+            task=task, session_id=session_id, directory=directory, follow_ups=follow_ups
         )
 
     def get(self, chat_id: int, thread_id: int | None) -> Turn | None:

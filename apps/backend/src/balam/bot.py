@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
 )
 
-from balam.agent.backend import AgentBackend
+from balam.agent.backend import AgentBackend, FollowUp, FollowUpChannel
 from balam.approvals import (
     Choice,
     CustomAnswer,
@@ -293,13 +293,27 @@ async def _submit_turn(
         mcp=resolved.mcp,
     )
 
-    # One turn per topic at a time (ADR-0009). OpenCode runs a single turn per
-    # session, so a message that lands while a turn is still streaming must not
-    # fire a second prompt — that collides and the message is silently dropped.
-    # Queue it instead; the running turn drains it when it finishes. The check and
-    # the enqueue run with no ``await`` between them, so the running turn's drain
-    # can't race in and miss this message.
-    if turns.get(chat_id, thread_id) is not None:
+    # A message that lands while a turn is still streaming can't fire a second
+    # prompt at the same session — one turn per topic (ADR-0009). Two paths, both
+    # decided with no ``await`` between the check and the act so the running
+    # turn's teardown can't race in and lose the message:
+    #
+    #  * Streaming-input backend (the SDK): fold it into the LIVE turn so the
+    #    agent picks it up at its next step (Claude Code-style). ``offer`` returns
+    #    False only if that turn is already closing, in which case we fall through
+    #    to the queue and it runs as the next turn.
+    #  * Otherwise (OpenCode): park it in the topic's FIFO queue; the running turn
+    #    drains it when it finishes.
+    running = turns.get(chat_id, thread_id)
+    if running is not None:
+        backend: AgentBackend = context.application.bot_data["backend"]
+        if (
+            backend.supports_streaming_input
+            and running.follow_ups is not None
+            and running.follow_ups.offer(FollowUp(prompt=text, files=files))
+        ):
+            await message.reply_text("📨 Sent — I'll pick this up in the current turn.")
+            return
         position = turns.enqueue(chat_id, thread_id, job)
         await message.reply_text(queued_reply.format(position=position))
         return
@@ -325,6 +339,10 @@ def _start_turn(
     turns: TurnRegistry = context.application.bot_data["turns"]
     pending: PendingApprovals = context.application.bot_data["pending"]
     router: Router = context.application.bot_data["router"]
+
+    # Mid-turn messages fold into this live turn only on a streaming-input backend
+    # (the SDK). On OpenCode the channel stays None, so they queue instead.
+    follow_ups = FollowUpChannel() if backend.supports_streaming_input else None
 
     # Snapshot-and-button factory for plan_exit questions ("View plan" in the
     # Mini App). Only wired when app.py stashed a content store (unit tests of
@@ -374,6 +392,7 @@ def _start_turn(
                 plan_view=plan_view,
                 on_plan_approved=_on_plan_approved,
                 on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
+                follow_ups=follow_ups,
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
@@ -392,7 +411,7 @@ def _start_turn(
                 _start_turn(context, chat_id, thread_id, next_job)
 
     task = asyncio.create_task(run())
-    turns.register(chat_id, thread_id, task, job.session_id, job.directory)
+    turns.register(chat_id, thread_id, task, job.session_id, job.directory, follow_ups)
 
 
 def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str | None:

@@ -43,7 +43,7 @@ from typing import Any, Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from balam.agent.backend import AgentBackend, TurnRequest
+from balam.agent.backend import AgentBackend, FollowUpChannel, TurnRequest
 from balam.agent.events import (
     PermissionRequested,
     QuestionAsked,
@@ -54,6 +54,7 @@ from balam.agent.events import (
     ToolUpdated,
     TurnFailed,
     TurnFinished,
+    TurnStepFinished,
 )
 from balam.approvals import (
     Choice,
@@ -276,6 +277,20 @@ class DraftSession:
                     await self._transport.edit_message(self._live_edit_message_id, chunk)
             else:
                 await self._transport.send_message(chunk)
+
+    def reset(self) -> None:
+        """Forget the just-finalized bubble so the next step streams a fresh one.
+
+        Used at a mid-turn step boundary (a folded-in follow-up): :meth:`finalize`
+        has committed this step's text to a permanent message, so drop the
+        live-edit anchor and accumulated text — the next flush sends a new bubble
+        below it instead of editing the finalized one. A new ``draft_id`` starts a
+        clean native-draft animation for the next step."""
+        self._raw = ""
+        self._dirty = False
+        self._live_edit_message_id = None
+        self._live_edit_last = None
+        self._draft_id = random.randint(1, 2**31)
 
 
 #: One streamed fragment: ``(arrival_order, kind, rendered_text)`` where ``kind``
@@ -618,6 +633,7 @@ async def stream_reply(
     plan_view: Callable[[str, str], InlineKeyboardButton | None] | None = None,
     on_plan_approved: Callable[[], None] | None = None,
     on_session_started: Callable[[str], None] | None = None,
+    follow_ups: FollowUpChannel | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
 ) -> None:
     """Run one turn through ``backend`` and stream its reply into the topic.
@@ -646,6 +662,11 @@ async def stream_reply(
     fires when a plan-approval question is answered "Yes", so the caller can drop
     its sticky plan-mode flag. ``on_session_started`` receives the backend's real
     session id once known — used to persist a lazily-minted SDK session.
+
+    ``follow_ups`` is the channel the bot offers mid-turn messages onto; a
+    streaming-input backend folds them into this live turn and marks each fold
+    with a :class:`~balam.agent.events.TurnStepFinished`, on which we finalize the
+    current answer/reasoning bubbles and reset so the next step streams fresh.
     """
     # Local session id: known up front for OpenCode, learned from the first
     # SessionStarted event for a lazily-minted SDK session.
@@ -675,6 +696,10 @@ async def stream_reply(
     topic_kwargs = thread_kwargs(thread_id)
 
     streaming = True
+    # Serializes draft mutation between the periodic flusher and a mid-turn step
+    # finalize (a folded-in follow-up): both touch the same DraftSessions, so
+    # without this the flusher could send a bubble the finalize is retiring.
+    render_lock = asyncio.Lock()
 
     async def flush_loop() -> None:
         while streaming:
@@ -685,8 +710,9 @@ async def stream_reply(
             # re-anchors below anything that landed under it (the topic tail), so
             # it always streams at the bottom rather than above an intervening
             # question/approval prompt.
-            await reasoning_draft.flush_draft()
-            await answer_draft.flush_draft(latest_message_id=last_sent_id)
+            async with render_lock:
+                await reasoning_draft.flush_draft()
+                await answer_draft.flush_draft(latest_message_id=last_sent_id)
 
     flush_task = asyncio.create_task(flush_loop())
 
@@ -912,7 +938,27 @@ async def stream_reply(
         mcp=mcp or {},
         chat_id=chat_id,
         thread_id=thread_id,
+        follow_ups=follow_ups,
     )
+
+    async def finalize_step() -> None:
+        """Commit the current step's bubbles and reset for the next one.
+
+        A streaming-input backend emits :class:`TurnStepFinished` when it folds a
+        mid-turn follow-up into the live turn: this step's answer is done, so make
+        its reasoning/answer drafts permanent and clear the accumulators. The
+        render lock keeps the periodic flusher from racing the finalize."""
+        nonlocal answer_message_id
+        async with render_lock:
+            if reasoning_draft.text.strip():
+                await reasoning_draft.finalize()
+                reasoning_draft.reset()
+            if answer_draft.text.strip():
+                await answer_draft.finalize(latest_message_id=last_sent_id)
+                answer_draft.reset()
+            reasoning_parts.clear()
+            answer_parts.clear()
+            answer_message_id = None
 
     async def consume() -> None:
         nonlocal order, error_text, answer_message_id, sid
@@ -990,6 +1036,9 @@ async def stream_reply(
 
             elif isinstance(event, RetryNotice):
                 await note_retry(event.detail)
+
+            elif isinstance(event, TurnStepFinished):
+                await finalize_step()
 
             elif isinstance(event, TurnFailed):
                 error_text = event.message

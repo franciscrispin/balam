@@ -152,6 +152,11 @@ def _plan_path_from_question(
 class OpenCodeBackend:
     """Drive the OpenCode server as an :class:`~balam.agent.backend.AgentBackend`."""
 
+    #: OpenCode runs one prompt per session (ADR-0009); a second concurrent
+    #: prompt collides and is dropped, so mid-turn messages are queued by the bot
+    #: rather than folded into the running turn.
+    supports_streaming_input = False
+
     def __init__(self, opencode: OpenCode) -> None:
         self._opencode = opencode
 
