@@ -66,7 +66,7 @@ from balam.approvals import (
     request_target_paths,
 )
 from balam.attachments import PromptFile
-from balam.markdown import gfm_to_telegram
+from balam.markdown import EXPANDABLE_QUOTE_MARKER, gfm_to_telegram
 from balam.opencode_tools import Tool
 from balam.telegram_utils import thread_kwargs
 
@@ -294,9 +294,14 @@ class DraftSession:
 
 
 #: One streamed fragment: ``(arrival_order, kind, rendered_text)`` where ``kind``
-#: is ``"text"`` (assistant prose), ``"tool"`` (a rendered tool-call line), or
+#: is ``"text"`` (assistant prose), ``"tool"`` (a rendered tool-call line),
+#: ``"toolgroup"`` (a closed group of calls, an expandable-quote block), or
 #: ``"narration"`` (an earlier step's interim text, demoted to progress).
 StreamPart = tuple[int, str, str]
+
+#: A tool call's latest state inside a group:
+#: ``(tool, input, status, output, error)``.
+GroupEntry = tuple[str, dict[str, Any], str, Any, Any]
 
 
 def _join_stream(parts: dict[str, StreamPart]) -> str:
@@ -314,7 +319,9 @@ def _join_stream(parts: dict[str, StreamPart]) -> str:
                 out = out.rstrip("\n") + "\n\n"
             elif kind == "tool":  # group consecutive tool lines
                 out = out.rstrip("\n") + "\n"
-            elif kind == "narration":  # blocks from different steps
+            elif kind in ("narration", "toolgroup"):
+                # Blocks from different steps / adjacent quote blocks: a blank
+                # line, or GFM would lazily continue one blockquote into the next.
                 out = out.rstrip("\n") + "\n\n"
             # text after text: concatenate the deltas, no separator
         out += text
@@ -448,6 +455,115 @@ def _render_tool_part(
     if status == "error":
         line += " ⚠️"
     return line
+
+
+def _group_phrase(entries: list[GroupEntry], *, running: bool) -> str:
+    """The one-line summary of a burst of tool calls, in Claude Code's collapsed
+    vocabulary: comma-joined per-category counts ("Ran 3 commands, read a file"),
+    present tense while calls are still ``running``, past tense once finished.
+    Reads and edits are deduplicated by file path."""
+    commands = 0
+    reads: set[str] = set()
+    edits: set[str] = set()
+    searches = lists = fetches = websearches = tasks = todos = others = 0
+    for i, (tool, tool_input, _status, _output, _error) in enumerate(entries):
+        if tool == Tool.BASH:
+            commands += 1
+        elif tool == Tool.READ:
+            reads.add(tool_input.get("filePath") or f"read#{i}")
+        elif tool in (Tool.EDIT, Tool.WRITE):
+            edits.add(tool_input.get("filePath") or f"edit#{i}")
+        elif tool == Tool.APPLY_PATCH:
+            edits.update(_apply_patch_files(tool_input.get("patchText", "")) or [f"patch#{i}"])
+        elif tool in (Tool.GREP, Tool.GLOB):
+            searches += 1
+        elif tool == Tool.LIST:
+            lists += 1
+        elif tool == Tool.WEBFETCH:
+            fetches += 1
+        elif tool == "websearch":
+            websearches += 1
+        elif tool in (Tool.TASK, Tool.AGENT):
+            tasks += 1
+        elif tool == Tool.TODOWRITE:
+            todos += 1
+        else:
+            others += 1
+
+    def count(past: str, now: str, n: int, noun: str, noun_plural: str | None = None) -> str:
+        verb = now if running else past
+        if n == 1:
+            return f"{verb} a {noun}"
+        return f"{verb} {n} {noun_plural or noun + 's'}"
+
+    parts: list[str] = []
+    if commands:
+        parts.append(count("ran", "running", commands, "command"))
+    if reads:
+        parts.append(count("read", "reading", len(reads), "file"))
+    if edits:
+        parts.append(count("edited", "editing", len(edits), "file"))
+    if searches:
+        parts.append(count("searched for", "searching for", searches, "pattern"))
+    if lists:
+        parts.append(count("listed", "listing", lists, "directory", "directories"))
+    if fetches:
+        parts.append(count("fetched", "fetching", fetches, "page"))
+    if websearches:
+        verb = "searching" if running else "searched"
+        parts.append(f"{verb} the web" + (f" {websearches} times" if websearches > 1 else ""))
+    if tasks:
+        parts.append(count("delegated", "delegating", tasks, "task"))
+    if todos:
+        parts.append(("updating" if running else "updated") + " the to-do list")
+    if others:
+        parts.append(count("made", "making", others, "tool call"))
+    if not parts:
+        return ""
+    text = ", ".join(parts)
+    return text[0].upper() + text[1:]
+
+
+def _group_detail_line(tool: str, tool_input: dict[str, Any], directory: str | None) -> str:
+    """One compact line inside a closed group's expandable quote. No fenced
+    blocks — Telegram disallows them inside a blockquote — so Bash degrades to
+    its command in a codespan."""
+    if tool == Tool.BASH:
+        summary = str(tool_input.get("command") or tool_input.get("description") or "")
+    else:
+        summary = _tool_summary(tool, tool_input, directory)
+    summary = " ".join(summary.split()).replace("`", "'")
+    if len(summary) > 80:
+        summary = summary[:79] + "…"
+    display = _TOOL_DISPLAY.get(tool, tool)
+    return f"🔧 {display} `{summary}`" if summary else f"🔧 {display}"
+
+
+def _render_tool_group(
+    entries: list[GroupEntry], *, active: bool, directory: str | None
+) -> tuple[str, str]:
+    """Render a group of consecutive tool calls; returns ``(kind, text)``.
+
+    An *active* group (still absorbing calls) is a plain summary line that ticks
+    up in place — Telegram re-collapses an expandable quote on every edit, so
+    the quote form only appears once the group closes. A closed group renders
+    its finished calls: one call keeps the legacy single-line form (Bash with
+    its fenced command); several fold into the summary line plus one compact
+    line per call inside a tap-to-expand blockquote.
+    """
+    if active:
+        running = any(status not in ("completed", "error") for _t, _i, status, _o, _e in entries)
+        phrase = _group_phrase(entries, running=running)
+        return ("tool", f"🔧 {phrase}…" if phrase else "")
+    finished = [e for e in entries if e[2] in ("completed", "error")]
+    if not finished:
+        return ("tool", "")
+    if len(finished) == 1:
+        tool, tool_input, status, output, error = finished[0]
+        return ("tool", _render_tool_part(tool, tool_input, status, output, error, directory))
+    lines = [EXPANDABLE_QUOTE_MARKER, f"🔧 {_group_phrase(finished, running=False)}"]
+    lines += [_group_detail_line(t, i, directory) for t, i, _s, _o, _e in finished]
+    return ("toolgroup", "\n".join("> " + line for line in lines))
 
 
 def _format_approval_request(
@@ -635,6 +751,7 @@ async def stream_reply(
     on_session_started: Callable[[str], None] | None = None,
     follow_ups: FollowUpChannel | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
+    tool_stream: str = "collapsed",
 ) -> None:
     """Run one turn through ``backend`` and stream its reply into the topic.
 
@@ -667,6 +784,12 @@ async def stream_reply(
     streaming-input backend folds them into this live turn and marks each fold
     with a :class:`~balam.agent.events.TurnStepFinished`, on which we finalize the
     current answer/reasoning bubbles and reset so the next step streams fresh.
+
+    ``tool_stream`` (``TOOL_STREAM``) picks how tool calls render in the
+    progress stream: ``"collapsed"`` (default) folds a burst of consecutive
+    calls into one summary line with the per-call detail in an expandable
+    blockquote (see :func:`_render_tool_group`); ``"full"`` keeps the legacy
+    one-line-per-call stream.
     """
     # Local session id: known up front for OpenCode, learned from the first
     # SessionStarted event for a lazily-minted SDK session.
@@ -728,6 +851,45 @@ async def stream_reply(
     order = 0
     error_text: str | None = None
     retry_noticed = False
+    # Collapsed tool stream (TOOL_STREAM=collapsed): consecutive calls fold into
+    # one group part. The *open* group keeps absorbing new calls until something
+    # else lands in the topic — answer/reasoning text, an approval keyboard, a
+    # question, a retry notice, a step boundary, or the turn's end closes it.
+    group_calls: dict[str, list[str]] = {}  # group part key → call ids, arrival order
+    group_entries: dict[str, GroupEntry] = {}  # call id → latest state
+    call_group: dict[str, str] = {}  # call id → its group part key
+    open_group_key: str | None = None
+    group_count = 0
+
+    def refresh_group(group_key: str) -> None:
+        """Re-render a group part from its calls' latest state (a call that was
+        still running when its group closed re-renders the closed group when it
+        completes, e.g. after a permission prompt)."""
+        nonlocal order
+        entries = [group_entries[cid] for cid in group_calls.get(group_key, ())]
+        kind, text = _render_tool_group(
+            entries, active=group_key == open_group_key, directory=directory
+        )
+        prior = reasoning_parts.get(group_key)
+        if prior is None:
+            if not text:
+                return
+            pos = order
+            order += 1
+        else:
+            pos = prior[0]
+        reasoning_parts[group_key] = (pos, kind, text)
+        reasoning_draft.set_text(_join_stream(reasoning_parts))
+
+    def close_open_group() -> None:
+        """Seal the open group, if any: later calls start a new group, and the
+        final form (single line / expandable quote) replaces the live summary."""
+        nonlocal open_group_key
+        if open_group_key is None:
+            return
+        key, open_group_key = open_group_key, None
+        refresh_group(key)
+
     dirs = allowed_dirs or ([directory] if directory else [])
     # Per-request approval tasks, so the event loop isn't blocked while the user
     # decides. Torn down with the consumer.
@@ -742,6 +904,10 @@ async def stream_reply(
         only translate the choice into a permission reply. ``category`` drives the
         keyboard (whether to offer "accept all edits"); ``tool`` is display-only."""
         assert pending is not None
+        # The keyboard lands below the progress stream, ending the tool burst —
+        # seal the group here, not on every PermissionRequested (auto-allowed
+        # requests send nothing and must not fragment the group).
+        close_open_group()
         token, future = pending.register(sid or "")
         gfm = _format_approval_request(tool, tool_input, directory, category)
         keyboard = _approval_keyboard(token, category)
@@ -854,6 +1020,8 @@ async def stream_reply(
             except Exception:
                 logger.debug("could not snapshot plan", exc_info=True)
 
+        # Question keyboards land below the progress stream: seal the tool group.
+        close_open_group()
         token, futures = pending_questions.register(
             sid or "",
             labels,
@@ -914,6 +1082,8 @@ async def stream_reply(
         if retry_noticed:
             return
         retry_noticed = True
+        # The notice lands below the progress stream: seal the tool group.
+        close_open_group()
         body = "⏳ The model provider is rate-limited — retrying…"
         if detail:
             body += f"\n{detail}"
@@ -950,6 +1120,14 @@ async def stream_reply(
         render lock keeps the periodic flusher from racing the finalize."""
         nonlocal answer_message_id
         async with render_lock:
+            # Seal the open tool group into the finalized bubble, then forget
+            # all group state: the step's parts are gone, so a call that
+            # completes after this must open a fresh group, not resurrect (and
+            # re-send) one that was already committed.
+            close_open_group()
+            group_calls.clear()
+            group_entries.clear()
+            call_group.clear()
             if reasoning_draft.text.strip():
                 await reasoning_draft.finalize()
                 reasoning_draft.reset()
@@ -961,7 +1139,7 @@ async def stream_reply(
             answer_message_id = None
 
     async def consume() -> None:
-        nonlocal order, error_text, answer_message_id, sid
+        nonlocal order, error_text, answer_message_id, sid, open_group_key, group_count
         async for event in backend.run_turn(turn):
             if isinstance(event, SessionStarted):
                 if sid != event.session_id:
@@ -970,6 +1148,8 @@ async def stream_reply(
                         on_session_started(sid)
 
             elif isinstance(event, TextUpdated):
+                if event.text:
+                    close_open_group()
                 if event.message_id != answer_message_id:
                     # Text from a new step: what the answer draft holds was an
                     # earlier step's narration, not the answer. Demote it to the
@@ -994,6 +1174,8 @@ async def stream_reply(
                 answer_draft.set_text(_join_stream(answer_parts))
 
             elif isinstance(event, ReasoningUpdated):
+                if event.text:
+                    close_open_group()
                 if event.part_id in reasoning_parts:
                     reasoning_parts[event.part_id] = (
                         reasoning_parts[event.part_id][0],
@@ -1006,19 +1188,71 @@ async def stream_reply(
                 reasoning_draft.set_text(_join_stream(reasoning_parts))
 
             elif isinstance(event, ToolUpdated):
-                # Reserve a slot at the call's arrival position (so the tool line
-                # interleaves before any later text), but only render once the
-                # call finishes.
-                key = f"tool:{event.call_id}"
-                if key not in reasoning_parts:
-                    reasoning_parts[key] = (order, "tool", "")
-                    order += 1
-                if event.status in ("completed", "error"):
-                    rendered = _render_tool_part(
-                        event.tool, event.input, event.status, event.output, event.error, directory
+                if tool_stream == "full":
+                    # Legacy stream: reserve a slot at the call's arrival position
+                    # (so the tool line interleaves before any later text), but
+                    # only render once the call finishes.
+                    key = f"tool:{event.call_id}"
+                    if key not in reasoning_parts:
+                        reasoning_parts[key] = (order, "tool", "")
+                        order += 1
+                    if event.status in ("completed", "error"):
+                        rendered = _render_tool_part(
+                            event.tool,
+                            event.input,
+                            event.status,
+                            event.output,
+                            event.error,
+                            directory,
+                        )
+                        reasoning_parts[key] = (reasoning_parts[key][0], "tool", rendered)
+                        reasoning_draft.set_text(_join_stream(reasoning_parts))
+                    continue
+                # Collapsed stream: fold the call into the open group (opening
+                # one if needed); the group renders as one updating summary line
+                # and seals into its final form when the burst ends.
+                group_key = call_group.get(event.call_id)
+                if group_key is None:
+                    if open_group_key is None:
+                        group_count += 1
+                        open_group_key = f"toolgroup:{group_count}"
+                        group_calls[open_group_key] = []
+                    group_key = open_group_key
+                    call_group[event.call_id] = group_key
+                    group_calls[group_key].append(event.call_id)
+                group_entries[event.call_id] = (
+                    event.tool,
+                    event.input,
+                    event.status,
+                    event.output,
+                    event.error,
+                )
+                if event.status == "error":
+                    # A failure is loud: pull it out of the group and render it
+                    # standalone in the full form (command + output tail); the
+                    # calls that follow start a fresh group.
+                    if event.call_id in group_calls.get(group_key, ()):
+                        group_calls[group_key].remove(event.call_id)
+                    prior = reasoning_parts.get(f"tool:{event.call_id}")
+                    pos = prior[0] if prior is not None else order
+                    if prior is None:
+                        order += 1
+                    reasoning_parts[f"tool:{event.call_id}"] = (
+                        pos,
+                        "tool",
+                        _render_tool_part(
+                            event.tool,
+                            event.input,
+                            event.status,
+                            event.output,
+                            event.error,
+                            directory,
+                        ),
                     )
-                    reasoning_parts[key] = (reasoning_parts[key][0], "tool", rendered)
+                    if group_key == open_group_key:
+                        open_group_key = None
                     reasoning_draft.set_text(_join_stream(reasoning_parts))
+                refresh_group(group_key)
 
             elif isinstance(event, PermissionRequested):
                 # Handle in a child task so a slow user decision doesn't stall the
@@ -1041,11 +1275,14 @@ async def stream_reply(
                 await finalize_step()
 
             elif isinstance(event, TurnFailed):
+                close_open_group()
                 error_text = event.message
                 break
 
             elif isinstance(event, TurnFinished):
+                close_open_group()
                 break
+        close_open_group()
 
     consume_task = asyncio.create_task(consume())
     try:
@@ -1063,6 +1300,9 @@ async def stream_reply(
             logger.exception("streaming the reply failed")
             error_text = error_text or str(exc) or exc.__class__.__name__
 
+        # A turn that died mid-burst still finalizes: seal the group so the
+        # progress bubble commits in its final form, not the live summary.
+        close_open_group()
         if error_text:
             base = _join_stream(answer_parts)
             prefix = f"{base}\n\n" if base.strip() else ""

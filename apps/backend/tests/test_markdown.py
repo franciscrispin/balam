@@ -1,4 +1,32 @@
-from balam.markdown import TELEGRAM_MAX_LENGTH, gfm_to_telegram, split_message
+from balam.markdown import (
+    EXPANDABLE_QUOTE_MARKER,
+    TELEGRAM_MAX_LENGTH,
+    gfm_to_telegram,
+    split_message,
+)
+
+
+def test_regular_blockquote_stays_plain() -> None:
+    (out,) = gfm_to_telegram("> quoted line\n> another")
+    assert out == ">quoted line\n>another"
+
+
+def test_expandable_marker_renders_expandable_blockquote() -> None:
+    # A quote led by the [!expandable] marker becomes Telegram's expandable
+    # form: an empty bold entity opens it, "||" on the last line collapses it.
+    gfm = f"> {EXPANDABLE_QUOTE_MARKER}\n> summary line\n> detail `x.py`"
+    (out,) = gfm_to_telegram(gfm)
+    assert out == "**>summary line\n>detail `x.py`||"
+
+
+def test_expandable_marker_alone_renders_nothing() -> None:
+    assert gfm_to_telegram(f"> {EXPANDABLE_QUOTE_MARKER}") == []
+
+
+def test_adjacent_expandable_quotes_stay_separate() -> None:
+    gfm = f"> {EXPANDABLE_QUOTE_MARKER}\n> one\n> a\n\n> {EXPANDABLE_QUOTE_MARKER}\n> two\n> b"
+    (out,) = gfm_to_telegram(gfm)
+    assert out == "**>one\n>a||\n\n**>two\n>b||"
 
 
 def test_bold_and_heading_render_as_markdownv2() -> None:

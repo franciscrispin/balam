@@ -84,6 +84,13 @@ class Config(BaseSettings):
     # inline button, which Telegram permits only in private chats.
     balam_miniapp_shortname: str | None = None
 
+    # --- Streaming verbosity ---
+    # How tool calls render in the progress stream. "collapsed" folds a burst of
+    # consecutive calls into one summary line ("Ran 3 commands, read a file")
+    # with the per-call detail inside a tap-to-expand blockquote; "full" keeps
+    # the legacy one-line-per-call stream. Mirrors TOOL_STREAM in .env.example.
+    tool_stream: Literal["collapsed", "full"] = "collapsed"
+
     # --- noVNC live browser view (ADR-0006) ---
     # The x11vnc server exposing the agent's headed Chrome (started on demand by
     # the browser-use skill, .claude/skills/browser-use/headed-browser/). The
@@ -108,6 +115,15 @@ class Config(BaseSettings):
         # Treat an empty/whitespace env value as "unset" so defaults apply.
         if isinstance(value, str) and value.strip() == "":
             return None
+        return value
+
+    @field_validator("tool_stream", mode="before")
+    @classmethod
+    def _blank_tool_stream_to_default(cls, value: object) -> object:
+        # A blank TOOL_STREAM means "unset"; the field is non-optional so the
+        # generic blank→None validator above would fail its Literal check.
+        if isinstance(value, str) and value.strip() == "":
+            return "collapsed"
         return value
 
     @field_validator("allowed_telegram_user_id")

@@ -816,6 +816,224 @@ async def test_stream_reply_keeps_failed_bash_output_tail() -> None:
     assert "line 0" not in final  # the head is dropped
 
 
+async def test_stream_reply_collapses_consecutive_tool_calls() -> None:
+    # A burst of consecutive calls folds into one summary line with the
+    # per-call detail inside an expandable blockquote (TOOL_STREAM=collapsed,
+    # the default) instead of one line per call.
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "call_1",
+                "read",
+                {"status": "completed", "input": {"filePath": "/work/proj/src/a.py"}},
+                pid="prt_t1",
+            ),
+            _tool_part(
+                "call_2",
+                "read",
+                {"status": "completed", "input": {"filePath": "/work/proj/src/b.py"}},
+                pid="prt_t2",
+            ),
+            _tool_part(
+                "call_3",
+                "bash",
+                {"status": "completed", "input": {"command": "uv run pytest"}, "output": "ok"},
+                pid="prt_t3",
+            ),
+            _ev("session.idle", sessionID=SID),
+        ],
+        directory="/work/proj",
+    )
+    (progress,) = bot.messages
+    # Telegram's expandable-quote form: empty bold opener, "||" terminator.
+    assert progress.startswith("**>")
+    assert progress.endswith("||")
+    assert "Ran a command, read 2 files" in progress
+    # The per-call detail lines ride inside the quote, paths workspace-relative.
+    assert "`src/a.py`" in progress
+    assert "`src/b.py`" in progress
+    assert "`uv run pytest`" in progress
+
+
+async def test_stream_reply_answer_text_breaks_tool_groups() -> None:
+    # Prose between two bursts seals the first group; the calls after it fold
+    # into a second, separate group (mirrors Claude Code's grouping rule).
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "call_1",
+                "read",
+                {"status": "completed", "input": {"filePath": "/w/a.py"}},
+                pid="prt_t1",
+            ),
+            _tool_part(
+                "call_2",
+                "read",
+                {"status": "completed", "input": {"filePath": "/w/b.py"}},
+                pid="prt_t2",
+            ),
+            _text_part(AID, "Found it."),
+            _tool_part(
+                "call_3",
+                "read",
+                {"status": "completed", "input": {"filePath": "/w/c.py"}},
+                pid="prt_t3",
+            ),
+            _tool_part(
+                "call_4",
+                "read",
+                {"status": "completed", "input": {"filePath": "/w/d.py"}},
+                pid="prt_t4",
+            ),
+            _ev("session.idle", sessionID=SID),
+        ],
+        directory="/w",
+    )
+    progress, answer = bot.messages
+    assert progress.count("**>") == 2  # two separate expandable quotes
+    assert answer == r"Found it\."
+
+
+async def test_stream_reply_collapsed_single_call_keeps_plain_line() -> None:
+    # A "group" of one call renders exactly like the legacy per-call line —
+    # no quote wrapper for something that is already one line.
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "call_1",
+                "read",
+                {"status": "completed", "input": {"filePath": "/w/a.py"}},
+            ),
+            _ev("session.idle", sessionID=SID),
+        ],
+        directory="/w",
+    )
+    (progress,) = bot.messages
+    assert "**>" not in progress
+    assert "🔧 Read" in progress and "`a.py`" in progress
+
+
+async def test_stream_reply_failed_call_breaks_out_of_group() -> None:
+    # An error is loud: it renders standalone in the full form (fenced command
+    # + output tail), never folded into a quote, and later calls start fresh.
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "call_1",
+                "read",
+                {"status": "completed", "input": {"filePath": "/w/a.py"}},
+                pid="prt_t1",
+            ),
+            _tool_part(
+                "call_2",
+                "bash",
+                {"status": "error", "input": {"command": "false"}, "error": "boom"},
+                pid="prt_t2",
+            ),
+            _tool_part(
+                "call_3",
+                "read",
+                {"status": "completed", "input": {"filePath": "/w/c.py"}},
+                pid="prt_t3",
+            ),
+            _ev("session.idle", sessionID=SID),
+        ],
+        directory="/w",
+    )
+    (progress,) = bot.messages
+    assert "**>" not in progress  # 1-call groups stay plain; the error is standalone
+    assert "boom" in progress  # the failure keeps its output
+    assert "`a.py`" in progress and "`c.py`" in progress
+
+
+async def test_stream_reply_full_mode_keeps_per_call_lines() -> None:
+    # TOOL_STREAM=full: the legacy one-line-per-call stream, no folding.
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=OpenCodeBackend(
+            FakeOpenCode(
+                [
+                    _msg_updated("assistant", AID),
+                    _tool_part(
+                        "call_1",
+                        "read",
+                        {"status": "completed", "input": {"filePath": "/w/a.py"}},
+                        pid="prt_t1",
+                    ),
+                    _tool_part(
+                        "call_2",
+                        "read",
+                        {"status": "completed", "input": {"filePath": "/w/b.py"}},
+                        pid="prt_t2",
+                    ),
+                    _ev("session.idle", sessionID=SID),
+                ]
+            )
+        ),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="hello",
+        directory="/w",
+        draft_interval=0.01,
+        tool_stream="full",
+    )
+    (progress,) = bot.messages
+    assert "**>" not in progress
+    assert progress.count("🔧 Read") == 2
+
+
+async def test_stream_reply_streams_live_group_summary_before_sealing() -> None:
+    # While the burst is active the group is a plain, ticking summary line
+    # (present tense + ellipsis); the expandable quote only appears once the
+    # group seals — re-editing a quote would visibly re-collapse it.
+    bot = TimelineBot()
+    await stream_reply(
+        bot=bot,
+        backend=OpenCodeBackend(
+            PacedOpenCode(
+                [
+                    _msg_updated("assistant", AID),
+                    _tool_part(
+                        "call_1",
+                        "read",
+                        {"status": "running", "input": {"filePath": "/w/a.py"}},
+                        pid="prt_t1",
+                    ),
+                    "SLEEP",  # flush → live summary line while the call runs
+                    _tool_part(
+                        "call_1",
+                        "read",
+                        {"status": "completed", "input": {"filePath": "/w/a.py"}},
+                        pid="prt_t1",
+                    ),
+                    _tool_part(
+                        "call_2",
+                        "read",
+                        {"status": "completed", "input": {"filePath": "/w/b.py"}},
+                        pid="prt_t2",
+                    ),
+                    _ev("session.idle", sessionID=SID),
+                ]
+            )
+        ),
+        session_id=SID,
+        chat_id=-1003953430909,  # supergroup → live-edit streaming
+        thread_id=99,
+        prompt="hello",
+        directory="/w",
+        draft_interval=0.01,
+    )
+    texts = [op[2] for op in bot.timeline if op[0] in ("send", "edit")]
+    assert any("Reading a file…" in t and "**>" not in t for t in texts)  # live form
+    assert texts[-1].startswith("**>") and "Read 2 files" in texts[-1]  # sealed form
+
+
 def test_format_approval_request_bash_shows_description_reason() -> None:
     gfm = _format_approval_request(
         "bash",

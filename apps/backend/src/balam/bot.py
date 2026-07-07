@@ -347,10 +347,13 @@ def _start_turn(
     # Snapshot-and-button factory for plan_exit questions ("View plan" in the
     # Mini App). Only wired when app.py stashed a content store (unit tests of
     # the bot path don't, and the streamer treats None as "no button").
+    # Config is optional here so unit tests of the bot path can omit it; the
+    # streamer's defaults then apply.
+    config: Config | None = context.application.bot_data.get("config")
+
     plan_view = None
     content_store = context.application.bot_data.get("content_store")
-    if content_store is not None:
-        config: Config = context.application.bot_data["config"]
+    if content_store is not None and config is not None:
         plan_view = make_plan_view_button(
             config, content_store, getattr(context.bot, "username", None)
         )
@@ -393,6 +396,7 @@ def _start_turn(
                 on_plan_approved=_on_plan_approved,
                 on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
                 follow_ups=follow_ups,
+                tool_stream=config.tool_stream if config is not None else "collapsed",
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.

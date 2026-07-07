@@ -34,6 +34,14 @@ def escape_markdown_v2(text: str) -> str:
     return _escape(text)
 
 
+#: A GFM blockquote whose first line is exactly ``[!expandable]`` (alert-style,
+#: like GitHub's ``[!NOTE]``) renders as a Telegram *expandable* blockquote:
+#: collapsed to its first lines with a chevron, tap to expand (Bot API 7.3).
+#: The marker is matched in rendered (escaped) form.
+EXPANDABLE_QUOTE_MARKER = "[!expandable]"
+_EXPANDABLE_MARKER_ESCAPED = _escape(EXPANDABLE_QUOTE_MARKER)
+
+
 def _plain_text(token: dict[str, Any]) -> str:
     """Extract plain text from a token subtree (no formatting)."""
     if isinstance(token.get("raw"), str):
@@ -94,7 +102,16 @@ class TelegramRenderer(mistune.BaseRenderer):
         # Telegram ends a blockquote at a bare ">" line, so drop empty lines that
         # would otherwise split one quote into several with unquoted gaps.
         non_empty = [line for line in text.strip().split("\n") if line]
+        expandable = bool(non_empty) and non_empty[0] == _EXPANDABLE_MARKER_ESCAPED
+        if expandable:
+            non_empty = non_empty[1:]
+        if not non_empty:
+            return ""
         quoted = "\n".join(">" + line for line in non_empty)
+        if expandable:
+            # MarkdownV2 expandable form: an empty bold entity before the first
+            # ">" opens it, "||" on the last line marks it collapsible.
+            quoted = "**" + quoted + "||"
         return quoted + "\n\n"
 
     def list(self, text: str, **attrs: Any) -> str:
