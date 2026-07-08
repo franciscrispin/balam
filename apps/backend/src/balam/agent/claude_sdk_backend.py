@@ -356,6 +356,10 @@ class ClaudeSdkBackend:
             # reach the keyboard.
             "setting_sources": ["user", "project", "local"],
             "skills": "all",
+            # Only use MCP servers explicitly declared in config.yaml (passed via
+            # mcp_servers); ignore ~/.claude.json mcpServers and any .mcp.json files.
+            # This isolates the bot's MCP config from the interactive Claude session.
+            "strict_mcp_config": True,
             "env": env,
         }
         if _is_resumable(turn.session_id):
