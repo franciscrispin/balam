@@ -51,9 +51,13 @@ PHOTO_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/web
 PROTOCOL_VERSION = "2024-11-05"
 
 SEND_FILE_DESCRIPTION = (
-    "Send a file to the user via Telegram. The file must exist on the local "
-    "filesystem. Images under 10 MB are sent as inline photos unless type is set "
-    "to 'document'. Markdown files include a button that opens a rendered preview."
+    "Send a file to the user via Telegram. Use this when the file *is* the "
+    "deliverable — a generated diagram, a report, a screenshot, a built artifact — "
+    "and you want it surfaced in the chat, not just mentioned. Call once per file. "
+    "The file must exist on the local filesystem. Images under 10 MB are sent as "
+    "inline photos unless type is set to 'document'. Markdown files include a "
+    "button that opens a rendered preview. Add a caption when a one-liner of "
+    "context helps; skip it if the file speaks for itself."
 )
 
 SEND_FILE_SCHEMA: dict[str, Any] = {

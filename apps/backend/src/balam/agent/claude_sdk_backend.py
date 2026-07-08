@@ -305,7 +305,15 @@ class ClaudeSdkBackend:
                 sdk_tool = tool(agent_tool.name, agent_tool.description, agent_tool.input_schema)(
                     agent_tool.handler
                 )
-                servers["balam"] = create_sdk_mcp_server(name="balam", tools=[sdk_tool])
+                server = dict(create_sdk_mcp_server(name="balam", tools=[sdk_tool]))
+                # Exempt send_file from the CLI's tool-search deferral: without
+                # this the model sees only the tool *name* until it ToolSearches,
+                # so the when-to-use guidance in the description never lands.
+                # The SDK forwards unknown config keys (only ``instance`` is
+                # stripped) and the CLI schema accepts ``alwaysLoad`` on sdk
+                # servers, propagating anthropic/alwaysLoad to every tool.
+                server["alwaysLoad"] = True
+                servers["balam"] = server
                 allowed.append(f"mcp__balam__{agent_tool.name}")
         return servers, allowed
 
