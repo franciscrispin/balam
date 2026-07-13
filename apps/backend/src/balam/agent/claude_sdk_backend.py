@@ -356,10 +356,15 @@ class ClaudeSdkBackend:
             # reach the keyboard.
             "setting_sources": ["user", "project", "local"],
             "skills": "all",
-            # Only use MCP servers explicitly declared in config.yaml (passed via
-            # mcp_servers); ignore ~/.claude.json mcpServers and any .mcp.json files.
-            # This isolates the bot's MCP config from the interactive Claude session.
-            "strict_mcp_config": True,
+            # Must stay False so the claude.ai account-managed connectors
+            # (Google Calendar, Gmail, Drive, Notion) remain available: strict mode
+            # uses ONLY the servers in mcp_servers and drops every "claudeai-proxy"
+            # connector, and the SDK has no input form to whitelist them back
+            # (McpClaudeAIProxyServerConfig is output-only). config.yaml still owns
+            # the usable surface via allowed_tools + the approval keyboard; on this VM
+            # nothing else leaks in (top-level ~/.claude.json mcpServers is empty and
+            # project-scoped servers never match a Balam context cwd).
+            "strict_mcp_config": False,
             "env": env,
         }
         if _is_resumable(turn.session_id):
