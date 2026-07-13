@@ -11,6 +11,7 @@ from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingDeletions, PendingQuestions
 from balam.bot import (
     BOT_COMMANDS,
+    _forwarded_slash_command,
     _handle_approval_callback,
     _handle_cancel,
     _handle_context,
@@ -25,6 +26,7 @@ from balam.bot import (
     _handle_question_done_callback,
     _handle_rename,
     _handle_status,
+    _strip_bot_mention_from_command,
     _topic_link,
     _topic_name,
     build_application,
@@ -54,6 +56,42 @@ def test_rejects_missing_sender() -> None:
 
 def test_does_not_treat_zero_as_wildcard() -> None:
     assert is_owner(0, OWNER) is False
+
+
+def test_strip_bot_mention_removes_own_mention() -> None:
+    assert _strip_bot_mention_from_command("/goal@balambot do it", "balambot") == "/goal do it"
+    assert _strip_bot_mention_from_command("/goal@BalamBot", "balambot") == "/goal"
+
+
+def test_strip_bot_mention_leaves_other_text_untouched() -> None:
+    # Non-commands, other bots' mentions, and missing username are all passed through.
+    assert _strip_bot_mention_from_command("/goal do it", "balambot") == "/goal do it"
+    assert _strip_bot_mention_from_command("email me @ work", "balambot") == "email me @ work"
+    assert _strip_bot_mention_from_command("/goal@otherbot", "balambot") == "/goal@otherbot"
+    assert _strip_bot_mention_from_command("/goal@balambot", None) == "/goal@balambot"
+
+
+def _cmd_entity(offset: int = 0, length: int = 5):
+    return MessageEntity(type=MessageEntity.BOT_COMMAND, offset=offset, length=length)
+
+
+def test_forwarded_slash_command_detects_leading_command() -> None:
+    msg = SimpleNamespace(text="/goal do it", entities=[_cmd_entity()])
+    assert _forwarded_slash_command(msg) is True
+
+
+def test_forwarded_slash_command_ignores_plain_text_and_mid_text_slash() -> None:
+    # Plain text, no entities, and a slash that isn't a leading BOT_COMMAND entity.
+    assert _forwarded_slash_command(SimpleNamespace(text="hello", entities=[])) is False
+    assert _forwarded_slash_command(SimpleNamespace(text="use /goal here", entities=None)) is False
+    # A mention entity at offset 0 (e.g. "@someone") is not a command.
+    mention = MessageEntity(type=MessageEntity.MENTION, offset=0, length=8)
+    assert _forwarded_slash_command(SimpleNamespace(text="@someone", entities=[mention])) is False
+    # A command not at the start of the message doesn't route as a command.
+    assert (
+        _forwarded_slash_command(SimpleNamespace(text="hi /goal", entities=[_cmd_entity(3)]))
+        is False
+    )
 
 
 # --- /context opens a new topic -----------------------------------------------
@@ -1471,6 +1509,39 @@ async def test_message_with_photo_forwards_file_part_and_caption(monkeypatch) ->
     files = captured["files"]
     assert [f.mime for f in files] == ["image/jpeg"]
     assert files[0].url.startswith("data:image/jpeg;base64,")
+
+
+async def test_slash_command_posts_forwarding_marker(monkeypatch) -> None:
+    # A forwarded slash command posts a deterministic marker into the topic before
+    # the turn runs, so the owner can see it was routed to the agent as a command.
+    async def fake_stream_reply(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    bot = _FakeBot()
+    message = SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        photo=None,
+        document=None,
+        text="/goal ship it",
+        caption=None,
+        entities=[MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=5)],
+        reply_to_message=None,
+        chat=SimpleNamespace(is_forum=True),
+    )
+    update, context, turns = _message_env(message, bot)
+    await context.application.bot_data["router"].create_topic_session(
+        SUPERGROUP, 5, "balam", "balam"
+    )
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 5)
+    if turn is not None:
+        await turn.task
+
+    assert (SUPERGROUP, "⌘ forwarding slash command /goal to the agent", 5) in bot.sent
 
 
 def _photo_update(chat_id: int, user_id: int) -> Update:

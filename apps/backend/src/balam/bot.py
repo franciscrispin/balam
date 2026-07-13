@@ -23,6 +23,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    MessageEntity,
     Update,
 )
 from telegram.error import BadRequest
@@ -187,6 +188,34 @@ async def _create_topic_from_general(
     return thread_id
 
 
+def _strip_bot_mention_from_command(text: str, bot_username: str | None) -> str:
+    """Drop a leading ``@<bot>`` from a slash command so the agent sees a clean
+    ``/goal``. Telegram appends ``@<bot>`` to commands in groups (``/goal@thisbot``);
+    only the first token is touched, and only when it addresses *this* bot."""
+    if not text.startswith("/") or not bot_username:
+        return text
+    head, sep, tail = text.partition(" ")
+    cmd, at, mention = head.partition("@")
+    if at and mention.lower() == bot_username.lower():
+        return f"{cmd}{sep}{tail}" if sep else cmd
+    return text
+
+
+def _forwarded_slash_command(message: Message) -> bool:
+    """True when this message is a bot command Balam forwards to the agent — a
+    ``BOT_COMMAND`` entity at offset 0, exactly what telegram's ``filters.COMMAND``
+    matches to route it through the catch-all handler. Balam's own commands are
+    caught by their ``CommandHandler`` first, so anything reaching here is a Claude
+    slash command (e.g. ``/goal``) on its way to the agent."""
+    ents = getattr(message, "entities", None) or []
+    return (
+        bool(getattr(message, "text", None))
+        and bool(ents)
+        and ents[0].offset == 0
+        and (ents[0].type == MessageEntity.BOT_COMMAND)
+    )
+
+
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
@@ -194,7 +223,13 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     chat_id = message.chat_id
     thread_id = message.message_thread_id
+    is_slash_command = _forwarded_slash_command(message)
     text = message.text or message.caption or ""
+    # An unregistered slash command (e.g. ``/goal``) reaches us via the catch-all
+    # handler so it can pass through to the agent as a Claude slash command. Telegram
+    # may address it as ``/goal@thisbot`` in groups; strip our own @-mention from the
+    # leading command token so the agent sees a clean ``/goal``.
+    text = _strip_bot_mention_from_command(text, getattr(context.bot, "username", None))
 
     pending_questions: PendingQuestions | None = context.application.bot_data.get(
         "pending_questions"
@@ -233,6 +268,18 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if created_thread_id is None:
             return
         thread_id = created_thread_id
+
+    # Show a deterministic marker so the owner can see a slash command was routed to
+    # the agent as a command (vs. treated as plain text). Expansion itself is invisible
+    # in the SDK stream, but this fires exactly when Balam forwards a command, and the
+    # agent's own ``Unknown command: /x`` reply closes the loop for a bad command.
+    if is_slash_command:
+        command = text.split(maxsplit=1)[0]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⌘ forwarding slash command {command} to the agent",
+            **thread_kwargs(thread_id),
+        )
 
     await _submit_turn(message, context, text, files, thread_id=thread_id)
 
@@ -1583,6 +1630,11 @@ def build_application(
             _handle_message,
         )
     )
+    # Catch-all for *unregistered* slash commands. The specific CommandHandlers above
+    # match first (PTB stops at the first handler in a group), so only commands Balam
+    # doesn't own — e.g. a Claude slash command like ``/goal`` — fall through here and
+    # get forwarded verbatim to the agent instead of being silently dropped.
+    app.add_handler(MessageHandler(filters.COMMAND & allowed, _handle_message))
     # Keep the stored title in step with renames done from the Telegram UI (the one
     # title change the bot doesn't itself originate). A service message matches
     # neither commands nor the text/photo handler above, so it falls through here.
