@@ -11,10 +11,18 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/projects/balam/apps/backend
 # Secrets + config from the repo .env (read by pydantic-settings). The optional
 # deploy/balam.env (note the leading "-") overlays the public-mode settings the
-# tunnel needs — BALAM_PUBLIC_URL and BALAM_MINIAPP_SHORTNAME. Later EnvironmentFile
-# wins, and a real env var beats the repo .env (ADR-0008), so these take effect.
+# tunnel needs — BALAM_DEV_AUTH=0 and the current BALAM_PUBLIC_URL — and is
+# rewritten by deploy/refresh-tunnel-url.sh. Later EnvironmentFile wins, and a
+# real env var beats the repo .env (ADR-0008), so these take effect.
 EnvironmentFile=/home/ubuntu/projects/balam/.env
 EnvironmentFile=-/home/ubuntu/projects/balam/deploy/balam.env
+# Mirror the interactive zsh PATH, same as balam-opencode.service (keep the two
+# in sync). In claude_sdk mode (AGENT_BACKEND=claude_sdk) the agent subprocess
+# is spawned by THIS unit — the SDK merges its env over the inherited one — so
+# its tool shells only see this PATH. Without it, user-installed CLIs (Go
+# binaries in ~/go/bin like printify, node, bun, glab, …) are not found.
+Environment=PATH=/home/ubuntu/.bun/bin:/home/ubuntu/.opencode/bin:/home/ubuntu/.local/bin:/home/ubuntu/.nvm/versions/node/v24.15.0/bin:/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/usr/local/go/bin:/home/ubuntu/go/bin
+Environment=GOPATH=/home/ubuntu/go
 ExecStart=/home/ubuntu/.local/bin/uv run balam
 Restart=on-failure
 RestartSec=5s
