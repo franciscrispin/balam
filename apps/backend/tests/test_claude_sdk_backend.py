@@ -116,6 +116,84 @@ async def test_tool_call_then_result() -> None:
     assert tools[-1].input == {"command": "ls"}
 
 
+def _tool_call(call_id: str, name: str, tool_input: dict) -> AssistantMessage:
+    return AssistantMessage(
+        content=[ToolUseBlock(id=call_id, name=name, input=tool_input)], model="claude"
+    )
+
+
+def _tool_result(call_id: str, content: str, *, is_error: bool = False) -> UserMessage:
+    return UserMessage(
+        content=[ToolResultBlock(tool_use_id=call_id, content=content, is_error=is_error)]
+    )
+
+
+async def test_task_tools_mirror_into_todowrite_checklist_events() -> None:
+    # The TaskCreate/TaskUpdate family (harnesses that replace TodoWrite) is
+    # mirrored into synthetic todowrite events carrying the cumulative list;
+    # the raw Task* calls never reach the tool stream.
+    messages = [
+        _init(),
+        _tool_call("t1", "TaskCreate", {"subject": "Write tests", "description": "d"}),
+        _tool_result("t1", "Task #1 created successfully: Write tests"),
+        _tool_call("t2", "TaskCreate", {"subject": "Run them", "description": "d"}),
+        _tool_result("t2", "Task #2 created successfully: Run them"),
+        _tool_call("t3", "TaskUpdate", {"taskId": "1", "status": "in_progress"}),
+        _tool_result("t3", "Updated task #1 status"),
+        _result(),
+    ]
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query(messages)), _turn())
+    tools = [e for e in events if isinstance(e, ToolUpdated)]
+    assert all(t.tool == "todowrite" and t.status == "completed" for t in tools)
+    assert [t.input["todos"] for t in tools] == [
+        [{"content": "Write tests", "status": "pending"}],
+        [
+            {"content": "Write tests", "status": "pending"},
+            {"content": "Run them", "status": "pending"},
+        ],
+        [
+            {"content": "Write tests", "status": "in_progress"},
+            {"content": "Run them", "status": "pending"},
+        ],
+    ]
+
+
+async def test_task_update_handles_unknown_ids_and_deletion() -> None:
+    # A task created in an earlier turn gets a placeholder label; a "deleted"
+    # status removes the item from the mirror.
+    messages = [
+        _init(),
+        _tool_call("t1", "TaskUpdate", {"taskId": "7", "status": "in_progress"}),
+        _tool_result("t1", "Updated task #7 status"),
+        _tool_call("t2", "TaskUpdate", {"taskId": "7", "status": "deleted"}),
+        _tool_result("t2", "Deleted task #7"),
+        _result(),
+    ]
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query(messages)), _turn())
+    tools = [e for e in events if isinstance(e, ToolUpdated)]
+    assert [t.input["todos"] for t in tools] == [
+        [{"content": "Task #7", "status": "in_progress"}],
+        [],
+    ]
+
+
+async def test_failed_task_tool_call_stays_loud() -> None:
+    # An errored Task* call is not swallowed into the mirror: it surfaces as a
+    # normal error tool event under its raw name.
+    messages = [
+        _init(),
+        _tool_call("t1", "TaskUpdate", {"taskId": "9", "status": "completed"}),
+        _tool_result("t1", "No such task", is_error=True),
+        _result(),
+    ]
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query(messages)), _turn())
+    tools = [e for e in events if isinstance(e, ToolUpdated)]
+    assert len(tools) == 1
+    assert tools[0].tool == "TaskUpdate"
+    assert tools[0].status == "error"
+    assert tools[0].error == "No such task"
+
+
 async def test_file_path_is_normalized_to_camelcase() -> None:
     messages = [
         _init(),

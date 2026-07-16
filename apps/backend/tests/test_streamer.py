@@ -10,6 +10,7 @@ from balam.streamer import (
     DraftSession,
     _format_approval_request,
     _make_transport,
+    _render_todos,
     stream_reply,
 )
 
@@ -814,6 +815,116 @@ async def test_stream_reply_keeps_failed_bash_output_tail() -> None:
     assert "truncated" in final  # a failed call keeps its (truncated) tail
     assert "line 199" in final  # the tail is kept
     assert "line 0" not in final  # the head is dropped
+
+
+def test_render_todos_icons_and_fallbacks() -> None:
+    gfm = _render_todos(
+        [
+            {"content": "Write tests", "status": "completed"},
+            {"content": "Run them", "status": "in_progress"},
+            {"content": "Ship it", "status": "pending"},
+            {"content": "Old idea", "status": "cancelled"},
+            {"content": "", "status": "pending"},  # no text → skipped
+            "junk",  # not a dict → skipped
+            {"text": "fallback field", "status": "surprising"},  # unknown status
+        ]
+    )
+    assert gfm.splitlines() == [
+        "📋 **Progress**",
+        "✅ Write tests",
+        "🔄 Run them",
+        "⬜ Ship it",
+        "❌ ~~Old idea~~",
+        "⬜ fallback field",
+    ]
+
+
+def test_render_todos_nothing_renderable_returns_empty() -> None:
+    assert _render_todos([]) == ""
+    assert _render_todos([{"content": "  ", "status": "pending"}]) == ""
+
+
+def _todowrite_part(call_id: str, status: str, todos: list[dict[str, str]]) -> dict[str, object]:
+    return _tool_part(
+        call_id, "todowrite", {"status": status, "input": {"todos": todos}}, pid=f"prt_{call_id}"
+    )
+
+
+async def test_stream_reply_todowrite_posts_then_edits_checklist_in_place() -> None:
+    # The to-do list is a live checklist message: posted once on the first
+    # todowrite, then edited in place as items advance; an identical update
+    # is a no-op (no redundant edit).
+    bot = TimelineBot()
+    advanced = [
+        {"content": "Write tests", "status": "completed"},
+        {"content": "Run them", "status": "in_progress"},
+    ]
+    await stream_reply(
+        bot=bot,
+        backend=OpenCodeBackend(
+            FakeOpenCode(
+                [
+                    _msg_updated("assistant", AID),
+                    _todowrite_part(
+                        "call_t1",
+                        "running",
+                        [
+                            {"content": "Write tests", "status": "in_progress"},
+                            {"content": "Run them", "status": "pending"},
+                        ],
+                    ),
+                    _todowrite_part("call_t2", "completed", advanced),
+                    _todowrite_part("call_t3", "completed", advanced),  # duplicate → no-op
+                    _text_part(AID, "done"),
+                    _ev("session.idle", sessionID=SID),
+                ]
+            )
+        ),
+        session_id=SID,
+        chat_id=-1003953430909,
+        thread_id=99,
+        prompt="hello",
+        draft_interval=0.01,
+    )
+    checklist_sends = [op for op in bot.timeline if op[0] == "send" and "Progress" in op[2]]
+    assert len(checklist_sends) == 1
+    _kind, checklist_id, first = checklist_sends[0]
+    assert "🔄 Write tests" in first
+    assert "⬜ Run them" in first
+    edits = [op for op in bot.timeline if op[0] == "edit" and op[1] == checklist_id]
+    assert len(edits) == 1  # the duplicate update was debounced
+    assert "✅ Write tests" in edits[0][2]
+    assert "🔄 Run them" in edits[0][2]
+
+
+async def test_stream_reply_todowrite_excluded_from_tool_stream() -> None:
+    # todowrite never renders as a tool line or joins a collapsed group — it
+    # only feeds the checklist message.
+    bot = await _run(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "call_1",
+                "bash",
+                {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+                pid="prt_t1",
+            ),
+            _todowrite_part("call_t", "completed", [{"content": "Plan", "status": "pending"}]),
+            _tool_part(
+                "call_2",
+                "bash",
+                {"status": "completed", "input": {"command": "pwd"}, "output": "ok"},
+                pid="prt_t2",
+            ),
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    checklist = [m for m in bot.messages if "Progress" in m]
+    assert len(checklist) == 1
+    assert "⬜ Plan" in checklist[0]
+    for message in bot.messages:
+        assert "to-do" not in message
+        assert "TodoWrite" not in message
 
 
 async def test_stream_reply_collapses_consecutive_tool_calls() -> None:

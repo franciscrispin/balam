@@ -457,6 +457,36 @@ def _render_tool_part(
     return line
 
 
+#: A todowrite item's ``status`` → its checklist icon in the live progress
+#: view (ported from iu's todo checklist).
+_TODO_ICONS: dict[str, str] = {
+    "completed": "✅",
+    "in_progress": "🔄",
+    "pending": "⬜",
+    "cancelled": "❌",
+}
+
+
+def _render_todos(todos: list[Any]) -> str:
+    """Render a todowrite ``todos`` list as the GFM checklist for the live
+    progress message. Both backends put the list in the tool input with
+    ``content`` per item (``text`` kept as a defensive fallback); items without
+    text are skipped, an unknown status gets the pending icon, and a cancelled
+    item is struck through. Returns ``""`` when nothing is renderable."""
+    lines = ["📋 **Progress**"]
+    for todo in todos:
+        if not isinstance(todo, dict):
+            continue
+        label = str(todo.get("content") or todo.get("text") or "").strip()
+        if not label:
+            continue
+        status = str(todo.get("status") or "")
+        if status == "cancelled":
+            label = f"~~{label}~~"
+        lines.append(f"{_TODO_ICONS.get(status, '⬜')} {label}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def _group_phrase(entries: list[GroupEntry], *, running: bool) -> str:
     """The one-line summary of a burst of tool calls, in Claude Code's collapsed
     vocabulary: comma-joined per-category counts ("Ran 3 commands, read a file"),
@@ -465,7 +495,7 @@ def _group_phrase(entries: list[GroupEntry], *, running: bool) -> str:
     commands = 0
     reads: set[str] = set()
     edits: set[str] = set()
-    searches = lists = fetches = websearches = tasks = todos = others = 0
+    searches = lists = fetches = websearches = tasks = others = 0
     for i, (tool, tool_input, _status, _output, _error) in enumerate(entries):
         if tool == Tool.BASH:
             commands += 1
@@ -485,8 +515,6 @@ def _group_phrase(entries: list[GroupEntry], *, running: bool) -> str:
             websearches += 1
         elif tool in (Tool.TASK, Tool.AGENT):
             tasks += 1
-        elif tool == Tool.TODOWRITE:
-            todos += 1
         else:
             others += 1
 
@@ -514,8 +542,6 @@ def _group_phrase(entries: list[GroupEntry], *, running: bool) -> str:
         parts.append(f"{verb} the web" + (f" {websearches} times" if websearches > 1 else ""))
     if tasks:
         parts.append(count("delegated", "delegating", tasks, "task"))
-    if todos:
-        parts.append(("updating" if running else "updated") + " the to-do list")
     if others:
         parts.append(count("made", "making", others, "tool call"))
     if not parts:
@@ -790,6 +816,11 @@ async def stream_reply(
     calls into one summary line with the per-call detail in an expandable
     blockquote (see :func:`_render_tool_group`); ``"full"`` keeps the legacy
     one-line-per-call stream.
+
+    ``todowrite`` calls are excluded from both modes: the agent's to-do list
+    renders as its own live **checklist message** (``📋 Progress`` with one
+    ✅/🔄/⬜/❌ line per item), posted once on the first update and edited in
+    place as items advance — mirroring iu's progress view.
     """
     # Local session id: known up front for OpenCode, learned from the first
     # SessionStarted event for a lazily-minted SDK session.
@@ -1070,6 +1101,37 @@ async def stream_reply(
             if answers and answers[0] == ["Yes"]:
                 on_plan_approved()
 
+    # The live to-do checklist: one message per turn, posted on the first
+    # todowrite and edited in place as items advance (ported from iu).
+    todo_message_id: int | None = None
+    todo_last_rendered: str | None = None
+
+    async def update_todos(todos: list[Any]) -> None:
+        """Post or edit the turn's to-do checklist message.
+
+        The checklist keeps its position (like the reasoning stream) and shows
+        the agent's latest to-do state; identical re-renders are skipped. It is
+        purely cosmetic — a failed send/edit is logged and must never abort the
+        turn."""
+        nonlocal todo_message_id, todo_last_rendered
+        gfm = _render_todos(todos)
+        if not gfm or gfm == todo_last_rendered:
+            return
+        chunks = gfm_to_telegram(gfm)
+        if not chunks:
+            return
+        todo_last_rendered = gfm
+        try:
+            if todo_message_id is None:
+                # The checklist lands below the progress stream, ending the
+                # tool burst — seal the group, like any other message send.
+                close_open_group()
+                todo_message_id = await transport.send_message(chunks[0])
+            else:
+                await transport.edit_message(todo_message_id, chunks[0])
+        except Exception:
+            logger.debug("to-do checklist update failed", exc_info=True)
+
     async def note_retry(detail: str | None) -> None:
         """Tell the user the turn is being retried (e.g. provider rate limit).
 
@@ -1188,6 +1250,13 @@ async def stream_reply(
                 reasoning_draft.set_text(_join_stream(reasoning_parts))
 
             elif isinstance(event, ToolUpdated):
+                if event.tool == Tool.TODOWRITE:
+                    # The to-do list gets its own live checklist message
+                    # instead of a tool line, in both stream modes.
+                    todos = event.input.get("todos")
+                    if isinstance(todos, list):
+                        await update_todos(todos)
+                    continue
                 if tool_stream == "full":
                     # Legacy stream: reserve a slot at the call's arrival position
                     # (so the tool line interleaves before any later text), but

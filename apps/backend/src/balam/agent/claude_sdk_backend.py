@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -96,6 +97,71 @@ _WIRE_TOOL: dict[str, str] = {
 _CATEGORY: dict[str, str] = {
     sdk: "edit" if wire in {"write", "edit"} else wire for sdk, wire in _WIRE_TOOL.items()
 }
+
+
+#: The task-list tool family newer CLI harnesses expose *instead of*
+#: ``TodoWrite``. They are stateful (create-then-update, ids assigned by the
+#: harness), so the backend mirrors them into a per-turn task list and emits
+#: synthetic ``todowrite`` events carrying the full list — the streamer's live
+#: checklist then works with either vocabulary. The raw calls are kept out of
+#: the tool stream (like ``TodoWrite`` itself); only a *failed* call surfaces.
+_TASK_TOOLS = frozenset({"TaskCreate", "TaskUpdate"})
+
+#: The task id a TaskCreate result announces ("Task #12 created successfully…").
+_TASK_ID_RE = re.compile(r"#(\d+)")
+
+
+def _result_text(content: Any) -> str:
+    """Flatten a ToolResultBlock ``content`` payload to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _apply_task_result(
+    mirror: dict[str, dict[str, str]], tool: str, tool_input: dict[str, Any], content: Any
+) -> list[dict[str, str]] | None:
+    """Fold one successful TaskCreate/TaskUpdate result into the turn's task
+    mirror and return the todowrite-shaped ``todos`` list, or ``None`` when the
+    result changed nothing renderable.
+
+    TaskCreate's id only appears in its result text; TaskUpdate carries it in
+    the input. A task first seen through an update (created in an earlier turn)
+    gets a ``Task #N`` placeholder label unless the update renames it; a
+    ``deleted`` status removes the item ("permanently removes the task").
+    """
+    if tool == "TaskCreate":
+        match = _TASK_ID_RE.search(_result_text(content))
+        if match is None:
+            return None
+        task_id = match.group(1)
+        label = str(tool_input.get("subject") or "").strip()
+        mirror[task_id] = {"content": label or f"Task #{task_id}", "status": "pending"}
+    else:  # TaskUpdate
+        task_id = str(tool_input.get("taskId") or "").strip()
+        if not task_id:
+            return None
+        status = tool_input.get("status")
+        if status == "deleted":
+            if mirror.pop(task_id, None) is None:
+                return None
+        else:
+            item = mirror.setdefault(task_id, {"content": f"Task #{task_id}", "status": "pending"})
+            subject = str(tool_input.get("subject") or "").strip()
+            if subject:
+                item["content"] = subject
+            if status in ("pending", "in_progress", "completed"):
+                item["status"] = status
+    return [
+        dict(item)
+        for _id, item in sorted(mirror.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)
+    ]
 
 
 def _wire_tool(name: str) -> str:
@@ -389,6 +455,10 @@ class ClaudeSdkBackend:
         session_started = False
         # tool_use_id -> (wire_tool, normalized_input), to render results later.
         tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+        # task id -> {"content", "status"}: the turn's mirror of the harness's
+        # TaskCreate/TaskUpdate state, re-emitted as synthetic ``todowrite``
+        # events so the streamer's checklist covers both tool vocabularies.
+        task_mirror: dict[str, dict[str, str]] = {}
         # Per-streaming-message block accumulators (StreamEvent partials).
         cur_msg_id: str | None = None
         block_text: dict[int, str] = {}
@@ -559,6 +629,22 @@ class ClaudeSdkBackend:
         def handle_tool_result(block: ToolResultBlock) -> None:
             wire, inp = tool_calls.get(block.tool_use_id, (block.tool_use_id, {}))
             is_error = bool(block.is_error)
+            if wire in _TASK_TOOLS and not is_error:
+                # Task-list bookkeeping: fold into the mirror and re-emit as a
+                # todowrite update for the live checklist; the raw call stays
+                # out of the tool stream. A failed call falls through below so
+                # the error is still loud.
+                todos = _apply_task_result(task_mirror, wire, inp, block.content)
+                if todos is not None:
+                    queue.put_nowait(
+                        ToolUpdated(
+                            call_id=f"tasks:{block.tool_use_id}",
+                            tool="todowrite",
+                            input={"todos": todos},
+                            status="completed",
+                        )
+                    )
+                return
             queue.put_nowait(
                 ToolUpdated(
                     call_id=block.tool_use_id,
@@ -640,6 +726,10 @@ class ClaudeSdkBackend:
                                 wire = _wire_tool(block.name)
                                 inp = _normalize_input(block.input)
                                 tool_calls[block.id] = (wire, inp)
+                                if wire in _TASK_TOOLS:
+                                    # Mirrors into the checklist on result; the
+                                    # raw call never enters the tool stream.
+                                    continue
                                 await queue.put(
                                     ToolUpdated(
                                         call_id=block.id, tool=wire, input=inp, status="running"
