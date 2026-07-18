@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter
 
 from balam.agent.backend import AgentBackend, FollowUpChannel, TurnRequest
 from balam.agent.events import (
@@ -717,6 +718,10 @@ def _make_transport(
                 msg = await bot.send_message(
                     chat_id=chat_id, text=text, parse_mode="MarkdownV2", **topic_kwargs
                 )
+            except RetryAfter:
+                # Flood control, not a formatting problem — a plain resend would
+                # burn another doomed request. The rate limiter already retried.
+                raise
             except Exception:
                 # Malformed MarkdownV2 → resend without formatting rather than drop.
                 logger.debug("MarkdownV2 send failed; falling back to plain text", exc_info=True)
@@ -739,6 +744,10 @@ def _make_transport(
                     text=text,
                     parse_mode="MarkdownV2",
                 )
+            except RetryAfter:
+                # Flood control, not a formatting problem — a plain re-edit would
+                # burn another doomed request. The rate limiter already retried.
+                raise
             except Exception as exc:
                 if "not modified" in str(exc).lower():
                     return

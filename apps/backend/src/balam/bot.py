@@ -28,6 +28,7 @@ from telegram import (
 )
 from telegram.error import BadRequest
 from telegram.ext import (
+    AIORateLimiter,
     Application,
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -1630,7 +1631,15 @@ def build_application(
     post_init: Any = None,
     post_shutdown: Any = None,
 ) -> Application:
-    builder = ApplicationBuilder().token(config.telegram_bot_token)
+    # Live-edit streaming, the todo checklist, and command handlers all share
+    # one per-group flood budget (~20 messages/min). The limiter paces calls
+    # under Telegram's limits and sleeps+retries on RetryAfter, so a burst
+    # can't 429 a turn's final answer into the void.
+    builder = (
+        ApplicationBuilder()
+        .token(config.telegram_bot_token)
+        .rate_limiter(AIORateLimiter(max_retries=3))
+    )
     if post_init is not None:
         builder = builder.post_init(post_init)
     if post_shutdown is not None:
