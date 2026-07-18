@@ -394,6 +394,16 @@ class ClaudeSdkBackend:
         env: dict[str, str] = {}
         if self._api_key:
             env["ANTHROPIC_API_KEY"] = self._api_key
+        # The CLI ships the whole Artifact stack (Artifact tool, artifact-design/
+        # artifact-capabilities bundled skills) but defaults it OFF for SDK
+        # entrypoints (`isArtifactSdkDefaultOff`: sdk-py/sdk-ts/sdk-cli). This env
+        # var skips only that check; the account-side gates (first-party OAuth,
+        # paid tier, `tengu_cobalt_plinth` rollout) still apply, so on an
+        # ineligible account the tool simply stays hidden. The CLI `/artifacts`
+        # command stays interactive-only (local-jsx); Balam's /artifacts bot
+        # command covers it via the tool's `action:"list"`. See
+        # docs/claude-cli-gated-features.md.
+        env["CLAUDE_CODE_ARTIFACT"] = "1"
         kwargs: dict[str, Any] = {
             "cwd": turn.directory,
             # Plan mode gates writes and lets the agent call ExitPlanMode when it

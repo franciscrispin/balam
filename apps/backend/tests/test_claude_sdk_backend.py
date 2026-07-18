@@ -280,6 +280,24 @@ async def test_plan_mode_sets_permission_mode() -> None:
     assert seen_options[0].permission_mode == "plan"
 
 
+async def test_options_env_lifts_artifact_sdk_default_off() -> None:
+    # CLAUDE_CODE_ARTIFACT=1 skips the CLI's SDK-entrypoint default-off so the
+    # Artifact tool + bundled artifact skills can load (account gates permitting);
+    # see docs/claude-cli-gated-features.md.
+    seen_options: list = []
+
+    def query_fn(*, prompt, options):
+        seen_options.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    await _collect(ClaudeSdkBackend(query_fn=query_fn), _turn())
+    assert seen_options[0].env["CLAUDE_CODE_ARTIFACT"] == "1"
+
+
 async def test_exit_plan_mode_becomes_plan_question_yes_allows() -> None:
     captured: list = []
 

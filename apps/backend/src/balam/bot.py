@@ -688,6 +688,53 @@ async def _handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+#: Scopes the Artifact tool's ``list`` action accepts; ``mine`` is its default.
+_ARTIFACT_SCOPES = ("mine", "shared", "all")
+
+
+async def _handle_artifacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/artifacts [shared|all]`` — list the owner's published claude.ai artifacts.
+
+    The CLI's own ``/artifacts`` is a local-jsx screen that only exists in
+    interactive sessions, so it can never run through the SDK backend. The data
+    behind it is reachable anyway: the Artifact tool's ``action:"list"`` returns
+    the published pages (title, url, updatedAt). This command submits a regular
+    turn instructing the agent to call it — which also means it degrades to a
+    plain "tool unavailable" answer on a backend without the Artifact tool
+    (OpenCode, or an account the rollout gate excludes).
+    """
+    message = update.message
+    if message is None:
+        return
+
+    if _is_forum_general_message(message):
+        # Same reasoning as /plan: General messages spawn fresh topics, so the
+        # listing would land in a topic named after a bare command.
+        await message.reply_text("Use /artifacts inside a topic.")
+        return
+
+    args = context.args or []
+    scope = args[0].lower() if args else "mine"
+    if scope not in _ARTIFACT_SCOPES:
+        await message.reply_text("Usage: /artifacts [shared|all] — default lists your own.")
+        return
+
+    prompt = (
+        f'Call the Artifact tool with action "list" and scope "{scope}", then present '
+        "the artifacts as a compact list: each title as a link to its URL, with the "
+        "updated date when available. Mention if the result was truncated. Do not "
+        "take any other action. If the Artifact tool is not available in this "
+        "session, say so instead of improvising."
+    )
+    await _submit_turn(
+        message,
+        context,
+        prompt,
+        [],
+        thread_id=message.message_thread_id,
+    )
+
+
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/status`` — report the topic's context, session, and whether a turn runs."""
     message = update.message
@@ -1553,6 +1600,7 @@ BOT_COMMANDS = [
     BotCommand("plan", "Plan mode for this topic (/plan [request], /plan off)"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
+    BotCommand("artifacts", "List your published claude.ai artifacts (/artifacts [shared|all])"),
     BotCommand("delete", "Delete topics — pick which ones to remove"),
 ]
 
@@ -1623,6 +1671,7 @@ def build_application(
     app.add_handler(CommandHandler("plan", _handle_plan, filters=allowed))
     app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
     app.add_handler(CommandHandler("browser", _handle_browser, filters=allowed))
+    app.add_handler(CommandHandler("artifacts", _handle_artifacts, filters=allowed))
     app.add_handler(CommandHandler("delete", _handle_delete, filters=allowed))
     app.add_handler(
         MessageHandler(

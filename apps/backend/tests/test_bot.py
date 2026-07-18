@@ -13,6 +13,7 @@ from balam.bot import (
     BOT_COMMANDS,
     _forwarded_slash_command,
     _handle_approval_callback,
+    _handle_artifacts,
     _handle_cancel,
     _handle_context,
     _handle_delete_confirm_callback,
@@ -998,7 +999,75 @@ async def test_register_commands_adds_chat_scope_when_configured() -> None:
 
 def test_bot_commands_includes_all_commands() -> None:
     names = {c.command for c in BOT_COMMANDS}
-    assert {"new", "rename", "status", "model", "effort", "cancel", "context"} <= names
+    expected = {"new", "rename", "status", "model", "effort", "cancel", "context", "artifacts"}
+    assert expected <= names
+
+
+# --- /artifacts ---------------------------------------------------------------
+
+
+async def test_artifacts_submits_listing_prompt(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    message = _text_msg(SUPERGROUP, 5, "/artifacts")
+    update, context, turns = _message_env(message, _FakeBot())
+    context.args = []
+
+    await _handle_artifacts(update, context)
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task
+
+    prompt = str(captured["prompt"])
+    assert 'Artifact tool with action "list"' in prompt
+    assert 'scope "mine"' in prompt
+
+
+async def test_artifacts_passes_scope_argument(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    message = _text_msg(SUPERGROUP, 5, "/artifacts Shared")
+    update, context, turns = _message_env(message, _FakeBot())
+    context.args = ["Shared"]  # scopes are case-insensitive
+
+    await _handle_artifacts(update, context)
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task
+
+    assert 'scope "shared"' in str(captured["prompt"])
+
+
+async def test_artifacts_rejects_unknown_scope() -> None:
+    message = _text_msg(SUPERGROUP, 5, "/artifacts bogus")
+    update, context, turns = _message_env(message, _FakeBot())
+    context.args = ["bogus"]
+
+    await _handle_artifacts(update, context)
+
+    assert turns.get(SUPERGROUP, 5) is None
+    assert "Usage: /artifacts" in message.replies[-1]
+
+
+async def test_artifacts_refused_in_general() -> None:
+    # Same rule as /plan: a General message would spawn a topic named after the
+    # bare command, so ask for a topic instead.
+    message = _text_msg(SUPERGROUP, None, "/artifacts")
+    update, context, turns = _message_env(message, _FakeBot())
+    context.args = []
+
+    await _handle_artifacts(update, context)
+
+    assert turns.get(SUPERGROUP, None) is None
+    assert "inside a topic" in message.replies[-1]
 
 
 # --- approval inline-keyboard callback ----------------------------------------
