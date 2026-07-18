@@ -129,6 +129,32 @@ What Balam changed:
    prompting the agent to call `Artifact(action:"list")` and format the
    result. On a backend without the tool (OpenCode, or an excluded account)
    the agent just reports the tool is unavailable.
+3. `.env` sets `CLAUDE_SDK_CLI_PATH=/home/ubuntu/.local/bin/claude` — see the
+   pitfall below; without it, steps 1–2 land in a binary that predates the
+   feature and silently do nothing.
+
+## Pitfall: the Python SDK spawns its own bundled CLI
+
+The first live test failed even though the env var provably reached the
+subprocess. Cause: `claude-agent-sdk` ships a **vendored CLI** at
+`site-packages/claude_agent_sdk/_bundled/claude` and spawns *that* by default —
+not the standalone install the binary investigation was done against. The
+bundled copy lags the standalone channel (2.1.178 vs 2.1.21x at the time), and
+a feature that postdates it simply is not there to enable.
+
+- **Diagnose**: from inside a bot session, `ps -o args= -p $PPID` shows the
+  exact binary running the session; `<path> --version` and
+  `grep -c <feature-string> <path>` tell you if the feature exists in it.
+- **Fix**: `CLAUDE_SDK_CLI_PATH` in `.env` (flows to
+  `ClaudeAgentOptions.cli_path`) pointed at the launcher symlink
+  `~/.local/bin/claude`, which tracks standalone CLI upgrades automatically.
+  The alternative — waiting for a `claude-agent-sdk` release with a fresh
+  bundle — leaves the bot's CLI version pinned to the SDK's release cadence.
+- **Verify before restarting the bot**: a five-line `query()` probe with
+  `cli_path` + the env override, reading the init message's `tools` /
+  `skills` lists (`/tmp/artifact_probe2.py` pattern). Note the first probe run
+  can show the tool but not the gated skills while the statsig cache is cold;
+  trust the second run.
 
 The marketplace `project-artifact` plugin is unrelated — it is a status-page
 generator *on top of* the Artifact tool, not one of the bundled skills.
@@ -147,4 +173,10 @@ generator *on top of* the Artifact tool, not one of the bundled skills.
    action.
 5. Wire env overrides in `_build_options` (per-session, in code — not in the
    systemd unit, so it survives redeploys and is visible in tests).
-6. Restart the bot **only between turns**, then verify in a fresh topic.
+6. **Check which binary the SDK actually spawns** (`ps -o args= -p $PPID`
+   inside a session). If it is the vendored
+   `claude_agent_sdk/_bundled/claude`, confirm the feature exists at that
+   version or point `CLAUDE_SDK_CLI_PATH` at the standalone launcher.
+7. Prove the change with a direct `query()` probe (init message `tools` /
+   `skills`) *before* restarting the bot.
+8. Restart the bot **only between turns**, then verify in a fresh topic.
