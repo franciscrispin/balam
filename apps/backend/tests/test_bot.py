@@ -11,6 +11,7 @@ from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingDeletions, PendingQuestions
 from balam.bot import (
     BOT_COMMANDS,
+    _forward_reply_prefix,
     _forwarded_slash_command,
     _handle_approval_callback,
     _handle_artifacts,
@@ -92,6 +93,114 @@ def test_forwarded_slash_command_ignores_plain_text_and_mid_text_slash() -> None
     assert (
         _forwarded_slash_command(SimpleNamespace(text="hi /goal", entities=[_cmd_entity(3)]))
         is False
+    )
+
+
+def _plain_msg(**overrides):
+    """A message double with every forward/reply field absent by default."""
+    base = dict(
+        text="hi",
+        caption=None,
+        forward_origin=None,
+        reply_to_message=None,
+        quote=None,
+        message_thread_id=5,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_forward_reply_prefix_plain_message_is_empty() -> None:
+    assert _forward_reply_prefix(_plain_msg()) == ""
+
+
+def test_forward_reply_prefix_from_visible_user() -> None:
+    origin = SimpleNamespace(sender_user=SimpleNamespace(full_name="Alice Tan", username="alice"))
+    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+        "[Forwarded from Alice Tan (@alice)]\n"
+    )
+
+
+def test_forward_reply_prefix_from_hidden_user_has_no_handle() -> None:
+    # A sender who hides their account exposes only a name, never a @username.
+    origin = SimpleNamespace(sender_user=None, sender_user_name="Bob (hidden)")
+    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+        "[Forwarded from Bob (hidden)]\n"
+    )
+
+
+def test_forward_reply_prefix_from_channel_uses_title_and_signature() -> None:
+    origin = SimpleNamespace(
+        sender_user=None,
+        sender_user_name=None,
+        sender_chat=None,
+        chat=SimpleNamespace(title="Glints News", username="glintsnews"),
+        author_signature="Editor",
+    )
+    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+        "[Forwarded from Glints News (Editor)]\n"
+    )
+
+
+def test_forward_reply_prefix_reply_uses_who_and_snippet() -> None:
+    reply = SimpleNamespace(
+        from_user=SimpleNamespace(full_name="Bob Lee", username="bob"),
+        message_id=41,
+        text="let's finish the deck tomorrow",
+        caption=None,
+        forum_topic_created=None,
+    )
+    assert _forward_reply_prefix(_plain_msg(reply_to_message=reply)) == (
+        '[Replying to Bob Lee (@bob): "let\'s finish the deck tomorrow"]\n'
+    )
+
+
+def test_forward_reply_prefix_prefers_highlighted_quote_over_full_message() -> None:
+    reply = SimpleNamespace(
+        from_user=SimpleNamespace(full_name="Bob Lee", username="bob"),
+        message_id=41,
+        text="a very long message with lots of unrelated context around it",
+        caption=None,
+        forum_topic_created=None,
+    )
+    quote = SimpleNamespace(text="9pm tomorrow")
+    line = _forward_reply_prefix(_plain_msg(reply_to_message=reply, quote=quote))
+    assert line == '[Replying to Bob Lee (@bob): "9pm tomorrow"]\n'
+
+
+def test_forward_reply_prefix_skips_forum_topic_anchor_and_service_message() -> None:
+    # Replying to the topic's own opening message (id == thread id) is threading
+    # bookkeeping, not a real reply.
+    anchor = SimpleNamespace(
+        from_user=SimpleNamespace(full_name="Owner", username=None),
+        message_id=5,
+        text="topic root",
+        caption=None,
+        forum_topic_created=None,
+    )
+    assert _forward_reply_prefix(_plain_msg(reply_to_message=anchor, message_thread_id=5)) == ""
+    # A forum service message (topic created) is skipped regardless of its id.
+    service = SimpleNamespace(
+        from_user=None,
+        message_id=99,
+        text=None,
+        caption=None,
+        forum_topic_created=SimpleNamespace(name="scratch"),
+    )
+    assert _forward_reply_prefix(_plain_msg(reply_to_message=service)) == ""
+
+
+def test_forward_reply_prefix_combines_forward_and_reply() -> None:
+    origin = SimpleNamespace(sender_user=SimpleNamespace(full_name="Alice Tan", username="alice"))
+    reply = SimpleNamespace(
+        from_user=SimpleNamespace(full_name="Bob Lee", username="bob"),
+        message_id=41,
+        text="the deck",
+        caption=None,
+        forum_topic_created=None,
+    )
+    assert _forward_reply_prefix(_plain_msg(forward_origin=origin, reply_to_message=reply)) == (
+        '[Forwarded from Alice Tan (@alice)]\n[Replying to Bob Lee (@bob): "the deck"]\n'
     )
 
 
@@ -1578,6 +1687,48 @@ async def test_message_with_photo_forwards_file_part_and_caption(monkeypatch) ->
     files = captured["files"]
     assert [f.mime for f in files] == ["image/jpeg"]
     assert files[0].url.startswith("data:image/jpeg;base64,")
+
+
+async def test_message_prepends_forward_and_reply_header_to_prompt(monkeypatch) -> None:
+    # The owner forwards a message *and* replies to another; both gestures survive
+    # into the agent-facing prompt as a bracketed header, while the topic is still
+    # auto-named from the owner's own text (not the injected header).
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    bot = _FakeBot()
+    message = _text_msg(SUPERGROUP, 5, "please action this")
+    message.forward_origin = SimpleNamespace(
+        sender_user=SimpleNamespace(full_name="Alice Tan", username="alice")
+    )
+    message.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(full_name="Bob Lee", username="bob"),
+        message_id=41,
+        text="finish the deck tomorrow",
+        caption=None,
+        forum_topic_created=None,
+    )
+    update, context, turns = _message_env(message, bot)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task
+
+    assert captured["prompt"] == (
+        "[Forwarded from Alice Tan (@alice)]\n"
+        '[Replying to Bob Lee (@bob): "finish the deck tomorrow"]\n'
+        "please action this"
+    )
+    # The topic name comes from the owner's text, never the injected header.
+    assert bot.edited_topics
+    topic_name = bot.edited_topics[-1][2]
+    assert "please action this" in topic_name
+    assert "Forwarded" not in topic_name and "Replying" not in topic_name
 
 
 async def test_slash_command_posts_forwarding_marker(monkeypatch) -> None:
