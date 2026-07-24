@@ -31,6 +31,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES,
     AssistantMessage,
     ClaudeAgentOptions,
     PermissionResultAllow,
@@ -39,6 +40,9 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -163,32 +167,66 @@ def _is_foreign_result(message: ResultMessage, *, model_called: bool) -> bool:
     return message.num_turns == 0 and message.duration_api_ms == 0
 
 
-def _background_tasks(data: dict[str, Any]) -> tuple[BackgroundTask, ...]:
-    """Normalize a ``background_tasks_changed`` payload into the event vocabulary.
+class LiveTasks:
+    """The tasks the CLI currently has running, tracked from its task messages.
 
-    The CLI reports the full set on every change, so this is the complete list of
-    what is running, not a delta.
+    The CLI *does* publish a whole-set ``background_tasks_changed`` system event,
+    but it never reaches an SDK client — it is filtered out of the transport, so
+    reading it here was dead code. What does arrive is the per-task lifecycle:
+    ``task_started`` when one launches and ``task_updated`` / ``task_notification``
+    as it moves. A task's terminal state can come from *either* of the latter two
+    (the SDK documents that a background task may report completion only via
+    ``task_updated``), so both clear it.
+
+    Foreground work (a subagent the model waits on) shows up here too and simply
+    goes terminal before the turn ends, which is why callers only need to read
+    this at a turn boundary to learn what would outlive the turn.
     """
-    raw = data.get("tasks")
-    if not isinstance(raw, list):
-        return ()
-    tasks: list[BackgroundTask] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        task_id = str(item.get("task_id") or "").strip()
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, BackgroundTask] = {}
+
+    @property
+    def tasks(self) -> tuple[BackgroundTask, ...]:
+        return tuple(self._tasks.values())
+
+    def started(self, message: TaskStartedMessage) -> bool:
+        task_id = (message.task_id or "").strip()
         if not task_id:
-            continue
-        description = str(item.get("description") or "").strip()
-        task_type = item.get("task_type")
-        tasks.append(
-            BackgroundTask(
-                task_id=task_id,
-                description=description or task_id,
-                task_type=str(task_type) if task_type else None,
-            )
+            return False
+        description = (message.description or "").strip() or task_id
+        self._tasks[task_id] = BackgroundTask(
+            task_id=task_id,
+            description=description,
+            task_type=message.task_type,
         )
-    return tuple(tasks)
+        return True
+
+    def updated(self, message: TaskUpdatedMessage) -> bool:
+        task_id = (message.task_id or "").strip()
+        if not task_id:
+            return False
+        patch = message.patch if isinstance(message.patch, dict) else {}
+        if patch.get("status") in TERMINAL_TASK_STATUSES:
+            return self._tasks.pop(task_id, None) is not None
+        existing = self._tasks.get(task_id)
+        description = str(patch.get("description") or "").strip()
+        if existing is not None and description and description != existing.description:
+            self._tasks[task_id] = BackgroundTask(
+                task_id=task_id,
+                description=description,
+                task_type=existing.task_type,
+            )
+            return True
+        return False
+
+    def notified(self, message: TaskNotificationMessage) -> bool:
+        task_id = (message.task_id or "").strip()
+        if not task_id:
+            return False
+        if message.status in TERMINAL_TASK_STATUSES:
+            return self._tasks.pop(task_id, None) is not None
+        return False
 
 
 def _result_text(content: Any) -> str:
@@ -555,6 +593,9 @@ class ClaudeSdkBackend:
         # TaskCreate/TaskUpdate state, re-emitted as synthetic ``todowrite``
         # events so the streamer's checklist covers both tool vocabularies.
         task_mirror: dict[str, dict[str, str]] = {}
+        # What the CLI has running right now, from its task lifecycle messages.
+        # Read at the turn boundary to decide what would outlive the turn.
+        live_tasks = LiveTasks()
         # Per-streaming-message block accumulators (StreamEvent partials).
         cur_msg_id: str | None = None
         block_text: dict[int, str] = {}
@@ -781,15 +822,25 @@ class ClaudeSdkBackend:
             try:
                 async for message in stream:
                     disarm_idle_guard()
-                    if isinstance(message, SystemMessage):
+                    # The task messages subclass SystemMessage, so they have to be
+                    # matched before the generic branch or they fall into it.
+                    if isinstance(
+                        message,
+                        (TaskStartedMessage, TaskUpdatedMessage, TaskNotificationMessage),
+                    ):
+                        maybe_session(message.session_id)
+                        if isinstance(message, TaskStartedMessage):
+                            changed = live_tasks.started(message)
+                        elif isinstance(message, TaskUpdatedMessage):
+                            changed = live_tasks.updated(message)
+                        else:
+                            changed = live_tasks.notified(message)
+                        if changed:
+                            await queue.put(BackgroundTasksChanged(tasks=live_tasks.tasks))
+
+                    elif isinstance(message, SystemMessage):
                         if message.subtype == "init":
                             maybe_session(message.data.get("session_id"))
-                        elif message.subtype == "background_tasks_changed":
-                            # Full state on every change, so an empty list means
-                            # nothing is left running.
-                            await queue.put(
-                                BackgroundTasksChanged(tasks=_background_tasks(message.data))
-                            )
 
                     elif isinstance(message, StreamEvent):
                         maybe_session(message.session_id)
