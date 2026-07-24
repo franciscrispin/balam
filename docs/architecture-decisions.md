@@ -632,7 +632,7 @@ answer via the backend's reply methods, so they are backend-agnostic.
   (scope-token URL); under the SDK it is an in-process SDK tool (closure over the
   topic) and context MCP servers are coerced to the SDK's `mcp_servers` shape — no
   HTTP server or token needed.
-- **Plan mode.** *Superseded — `/plan` has since been removed.* It used
+- **Plan mode.** *Superseded — `/plan` was removed (ADR-0015).* It used
   OpenCode's plan agent and the SDK's `permission_mode="plan"`, surfacing
   `ExitPlanMode` as a Yes/No plan-approval question. Native natural-language
   planning ("plan feature X" in a normal turn) is unaffected and remains
@@ -643,6 +643,68 @@ answer via the backend's reply methods, so they are backend-agnostic.
 - **Different process model.** No agent daemon: the SDK spawns the bundled `claude`
   CLI per turn (auth via `ANTHROPIC_API_KEY` or an already-authenticated CLI), so
   the OpenCode systemd unit is not needed in SDK mode.
+
+---
+
+## ADR-0015: Hold an SDK turn open while its background work runs
+
+Status: Accepted Date: 2026-07-24
+
+### Context
+
+Under ADR-0014 the SDK backend runs one `claude` process per turn and closes its
+stdin at the `ResultMessage`. The CLI reads that as wind-down and kills every
+background task it owns.
+
+So an agent that starts background subagents, says "I'll report findings as they
+land", and ends its turn has its work killed seconds later. Observed live: four
+investigation subagents launched, the reply sent at 11:17:01, all four killed at
+11:17:04 mid-tool-call with nothing produced and nothing said in the topic.
+
+Two mitigations already existed and neither worked. The system-prompt note only
+described the Bash tool's `run_in_background`, while the Agent tool defaults to
+backgrounding and has no `setsid` equivalent. The turn-end "still running" notice
+read `background_tasks_changed`, which the CLI publishes but filters out of the
+SDK transport — dead code that could never fire.
+
+### Decision
+
+**Keep the turn open while background work is live**, instead of ending it at the
+first result.
+
+- The live set is rebuilt from the per-task lifecycle messages (`task_started`,
+  `task_updated`, `task_notification`), which do reach an SDK client. A terminal
+  state may arrive on either of the latter two, so both clear it.
+- At a result with work still live, the backend emits `TurnStepFinished` and
+  keeps consuming. The streamer commits the answer so far, so anything that
+  follows lands as its own message.
+- When a background task finishes, the CLI wakes the model by itself and the
+  report arrives as an ordinary assistant turn. Delivery is not built here; it
+  falls out of not hanging up.
+- `_BACKGROUND_HOLD_S` (30 min) caps the hold. At the deadline the turn ends and
+  the work stops with it — reported by the turn-end notice, now its only job.
+
+Measured on this VM against CLI 2.1.218: with the client held open past the
+result a background task keeps running and the process stays alive; disconnecting
+kills it immediately. That is the whole mechanism.
+
+### Consequences
+
+- **Persistence is demand-driven.** A topic holds a CLI process only while it has
+  background work, so the ordinary turn costs exactly what it did before. This is
+  why there is no session pool: one process is ~200-500 MB here and the store has
+  34 topics, so keeping one alive per topic (open-shrimp's model, a flat 30-minute
+  idle timeout) would not fit in 23 GB.
+- **Model and effort had to become chat-global.** A held turn cannot absorb a
+  mid-flight change — the SDK can swap a model on a live client but effort is
+  fixed at connect. `/model` and `/effort` are now set from General and apply
+  everywhere.
+- **Plan mode was removed** rather than carried through the new lifecycle; the
+  CLI's native natural-language planning covers it.
+- **`_is_foreign_result` still stands.** Resume still happens on a cold topic, and
+  the CLI's orphan scan still injects its own prompt there.
+- **A cancelled or failed turn kills background work**, as before: both close the
+  stream. That is the intended reading of `/cancel`.
 
 ---
 
@@ -663,3 +725,4 @@ answer via the backend's reply methods, so they are backend-agnostic.
 | 0012 | Workspace contexts in a required `config.yaml`                              | Per-project dir/model/effort/tools; structured config, not env  |
 | 0013 | Expose only the Mini App via an authenticated Cloudflare tunnel (amends 0007) | Mini App needs a public HTTPS origin; `initData` is the boundary |
 | 0014 | Pluggable agent backend (OpenCode or the Claude Agent SDK) via `AGENT_BACKEND` | One seam, normalized events; SDK = Claude models + per-turn config |
+| 0015 | Hold an SDK turn open while its background work runs (amends 0014)          | Closing stdin kills background tasks; holding also delivers their report |
