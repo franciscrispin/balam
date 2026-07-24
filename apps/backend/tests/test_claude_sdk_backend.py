@@ -14,6 +14,9 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -772,26 +775,91 @@ async def test_ignored_result_that_leads_nowhere_ends_the_turn(monkeypatch) -> N
     assert isinstance(events[-1], TurnFinished)
 
 
-async def test_background_tasks_are_reported() -> None:
-    # The CLI announces the *full* set on every change, so the last event is the
-    # live one and an empty list means everything finished.
-    changed = SystemMessage(
-        subtype="background_tasks_changed",
-        data={
-            "tasks": [
-                {"task_id": "b1", "task_type": "local_bash", "description": "Start dev server"},
-                {"task_id": "b2", "description": ""},
-                "not a dict",
-                {"description": "no id, skipped"},
-            ]
-        },
+async def _task_events(messages):
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query(messages)), _turn())
+    return [e for e in events if isinstance(e, BackgroundTasksChanged)]
+
+
+def _started(task_id: str, description: str, task_type: str | None = None):
+    return TaskStartedMessage(
+        subtype="task_started",
+        data={},
+        task_id=task_id,
+        description=description,
+        uuid="u",
+        session_id="ses_x",
+        task_type=task_type,
     )
-    events = await _collect(
-        ClaudeSdkBackend(query_fn=_fake_query([_init(), changed, _result()])), _turn()
+
+
+def _updated(task_id: str, **patch):
+    return TaskUpdatedMessage(subtype="task_updated", data={}, task_id=task_id, patch=patch)
+
+
+def _notified(task_id: str, status: str):
+    return TaskNotificationMessage(
+        subtype="task_notification",
+        data={},
+        task_id=task_id,
+        status=status,
+        output_file="/tmp/out",
+        summary="done",
+        uuid="u",
+        session_id="ses_x",
     )
-    reported = [e for e in events if isinstance(e, BackgroundTasksChanged)]
-    assert len(reported) == 1
-    assert reported[0].tasks == (
+
+
+async def test_started_tasks_are_reported() -> None:
+    # `background_tasks_changed` never reaches an SDK client; the live set is
+    # rebuilt from the per-task lifecycle messages instead.
+    reported = await _task_events(
+        [_init(), _started("b1", "Start dev server", "local_bash"), _result()]
+    )
+    assert reported[-1].tasks == (
         BackgroundTask(task_id="b1", description="Start dev server", task_type="local_bash"),
-        BackgroundTask(task_id="b2", description="b2", task_type=None),
+    )
+
+
+async def test_task_without_description_falls_back_to_its_id() -> None:
+    reported = await _task_events([_init(), _started("b2", ""), _result()])
+    assert reported[-1].tasks == (BackgroundTask(task_id="b2", description="b2", task_type=None),)
+
+
+async def test_terminal_task_update_clears_the_task() -> None:
+    reported = await _task_events(
+        [_init(), _started("b1", "Build"), _updated("b1", status="completed"), _result()]
+    )
+    assert reported[-1].tasks == ()
+
+
+async def test_terminal_task_notification_clears_the_task() -> None:
+    # A task may report completion through either message, so both must clear it.
+    reported = await _task_events(
+        [_init(), _started("b1", "Build"), _notified("b1", "killed"), _result()]
+    )
+    assert reported[-1].tasks == ()
+
+
+async def test_non_terminal_update_keeps_the_task_running() -> None:
+    reported = await _task_events(
+        [_init(), _started("b1", "Build"), _updated("b1", status="running"), _result()]
+    )
+    assert reported[-1].tasks == (
+        BackgroundTask(task_id="b1", description="Build", task_type=None),
+    )
+
+
+async def test_surviving_task_is_still_live_at_the_end_of_the_turn() -> None:
+    # Two started, one finished: the turn ends with work still running.
+    reported = await _task_events(
+        [
+            _init(),
+            _started("b1", "Agent one"),
+            _started("b2", "Agent two"),
+            _updated("b1", status="completed"),
+            _result(),
+        ]
+    )
+    assert reported[-1].tasks == (
+        BackgroundTask(task_id="b2", description="Agent two", task_type=None),
     )
