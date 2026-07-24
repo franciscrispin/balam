@@ -37,7 +37,7 @@ import asyncio
 import logging
 import os
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -46,6 +46,8 @@ from telegram.error import RetryAfter
 
 from balam.agent.backend import AgentBackend, FollowUpChannel, TurnRequest
 from balam.agent.events import (
+    BackgroundTask,
+    BackgroundTasksChanged,
     PermissionRequested,
     QuestionAsked,
     ReasoningUpdated,
@@ -504,6 +506,34 @@ def _render_todos(todos: list[Any], *, rich: bool = False) -> str:
             lines.append(f"{_TODO_ICONS.get(status, '⬜')} {label}")
     # In rich mode the header costs two entries (heading + blank line).
     return "\n".join(lines) if len(lines) > (2 if rich else 1) else ""
+
+
+def _render_background_notice(tasks: Sequence[BackgroundTask]) -> str:
+    """The turn-end notice naming what the agent left running in the background.
+
+    These tasks are children of the turn's agent process, so the CLI kills them
+    as it winds down — which is exactly why the user is told: a dev server
+    started mid-turn stops the moment the reply lands, and until now it did so
+    silently. The note points at the detached alternative the agent is told to
+    use for anything meant to outlive the turn.
+    """
+    if not tasks:
+        return ""
+    heading = (
+        "⚙️ **1 background task was still running:**"
+        if len(tasks) == 1
+        else f"⚙️ **{len(tasks)} background tasks were still running:**"
+    )
+    lines = [heading]
+    lines += [f"- `{task.description}`" for task in tasks]
+    # Blank line first, or GFM reads the closing sentence as a lazy continuation
+    # of the last bullet and folds it into the list.
+    lines += [
+        "",
+        "They stop with this turn's agent process. To keep one alive, ask for it "
+        "detached (`setsid nohup … &`).",
+    ]
+    return "\n".join(lines)
 
 
 def _group_phrase(entries: list[GroupEntry], *, running: bool) -> str:
@@ -991,6 +1021,11 @@ async def stream_reply(
     order = 0
     error_text: str | None = None
     retry_noticed = False
+    # What the agent left running in the background, as of the last
+    # BackgroundTasksChanged (full state, so this is the live set — empty once
+    # everything finished). Reported at turn end so a task never keeps running,
+    # or gets killed with the turn's process, without the user knowing.
+    background_tasks: tuple[BackgroundTask, ...] = ()
     # Collapsed tool stream (TOOL_STREAM=collapsed): consecutive calls fold into
     # one group part. The *open* group keeps absorbing new calls until something
     # else lands in the topic — answer/reasoning text, an approval keyboard, a
@@ -1315,6 +1350,7 @@ async def stream_reply(
 
     async def consume() -> None:
         nonlocal order, error_text, answer_message_id, sid, open_group_key, group_count
+        nonlocal background_tasks
         async for event in backend.run_turn(turn):
             if isinstance(event, SessionStarted):
                 if sid != event.session_id:
@@ -1450,6 +1486,9 @@ async def stream_reply(
                 question_tasks.add(qtask)
                 qtask.add_done_callback(question_tasks.discard)
 
+            elif isinstance(event, BackgroundTasksChanged):
+                background_tasks = tuple(event.tasks)
+
             elif isinstance(event, RetryNotice):
                 await note_retry(event.detail)
 
@@ -1506,6 +1545,14 @@ async def stream_reply(
         await asyncio.gather(
             flush_task, consume_task, *permission_tasks, *question_tasks, return_exceptions=True
         )
+
+    # Anything the agent left running rides along in the answer rather than as its
+    # own message: the answer has to end the turn (see _drop_if_stale), and a
+    # notice sent after it would bury it.
+    if background_tasks:
+        notice = _render_background_notice(background_tasks)
+        base = answer_draft.text.rstrip()
+        answer_draft.set_text(f"{base}\n\n{notice}" if base else notice)
 
     # Replace ephemeral drafts with real, persistent messages. Reasoning/progress
     # is intentionally separate from the answer; only emit the answer fallback if

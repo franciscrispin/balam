@@ -2285,3 +2285,106 @@ async def test_stream_reply_finalizes_each_step_on_turn_step_finished() -> None:
     # Without the boundary finalize, "first answer" would be folded into step 2's
     # progress stream and only two messages would land.
     assert bot.messages == ["first answer", "thinking about second", "second answer"]
+
+
+async def test_stream_reply_reports_background_tasks_left_running() -> None:
+    # A dev server started mid-turn dies with the turn's agent process, so the
+    # reply has to say what was still running instead of letting it vanish.
+    from balam.agent.events import (
+        BackgroundTask,
+        BackgroundTasksChanged,
+        SessionStarted,
+        TextUpdated,
+        TurnFinished,
+    )
+
+    events = [
+        SessionStarted(SID),
+        TextUpdated(part_id="m1:0", text="Started the servers.", message_id="m1"),
+        BackgroundTasksChanged(
+            tasks=(
+                BackgroundTask(task_id="b1", description="Start backend uvicorn server"),
+                BackgroundTask(task_id="b2", description="Start frontend next dev server"),
+            )
+        ),
+        TurnFinished(),
+    ]
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=_ScriptedBackend(events),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="start the app",
+        draft_interval=0.01,
+    )
+    final = bot.messages[-1]  # MarkdownV2-escaped, so match punctuation-free spans
+    assert "Started the servers" in final
+    assert "2 background tasks were still running" in final
+    assert "Start backend uvicorn server" in final
+    assert "Start frontend next dev server" in final
+
+
+async def test_stream_reply_omits_the_notice_once_tasks_finish() -> None:
+    # Full-state semantics: an empty list means everything finished, so there is
+    # nothing to warn about.
+    from balam.agent.events import (
+        BackgroundTask,
+        BackgroundTasksChanged,
+        SessionStarted,
+        TextUpdated,
+        TurnFinished,
+    )
+
+    events = [
+        SessionStarted(SID),
+        BackgroundTasksChanged(tasks=(BackgroundTask(task_id="b1", description="sleep 4"),)),
+        TextUpdated(part_id="m1:0", text="Done.", message_id="m1"),
+        BackgroundTasksChanged(tasks=()),
+        TurnFinished(),
+    ]
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=_ScriptedBackend(events),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="run it",
+        draft_interval=0.01,
+    )
+    assert "background task" not in bot.messages[-1]
+
+
+async def test_stream_reply_background_notice_replaces_the_empty_fallback() -> None:
+    # A turn that says nothing but leaves a task running is not "no output" — the
+    # notice is the reply, and the fallback must not mask it.
+    from balam.agent.events import (
+        BackgroundTask,
+        BackgroundTasksChanged,
+        SessionStarted,
+        TurnFinished,
+    )
+
+    events = [
+        SessionStarted(SID),
+        BackgroundTasksChanged(
+            tasks=(BackgroundTask(task_id="b1", description="Start dev server"),)
+        ),
+        TurnFinished(),
+    ]
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=_ScriptedBackend(events),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="start it",
+        draft_interval=0.01,
+    )
+    final = bot.messages[-1]
+    assert "1 background task was still running" in final
+    assert "Start dev server" in final
+    assert "without producing any text" not in final

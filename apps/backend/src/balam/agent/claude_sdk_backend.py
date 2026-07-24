@@ -50,6 +50,8 @@ from claude_agent_sdk import (
 from balam.agent.backend import TurnRequest
 from balam.agent.events import (
     AgentEvent,
+    BackgroundTask,
+    BackgroundTasksChanged,
     PermissionRequested,
     QuestionAsked,
     ReasoningUpdated,
@@ -109,6 +111,84 @@ _TASK_TOOLS = frozenset({"TaskCreate", "TaskUpdate"})
 
 #: The task id a TaskCreate result announces ("Task #12 created successfully…").
 _TASK_ID_RE = re.compile(r"#(\d+)")
+
+#: How long to keep a turn open after ignoring a ResultMessage as foreign
+#: (:func:`_is_foreign_result`). Only reached when that judgement was wrong —
+#: nothing follows the result we skipped — so it trades a slow turn for a hung
+#: topic. Comfortably longer than the CLI's own gap between queued prompts.
+_FOREIGN_RESULT_GRACE_S = 45.0
+
+#: Appended to the ``claude_code`` system prompt. Background shell tasks are
+#: children of the per-turn CLI process, and the CLI kills them when that process
+#: winds down ("print wind-down: killing background shell …"), so a dev server
+#: started with ``run_in_background`` dies the moment the reply is sent. A
+#: ``setsid``-detached process gets its own session and survives (verified on
+#: this VM), so point the agent at that for anything meant to outlive the turn.
+_SYSTEM_PROMPT_APPEND = """
+## Background processes in this environment
+
+You run as a fresh process per turn, and every task you start with the Bash
+tool's `run_in_background` is killed when the turn ends. The user is told what
+was still running when that happens, so nothing dies silently — but the process
+does die.
+
+If something must keep running after you reply (a dev server, a tunnel, a
+watcher), do not use `run_in_background`. Start it detached instead, so it
+outlives this process:
+
+    setsid nohup <command> > /tmp/<name>.log 2>&1 &
+
+Then tell the user the log path and how to stop it (the PID, or `pkill -f`).
+Keep using `run_in_background` for work that should end with the turn, such as a
+build or a test run you intend to wait on.
+"""
+
+
+def _is_foreign_result(message: ResultMessage, *, model_called: bool) -> bool:
+    """Whether ``message`` answers a prompt the CLI queued for *itself*.
+
+    The CLI has its own prompt queue: on resume, its background-task scan
+    injects a ``<task-notification>`` ahead of ours, and every queued prompt gets
+    its own ResultMessage, in order. Taking the first one as "the turn is over"
+    finalizes an empty reply and tears the query down while the model is still
+    answering the real prompt.
+
+    Such an injected step never reaches the model — ``num_turns`` and
+    ``duration_api_ms`` are both 0 and no assistant message is streamed — which
+    is what separates it from a real reply, however short. An error result is
+    never foreign: it ends the turn either way.
+    """
+    if message.is_error or model_called:
+        return False
+    return message.num_turns == 0 and message.duration_api_ms == 0
+
+
+def _background_tasks(data: dict[str, Any]) -> tuple[BackgroundTask, ...]:
+    """Normalize a ``background_tasks_changed`` payload into the event vocabulary.
+
+    The CLI reports the full set on every change, so this is the complete list of
+    what is running, not a delta.
+    """
+    raw = data.get("tasks")
+    if not isinstance(raw, list):
+        return ()
+    tasks: list[BackgroundTask] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        task_id = str(item.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        description = str(item.get("description") or "").strip()
+        task_type = item.get("task_type")
+        tasks.append(
+            BackgroundTask(
+                task_id=task_id,
+                description=description or task_id,
+                task_type=str(task_type) if task_type else None,
+            )
+        )
+    return tuple(tasks)
 
 
 def _result_text(content: Any) -> str:
@@ -412,8 +492,14 @@ class ClaudeSdkBackend:
             "permission_mode": "plan" if turn.plan_mode else "default",
             "can_use_tool": can_use_tool,
             "include_partial_messages": True,
-            # Keep Claude Code's native behavior (incl. natural-language planning).
-            "system_prompt": {"type": "preset", "preset": "claude_code"},
+            # Keep Claude Code's native behavior (incl. natural-language planning),
+            # plus what the agent cannot infer: its process only lives for this
+            # turn, so anything meant to outlive it must be detached.
+            "system_prompt": {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": _SYSTEM_PROMPT_APPEND,
+            },
             # Load user + project + local settings so filesystem skills are
             # discovered (both the global ~/.claude/skills and the project's
             # .claude/skills), matching the interactive session. Skill discovery is
@@ -472,6 +558,10 @@ class ClaudeSdkBackend:
         # Per-streaming-message block accumulators (StreamEvent partials).
         cur_msg_id: str | None = None
         block_text: dict[int, str] = {}
+        # Whether the model ran since the last ResultMessage. A result for a step
+        # that never called the model belongs to a prompt the CLI queued itself,
+        # not to ours (see ``_is_foreign_result``).
+        model_called = False
         owned_perms: set[str] = set()
         owned_questions: set[str] = set()
         # Messages the driver hands to the streaming-input stream: the initial
@@ -505,6 +595,39 @@ class ClaudeSdkBackend:
             if session_id and not session_started:
                 session_started = True
                 queue.put_nowait(SessionStarted(session_id))
+
+        # Backstop for the :func:`_is_foreign_result` skip. Armed when a result is
+        # skipped and disarmed by the next message off the stream, so it only ever
+        # fires if that judgement was wrong and nothing follows — ending the turn
+        # the skipped result would have ended, instead of hanging the topic.
+        idle_guard: asyncio.Task[None] | None = None
+
+        def disarm_idle_guard() -> None:
+            nonlocal idle_guard
+            if idle_guard is not None:
+                idle_guard.cancel()
+                idle_guard = None
+
+        def arm_idle_guard() -> None:
+            nonlocal idle_guard
+
+            async def expire() -> None:
+                await asyncio.sleep(_FOREIGN_RESULT_GRACE_S)
+                logger.warning(
+                    "nothing followed the ignored ResultMessage within %ss; ending the turn",
+                    _FOREIGN_RESULT_GRACE_S,
+                )
+                if channel is not None:
+                    channel.close()
+                outbound.put_nowait(None)
+                await queue.put(TurnFinished())
+                # End the stream here rather than waiting for the CLI to notice
+                # its closed stdin: run_turn's finally then cancels the driver,
+                # which closes the query and its subprocess.
+                await queue.put(_SENTINEL)
+
+            disarm_idle_guard()
+            idle_guard = asyncio.create_task(expire())
 
         async def ask_plan_exit(
             input_data: dict[str, Any],
@@ -688,20 +811,28 @@ class ClaudeSdkBackend:
                 yield msg
 
         async def driver() -> None:
-            nonlocal cur_msg_id
+            nonlocal cur_msg_id, model_called
             options = self._build_options(turn, can_use_tool, mcp_servers, allowed_tools)
             stream = self._query(prompt=input_stream(), options=options)
             try:
                 async for message in stream:
+                    disarm_idle_guard()
                     if isinstance(message, SystemMessage):
                         if message.subtype == "init":
                             maybe_session(message.data.get("session_id"))
+                        elif message.subtype == "background_tasks_changed":
+                            # Full state on every change, so an empty list means
+                            # nothing is left running.
+                            await queue.put(
+                                BackgroundTasksChanged(tasks=_background_tasks(message.data))
+                            )
 
                     elif isinstance(message, StreamEvent):
                         maybe_session(message.session_id)
                         ev = message.event
                         etype = ev.get("type")
                         if etype == "message_start":
+                            model_called = True
                             cur_msg_id = (ev.get("message") or {}).get("id")
                             block_text.clear()
                         elif etype == "content_block_delta":
@@ -731,6 +862,7 @@ class ClaudeSdkBackend:
 
                     elif isinstance(message, AssistantMessage):
                         maybe_session(message.session_id)
+                        model_called = True
                         for block in message.content:
                             if isinstance(block, ToolUseBlock):
                                 wire = _wire_tool(block.name)
@@ -768,6 +900,24 @@ class ClaudeSdkBackend:
 
                     elif isinstance(message, ResultMessage):
                         maybe_session(message.session_id)
+                        if _is_foreign_result(message, model_called=model_called):
+                            # Not our prompt: the CLI queues prompts of its own
+                            # (on resume its orphan-task scan injects a
+                            # ``<task-notification>``) and answers each with its
+                            # own ResultMessage. Ending the turn here would
+                            # finalize an empty reply and tear the query down
+                            # while the model is still answering the real prompt.
+                            # Keep consuming, but arm a guard so a result we
+                            # misjudge can't hang the topic forever.
+                            logger.info(
+                                "ignoring a ResultMessage for a prompt Balam did not send "
+                                "(subtype=%s, num_turns=%s)",
+                                message.subtype,
+                                message.num_turns,
+                            )
+                            arm_idle_guard()
+                            continue
+                        model_called = False
                         if message.is_error:
                             # An error ends the whole turn, mid-turn follow-ups
                             # notwithstanding.
@@ -799,6 +949,7 @@ class ClaudeSdkBackend:
                 logger.exception("Claude Agent SDK query failed")
                 await queue.put(TurnFailed(message=str(exc) or exc.__class__.__name__))
             finally:
+                disarm_idle_guard()
                 # Refuse further mid-turn offers (they fall back to the bot's turn
                 # queue) and release the input stream so it can close stdin cleanly.
                 if channel is not None:
@@ -818,6 +969,7 @@ class ClaudeSdkBackend:
             while (event := await queue.get()) is not None:
                 yield event
         finally:
+            disarm_idle_guard()
             if not driver_task.done():
                 driver_task.cancel()
             # Unblock any can_use_tool still awaiting a decision so the cancelled

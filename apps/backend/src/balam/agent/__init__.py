@@ -11,6 +11,8 @@ from __future__ import annotations
 from balam.agent.backend import AgentBackend, TurnRequest
 from balam.agent.events import (
     AgentEvent,
+    BackgroundTask,
+    BackgroundTasksChanged,
     PermissionRequested,
     QuestionAsked,
     ReasoningUpdated,
@@ -26,6 +28,8 @@ from balam.agent.opencode_backend import OpenCodeBackend
 __all__ = [
     "AgentBackend",
     "AgentEvent",
+    "BackgroundTask",
+    "BackgroundTasksChanged",
     "OpenCodeBackend",
     "PermissionRequested",
     "QuestionAsked",

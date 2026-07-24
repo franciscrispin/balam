@@ -4,6 +4,7 @@ Drives turns through an injected fake ``query_fn`` so no real ``claude``
 subprocess is spawned.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 from claude_agent_sdk import (
@@ -21,6 +22,8 @@ from claude_agent_sdk import (
 from balam.agent.backend import TurnRequest
 from balam.agent.claude_sdk_backend import ClaudeSdkBackend, _category, coerce_sdk_mcp_config
 from balam.agent.events import (
+    BackgroundTask,
+    BackgroundTasksChanged,
     PermissionRequested,
     QuestionAsked,
     SessionStarted,
@@ -726,3 +729,126 @@ async def test_follow_up_offered_after_close_is_bounced() -> None:
     assert channel.offer(FollowUp(prompt="too late")) is False
     assert channel.take().prompt == "in time"
     assert channel.take() is None
+
+
+def _foreign_result() -> ResultMessage:
+    """A ResultMessage for a prompt the CLI queued for itself.
+
+    Shape taken from a live capture: on resume the CLI's orphan-task scan
+    injects a ``<task-notification>`` prompt ahead of ours and answers it
+    without ever calling the model.
+    """
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=0,
+        is_error=False,
+        num_turns=0,
+        session_id=SID,
+        result="",
+    )
+
+
+async def test_result_for_a_prompt_balam_did_not_send_does_not_end_the_turn() -> None:
+    # The bug: ending on the CLI's own queued prompt finalized an empty reply
+    # ("the agent finished without producing any text") and tore the query down
+    # while the model was still answering the real prompt.
+    messages = [
+        SystemMessage(subtype="task_notification", data={"status": "stopped"}),
+        _init(),
+        _foreign_result(),
+        _init(),
+        _stream({"type": "message_start", "message": {"id": "m1"}}),
+        _stream(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "the real answer"},
+            }
+        ),
+        _result(result="the real answer"),
+    ]
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query(messages)), _turn())
+
+    assert [e.text for e in events if isinstance(e, TextUpdated)] == ["the real answer"]
+    assert len([e for e in events if isinstance(e, TurnFinished)]) == 1
+    assert isinstance(events[-1], TurnFinished)
+
+
+async def test_short_real_reply_still_ends_the_turn() -> None:
+    # Guard against over-eager skipping: a one-word reply is a real reply, and the
+    # model *did* run, so its result must end the turn.
+    messages = [
+        _init(),
+        _stream({"type": "message_start", "message": {"id": "m1"}}),
+        _stream(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "OK"},
+            }
+        ),
+        # num_turns/duration_api_ms of a foreign result, but the model ran.
+        _foreign_result(),
+    ]
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query(messages)), _turn())
+    assert isinstance(events[-1], TurnFinished)
+
+
+async def test_error_result_is_never_treated_as_foreign() -> None:
+    # An error ends the turn whatever its counters say — otherwise a failure that
+    # never reached the model would hang the topic until the guard fired.
+    error = ResultMessage(
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=0,
+        is_error=True,
+        num_turns=0,
+        session_id=SID,
+        result="boom",
+    )
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query([_init(), error])), _turn())
+    assert isinstance(events[-1], TurnFailed) and events[-1].message == "boom"
+
+
+async def test_ignored_result_that_leads_nowhere_ends_the_turn(monkeypatch) -> None:
+    # Backstop: if the "foreign" judgement was wrong and nothing follows, the turn
+    # ends on the grace timer instead of hanging the topic forever.
+    import balam.agent.claude_sdk_backend as mod
+
+    monkeypatch.setattr(mod, "_FOREIGN_RESULT_GRACE_S", 0.05)
+
+    async def query_fn(*, prompt, options):
+        yield _init()
+        yield _foreign_result()
+        await asyncio.sleep(5)  # the CLI goes quiet: nothing more is coming
+
+    events = await asyncio.wait_for(
+        _collect(ClaudeSdkBackend(query_fn=query_fn), _turn()), timeout=5
+    )
+    assert isinstance(events[-1], TurnFinished)
+
+
+async def test_background_tasks_are_reported() -> None:
+    # The CLI announces the *full* set on every change, so the last event is the
+    # live one and an empty list means everything finished.
+    changed = SystemMessage(
+        subtype="background_tasks_changed",
+        data={
+            "tasks": [
+                {"task_id": "b1", "task_type": "local_bash", "description": "Start dev server"},
+                {"task_id": "b2", "description": ""},
+                "not a dict",
+                {"description": "no id, skipped"},
+            ]
+        },
+    )
+    events = await _collect(
+        ClaudeSdkBackend(query_fn=_fake_query([_init(), changed, _result()])), _turn()
+    )
+    reported = [e for e in events if isinstance(e, BackgroundTasksChanged)]
+    assert len(reported) == 1
+    assert reported[0].tasks == (
+        BackgroundTask(task_id="b1", description="Start dev server", task_type="local_bash"),
+        BackgroundTask(task_id="b2", description="b2", task_type=None),
+    )

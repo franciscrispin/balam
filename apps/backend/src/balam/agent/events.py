@@ -121,6 +121,37 @@ class QuestionAsked:
 
 
 @dataclass(frozen=True, slots=True)
+class BackgroundTask:
+    """One task the agent left running in the background (a ``run_in_background``
+    shell command, a background agent, …).
+
+    ``description`` is the agent's own label for it (the Bash tool's
+    ``description``, e.g. "Start frontend next dev server").
+    """
+
+    task_id: str
+    description: str
+    task_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundTasksChanged:
+    """The **full** set of background tasks currently running, after a change.
+
+    Replace semantics, like the text events: each one carries the complete list,
+    so an empty ``tasks`` means everything finished. The streamer keeps the last
+    one it saw and tells the user at turn end what is still running, so a task
+    never keeps running invisibly (the SDK backend's tasks do not outlive the
+    turn's agent process — see the note it appends to the system prompt).
+
+    Only the SDK backend emits this; OpenCode has no background-task concept, so
+    the streamer simply never gets one there.
+    """
+
+    tasks: tuple[BackgroundTask, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RetryNotice:
     """The turn is being retried internally (e.g. a provider rate limit), so the
     long silence is explained to the user once per turn.
@@ -166,6 +197,7 @@ AgentEvent = (
     | ToolUpdated
     | PermissionRequested
     | QuestionAsked
+    | BackgroundTasksChanged
     | RetryNotice
     | TurnStepFinished
     | TurnFailed
