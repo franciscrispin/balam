@@ -17,6 +17,7 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
     TaskStartedMessage,
     TaskUpdatedMessage,
+    TextBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -34,6 +35,7 @@ from balam.agent.events import (
     ToolUpdated,
     TurnFailed,
     TurnFinished,
+    TurnStepFinished,
 )
 from balam.agent_tools import AgentTool
 
@@ -863,3 +865,67 @@ async def test_surviving_task_is_still_live_at_the_end_of_the_turn() -> None:
     assert reported[-1].tasks == (
         BackgroundTask(task_id="b2", description="Agent two", task_type=None),
     )
+
+
+async def test_turn_is_held_open_while_background_work_runs() -> None:
+    # Closing stdin winds the CLI down and kills its background tasks, so a
+    # result that arrives with work still live must not end the turn.
+    events = await _collect(
+        ClaudeSdkBackend(query_fn=_fake_query([_init(), _started("b1", "Investigate"), _result()])),
+        _turn(),
+    )
+    assert any(isinstance(e, TurnStepFinished) for e in events)
+    assert not any(isinstance(e, TurnFinished) for e in events)
+
+
+async def test_turn_ends_normally_when_nothing_is_left_running() -> None:
+    events = await _collect(ClaudeSdkBackend(query_fn=_fake_query([_init(), _result()])), _turn())
+    assert any(isinstance(e, TurnFinished) for e in events)
+    assert not any(isinstance(e, TurnStepFinished) for e in events)
+
+
+async def test_finished_background_work_lets_the_turn_end() -> None:
+    # Held open at the first result, released at the second once the task is done.
+    events = await _collect(
+        ClaudeSdkBackend(
+            query_fn=_fake_query(
+                [
+                    _init(),
+                    _started("b1", "Investigate"),
+                    _result(),
+                    _updated("b1", status="completed"),
+                    _result(),
+                ]
+            )
+        ),
+        _turn(),
+    )
+    assert any(isinstance(e, TurnStepFinished) for e in events)
+    assert any(isinstance(e, TurnFinished) for e in events)
+
+
+async def test_background_report_streams_as_its_own_step() -> None:
+    # The CLI wakes the model when a task finishes; that report is an ordinary
+    # assistant turn, and the TurnStepFinished before it makes the streamer
+    # commit the previous answer so the report lands as a separate message.
+    events = await _collect(
+        ClaudeSdkBackend(
+            query_fn=_fake_query(
+                [
+                    _init(),
+                    _started("b1", "Investigate"),
+                    _result(),
+                    _updated("b1", status="completed"),
+                    AssistantMessage(
+                        content=[TextBlock(text="The investigation finished.")],
+                        model="claude",
+                        session_id=SID,
+                    ),
+                    _result(),
+                ]
+            )
+        ),
+        _turn(),
+    )
+    order = [type(e).__name__ for e in events]
+    assert order.index("TurnStepFinished") < order.index("TurnFinished")

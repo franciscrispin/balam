@@ -508,13 +508,12 @@ def _render_todos(todos: list[Any], *, rich: bool = False) -> str:
 
 
 def _render_background_notice(tasks: Sequence[BackgroundTask]) -> str:
-    """The turn-end notice naming what the agent left running in the background.
+    """The turn-end notice naming background work that was cut short.
 
-    These tasks are children of the turn's agent process, so the CLI kills them
-    as it winds down — which is exactly why the user is told: a dev server
-    started mid-turn stops the moment the reply lands, and until now it did so
-    silently. The note points at the detached alternative the agent is told to
-    use for anything meant to outlive the turn.
+    The turn is held open while background work runs, so reaching turn end with
+    tasks still live means the backend's hold cap expired and the CLI process —
+    and with it these tasks — is being torn down. That is worth saying: the user
+    was likely told a report was coming, and it is not.
     """
     if not tasks:
         return ""
@@ -529,8 +528,8 @@ def _render_background_notice(tasks: Sequence[BackgroundTask]) -> str:
     # of the last bullet and folds it into the list.
     lines += [
         "",
-        "They stop with this turn's agent process. To keep one alive, ask for it "
-        "detached (`setsid nohup … &`).",
+        "The turn ran out of time to wait, so they stop here. For work that "
+        "should outlive the conversation, ask for it detached (`setsid nohup … &`).",
     ]
     return "\n".join(lines)
 

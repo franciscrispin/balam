@@ -122,29 +122,40 @@ _TASK_ID_RE = re.compile(r"#(\d+)")
 #: topic. Comfortably longer than the CLI's own gap between queued prompts.
 _FOREIGN_RESULT_GRACE_S = 45.0
 
-#: Appended to the ``claude_code`` system prompt. Background shell tasks are
-#: children of the per-turn CLI process, and the CLI kills them when that process
-#: winds down ("print wind-down: killing background shell …"), so a dev server
-#: started with ``run_in_background`` dies the moment the reply is sent. A
-#: ``setsid``-detached process gets its own session and survives (verified on
-#: this VM), so point the agent at that for anything meant to outlive the turn.
+#: Absolute cap on holding a turn open for background work it left running. The
+#: CLI kills its background tasks as the process winds down, and the process
+#: winds down when we close stdin — so the turn stays open while work is live
+#: (see ``run_turn``). One CLI process is ~200-500 MB here, so this bounds what a
+#: task that never finishes can pin: at the deadline the turn ends and its
+#: background work stops with it.
+_BACKGROUND_HOLD_S = 30 * 60.0
+
+#: Appended to the ``claude_code`` system prompt. Background tasks are children
+#: of the CLI process, which the turn now keeps alive while any of them are
+#: running (see ``run_turn``) — so backgrounding is safe, and promising to report
+#: later is a promise the runtime can keep. The remaining limit is the
+#: ``_BACKGROUND_HOLD_S`` cap, which a genuinely long-lived service should escape
+#: with ``setsid`` (verified on this VM: a detached process gets its own session
+#: and survives).
 _SYSTEM_PROMPT_APPEND = """
-## Background processes in this environment
+## Background work in this environment
 
-You run as a fresh process per turn, and every task you start with the Bash
-tool's `run_in_background` is killed when the turn ends. The user is told what
-was still running when that happens, so nothing dies silently — but the process
-does die.
+Work you start in the background — a `run_in_background` shell command, or a
+subagent you do not wait on — keeps running after you reply. The turn stays open
+while it runs, and when it finishes you are woken to report it, so telling the
+user "I'll report back when this lands" is a promise that will be kept. You do
+not need to hold the turn open yourself by waiting.
 
-If something must keep running after you reply (a dev server, a tunnel, a
-watcher), do not use `run_in_background`. Start it detached instead, so it
-outlives this process:
+Two limits are worth knowing:
 
-    setsid nohup <command> > /tmp/<name>.log 2>&1 &
+- Background work is capped at 30 minutes. Past that the turn ends and anything
+  still running stops.
+- A service meant to outlive the conversation entirely (a dev server, a tunnel,
+  a watcher) should be detached instead, so nothing can reap it:
 
-Then tell the user the log path and how to stop it (the PID, or `pkill -f`).
-Keep using `run_in_background` for work that should end with the turn, such as a
-build or a test run you intend to wait on.
+      setsid nohup <command> > /tmp/<name>.log 2>&1 &
+
+  Then tell the user the log path and how to stop it (the PID, or `pkill -f`).
 """
 
 
@@ -670,6 +681,40 @@ class ClaudeSdkBackend:
             disarm_idle_guard()
             idle_guard = asyncio.create_task(expire())
 
+        # Absolute cap on how long the turn is held open for background work
+        # (below). Unlike the idle guard this is a deadline, not an
+        # inactivity timer: a task that never finishes must not pin the topic
+        # (and its CLI process) forever.
+        hold_watchdog: asyncio.Task[None] | None = None
+        held_for_background = False
+
+        def disarm_hold_watchdog() -> None:
+            nonlocal hold_watchdog
+            if hold_watchdog is not None:
+                hold_watchdog.cancel()
+                hold_watchdog = None
+
+        def arm_hold_watchdog() -> None:
+            nonlocal hold_watchdog, held_for_background
+            if hold_watchdog is not None:
+                return  # already counting down; the cap is from the first hold
+            held_for_background = True
+
+            async def expire() -> None:
+                await asyncio.sleep(_BACKGROUND_HOLD_S)
+                logger.warning(
+                    "background work still running after %ss; ending the turn "
+                    "(its tasks stop with the agent process)",
+                    _BACKGROUND_HOLD_S,
+                )
+                if channel is not None:
+                    channel.close()
+                outbound.put_nowait(None)
+                await queue.put(TurnFinished())
+                await queue.put(_SENTINEL)
+
+            hold_watchdog = asyncio.create_task(expire())
+
         async def ask_user_question(
             input_data: dict[str, Any],
         ) -> PermissionResultAllow | PermissionResultDeny:
@@ -955,6 +1000,18 @@ class ClaudeSdkBackend:
                             outbound.put_nowait(_user_message(follow.prompt, follow.files))
                             await queue.put(TurnStepFinished())
                             continue
+                        # The model has answered, but background work it started is
+                        # still running. Closing stdin now would wind the CLI down
+                        # and kill that work (verified: a task survives exactly as
+                        # long as the client stays connected). So hold the turn
+                        # open. The CLI wakes the model when a task finishes, and
+                        # that report arrives as an ordinary assistant turn —
+                        # TurnStepFinished commits the answer so far, so the report
+                        # lands in the topic as its own message.
+                        if live_tasks.tasks:
+                            arm_hold_watchdog()
+                            await queue.put(TurnStepFinished())
+                            continue
                         if channel is not None:
                             channel.close()
                         outbound.put_nowait(None)
@@ -965,6 +1022,7 @@ class ClaudeSdkBackend:
                 await queue.put(TurnFailed(message=str(exc) or exc.__class__.__name__))
             finally:
                 disarm_idle_guard()
+                disarm_hold_watchdog()
                 # Refuse further mid-turn offers (they fall back to the bot's turn
                 # queue) and release the input stream so it can close stdin cleanly.
                 if channel is not None:
@@ -985,6 +1043,7 @@ class ClaudeSdkBackend:
                 yield event
         finally:
             disarm_idle_guard()
+            disarm_hold_watchdog()
             if not driver_task.done():
                 driver_task.cancel()
             # Unblock any can_use_tool still awaiting a decision so the cancelled
