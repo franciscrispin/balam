@@ -133,7 +133,7 @@ async def test_resolve_applies_model_override() -> None:
     store, oc = _store(), FakeOpenCode()
     router = Router(store, oc, _contexts())
 
-    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
+    router.set_model_override(1, "anthropic", "claude-sonnet-4")
     resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
 
     assert resolved.provider == "anthropic"
@@ -145,7 +145,7 @@ async def test_resolve_applies_effort_override() -> None:
     store, oc = _store(), FakeOpenCode()
     router = Router(store, oc, _contexts())
 
-    router.set_effort_override(1, 5, "low")
+    router.set_effort_override(1, "low")
     resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
 
     assert resolved.provider == "anthropic"
@@ -157,10 +157,10 @@ async def test_resolve_returns_context_defaults_after_override_reset() -> None:
     store, oc = _store(), FakeOpenCode()
     router = Router(store, oc, _contexts())
 
-    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
-    router.set_effort_override(1, 5, "low")
-    router.reset_model_override(1, 5)
-    router.reset_effort_override(1, 5)
+    router.set_model_override(1, "anthropic", "claude-sonnet-4")
+    router.set_effort_override(1, "low")
+    router.reset_model_override(1)
+    router.reset_effort_override(1)
     resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
 
     assert resolved.provider == "anthropic"
@@ -168,28 +168,39 @@ async def test_resolve_returns_context_defaults_after_override_reset() -> None:
     assert resolved.effort == "high"
 
 
-async def test_overrides_are_isolated_per_topic() -> None:
+async def test_overrides_are_shared_by_every_topic_in_the_chat() -> None:
+    # Overrides are chat-global (set from General), so one topic's session never
+    # has to switch model or effort because another topic changed it.
     store, oc = _store(), FakeOpenCode()
     router = Router(store, oc, _contexts())
 
-    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
-    router.set_effort_override(1, 6, "max")
+    router.set_model_override(1, "anthropic", "claude-sonnet-4")
+    router.set_effort_override(1, "max")
 
     first = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
     second = await router.resolve(TopicRef(chat_id=1, thread_id=6, title="t"))
 
-    assert first.model == "claude-sonnet-4"
-    assert first.effort == "high"
-    assert second.model == "claude-opus-4-8"
-    assert second.effort == "max"
+    assert first.model == second.model == "claude-sonnet-4"
+    assert first.effort == second.effort == "max"
+
+
+async def test_overrides_do_not_leak_between_chats() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+
+    router.set_model_override(1, "anthropic", "claude-sonnet-4")
+
+    other = await router.resolve(TopicRef(chat_id=2, thread_id=5, title="t"))
+
+    assert other.model == "claude-opus-4-8"
 
 
 async def test_overrides_survive_vanished_session_recreation() -> None:
     store, oc = _store(), FakeOpenCode()
     router = Router(store, oc, _contexts())
     store.set(1, 5, "ses_gone", 1, context="balam")
-    router.set_model_override(1, 5, "anthropic", "claude-sonnet-4")
-    router.set_effort_override(1, 5, "medium")
+    router.set_model_override(1, "anthropic", "claude-sonnet-4")
+    router.set_effort_override(1, "medium")
 
     resolved = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
 
