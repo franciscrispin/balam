@@ -38,7 +38,6 @@ import logging
 import os
 import random
 from collections.abc import Callable, Sequence
-from pathlib import Path
 from typing import Any, Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -900,9 +899,6 @@ async def stream_reply(
     allowed_tools: list[str] | None = None,
     mcp: dict[str, Any] | None = None,
     files: list[PromptFile] | None = None,
-    plan_mode: bool = False,
-    plan_view: Callable[[str, str], InlineKeyboardButton | None] | None = None,
-    on_plan_approved: Callable[[], None] | None = None,
     on_session_started: Callable[[str], None] | None = None,
     follow_ups: FollowUpChannel | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
@@ -925,16 +921,8 @@ async def stream_reply(
     awaits the user's choice (ADR-0012). Without ``pending`` the request is left
     unhandled (e.g. unit tests of the text/tool path).
 
-    ``plan_view`` (see :func:`balam.miniapp.make_plan_view_button`) maps a plan
-    ``(title, content)`` to a Mini App button; when a question carries a
-    ``plan_path`` (a plan-approval), the plan file is snapshotted and the button
-    rides the question keyboard as an extra row.
-
-    ``plan_mode`` puts the turn in plan mode (the backend maps it to OpenCode's
-    plan agent or the SDK's ``permission_mode="plan"``). ``on_plan_approved``
-    fires when a plan-approval question is answered "Yes", so the caller can drop
-    its sticky plan-mode flag. ``on_session_started`` receives the backend's real
-    session id once known — used to persist a lazily-minted SDK session.
+    ``on_session_started`` receives the backend's real session id once known —
+    used to persist a lazily-minted SDK session.
 
     ``follow_ups`` is the channel the bot offers mid-turn messages onto; a
     streaming-input backend folds them into this live turn and marks each fold
@@ -1179,25 +1167,6 @@ async def stream_reply(
             await backend.reject_question(request.request_id, directory=directory)
             return
 
-        # A plan-approval carries the freshly written plan: snapshot it and ride a
-        # "View plan" button on the question keyboard. The backend supplies either
-        # an inline ``plan_text`` (SDK) or a ``plan_path`` to read (OpenCode).
-        # Strictly best-effort — any failure (file unreadable, no public URL) must
-        # never block the Yes/No flow, which is what actually answers the agent.
-        is_plan = request.plan_path is not None or request.plan_text is not None
-        plan_button: InlineKeyboardButton | None = None
-        if plan_view is not None and is_plan:
-            try:
-                if request.plan_text is not None:
-                    plan_button = plan_view("Plan", request.plan_text)
-                elif request.plan_path is not None:
-                    text = await asyncio.to_thread(
-                        Path(request.plan_path).read_text, "utf-8", "replace"
-                    )
-                    plan_button = plan_view(os.path.basename(request.plan_path), text)
-            except Exception:
-                logger.debug("could not snapshot plan", exc_info=True)
-
         # Question keyboards land below the progress stream: seal the tool group.
         close_open_group()
         token, futures = pending_questions.register(
@@ -1219,8 +1188,6 @@ async def stream_reply(
                     custom=customs[index],
                     multiple=multiples[index],
                 )
-                if index == 0 and plan_button is not None:
-                    keyboard = InlineKeyboardMarkup([*keyboard.inline_keyboard, [plan_button]])
                 msg = await bot.send_message(
                     chat_id=chat_id,
                     text=text,
@@ -1241,12 +1208,6 @@ async def stream_reply(
             await backend.reject_question(request.request_id, directory=directory)
             return
         await backend.reply_question(request.request_id, answers, directory=directory)
-        # "Yes" to a plan-approval makes the agent switch to building, so the
-        # caller's sticky plan-mode flag must drop with it — else the next prompt
-        # would force it straight back into plan mode. "No" keeps plan mode.
-        if is_plan and on_plan_approved is not None:
-            if answers and answers[0] == ["Yes"]:
-                on_plan_approved()
 
     # The live to-do checklist: one message per turn, posted on the first
     # todowrite and edited in place as items advance (ported from iu).
@@ -1312,7 +1273,6 @@ async def stream_reply(
         model=model,
         effort=effort,
         files=files,
-        plan_mode=plan_mode,
         allowed_tools=allowed_tools or [],
         additional_directories=additional_directories or [],
         mcp=mcp or {},

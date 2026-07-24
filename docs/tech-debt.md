@@ -19,7 +19,7 @@ leverage (impact × how often the area changes), not by severity alone._
 ### 1. `bot.py` is a god module (1,655 lines, 51 functions, **34 commits — #1 churn**)
 
 One file holds: the message handler, **every** slash-command handler (`/context`,
-`/new`, `/plan`, `/status`, `/model`, `/effort`, `/rename`, `/diff`, `/browser`,
+`/new`, `/status`, `/model`, `/effort`, `/rename`, `/diff`, `/browser`,
 `/cancel`, `/delete`), all inline-keyboard callback handlers (approvals,
 questions, delete paging/confirm), topic naming, keyboard construction, cleanup
 scheduling, and `build_application`. It is both the largest and most-changed

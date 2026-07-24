@@ -134,12 +134,6 @@ async def test_text_before_assistant_message_is_dropped() -> None:
     assert not [e for e in events if isinstance(e, TextUpdated)]
 
 
-async def test_plan_mode_forwards_plan_agent() -> None:
-    fake = FakeOpenCode([_ev("session.idle", sessionID=SID)])
-    await _collect(OpenCodeBackend(fake), _turn(plan_mode=True))
-    assert fake.prompt_kwargs["agent"] == "plan"
-
-
 async def test_session_error_becomes_turn_failed() -> None:
     fake = FakeOpenCode(
         [_ev("session.error", sessionID=SID, error={"name": "Boom", "data": {"message": "bad"}})]

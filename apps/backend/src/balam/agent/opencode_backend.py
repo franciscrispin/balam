@@ -374,7 +374,7 @@ class OpenCodeBackend:
                         model=turn.model,
                         effort=turn.effort,
                         files=turn.files,
-                        agent="plan" if turn.plan_mode else None,
+                        agent=None,
                     )
                 except Exception as exc:
                     logger.exception("OpenCode prompt failed")

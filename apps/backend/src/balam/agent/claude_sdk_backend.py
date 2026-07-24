@@ -486,10 +486,10 @@ class ClaudeSdkBackend:
         env["CLAUDE_CODE_ARTIFACT"] = "1"
         kwargs: dict[str, Any] = {
             "cwd": turn.directory,
-            # Plan mode gates writes and lets the agent call ExitPlanMode when it
-            # is ready to build; a default turn keeps native natural-language
-            # planning available without forcing the formal mode.
-            "permission_mode": "plan" if turn.plan_mode else "default",
+            # Always the default mode: Balam has no plan-mode command, and the
+            # CLI's native natural-language planning needs no formal mode. An
+            # explicit value also neutralizes ``defaultMode`` from settings.
+            "permission_mode": "default",
             "can_use_tool": can_use_tool,
             "include_partial_messages": True,
             # Keep Claude Code's native behavior (incl. natural-language planning),
@@ -629,40 +629,6 @@ class ClaudeSdkBackend:
             disarm_idle_guard()
             idle_guard = asyncio.create_task(expire())
 
-        async def ask_plan_exit(
-            input_data: dict[str, Any],
-        ) -> PermissionResultAllow | PermissionResultDeny:
-            """Surface ExitPlanMode as a Yes/No plan-approval question. "Yes"
-            allows the agent to leave plan mode and build in this same turn; the
-            streamer also drops the sticky plan flag so later turns run normally.
-            "No" denies it, keeping the agent in planning."""
-            request_id = f"q_{uuid.uuid4().hex[:16]}"
-            future: asyncio.Future[list[list[str]] | None] = loop.create_future()
-            self._pending_questions[request_id] = future
-            owned_questions.add(request_id)
-            await queue.put(
-                QuestionAsked(
-                    request_id=request_id,
-                    questions=[
-                        {
-                            "question": "The plan is complete. Build it?",
-                            "header": "Plan",
-                            "options": [{"label": "Yes"}, {"label": "No"}],
-                            "multiple": False,
-                            "custom": False,
-                        }
-                    ],
-                    plan_text=input_data.get("plan"),
-                )
-            )
-            try:
-                answers = await future
-            finally:
-                self._pending_questions.pop(request_id, None)
-            if answers and answers[0] == ["Yes"]:
-                return PermissionResultAllow()
-            return PermissionResultDeny(message="Keep planning; the plan was not approved.")
-
         async def ask_user_question(
             input_data: dict[str, Any],
         ) -> PermissionResultAllow | PermissionResultDeny:
@@ -721,8 +687,6 @@ class ClaudeSdkBackend:
         async def can_use_tool(
             tool_name: str, input_data: dict[str, Any], ctx: Any
         ) -> PermissionResultAllow | PermissionResultDeny:
-            if tool_name == "ExitPlanMode":
-                return await ask_plan_exit(input_data)
             if tool_name == "AskUserQuestion":
                 return await ask_user_question(input_data)
             norm = _normalize_input(input_data)

@@ -632,11 +632,11 @@ answer via the backend's reply methods, so they are backend-agnostic.
   (scope-token URL); under the SDK it is an in-process SDK tool (closure over the
   topic) and context MCP servers are coerced to the SDK's `mcp_servers` shape — no
   HTTP server or token needed.
-- **Plan mode.** OpenCode uses its plan agent; the SDK uses `permission_mode="plan"`
-  and surfaces `ExitPlanMode` as the same Yes/No plan-approval question. Both keep
-  the existing `/plan` flow. Native natural-language planning ("plan feature X" in
-  a normal turn) is preserved on the SDK and is an upgrade over OpenCode/codex,
-  where autonomous plan entry is compiled out.
+- **Plan mode.** *Superseded — `/plan` has since been removed.* It used
+  OpenCode's plan agent and the SDK's `permission_mode="plan"`, surfacing
+  `ExitPlanMode` as a Yes/No plan-approval question. Native natural-language
+  planning ("plan feature X" in a normal turn) is unaffected and remains
+  available on the SDK.
 - **Coarser live reasoning on the SDK.** Text streams as deltas, but extended
   thinking is not streamed token-by-token, so the "thinking…" narration is less
   granular than OpenCode's.

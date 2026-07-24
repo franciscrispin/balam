@@ -1,8 +1,6 @@
 import asyncio
 from types import SimpleNamespace
 
-from telegram import InlineKeyboardButton
-
 from balam.agent.opencode_backend import OpenCodeBackend, _plan_path_from_question
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile
@@ -1937,145 +1935,6 @@ def test_plan_path_from_question_none_for_ordinary_questions() -> None:
     assert plan_path_from_question(request, {}, "/work/proj") is None
 
 
-async def test_plan_exit_question_carries_view_plan_button(tmp_path) -> None:
-    plan_file = tmp_path / ".opencode" / "plans" / "1-x.md"
-    plan_file.parent.mkdir(parents=True)
-    plan_file.write_text("# The plan\n\n- do the thing")
-
-    pending_questions = PendingQuestions()
-    oc = PermissionOpenCode(
-        [
-            _msg_updated("assistant", AID),
-            _tool_part("cp", "plan_exit", {"status": "running", "input": {}}),
-            _plan_question("q_plan"),
-            "WAIT_QUESTION_REPLY",
-            _ev("session.idle", sessionID=SID),
-        ]
-    )
-    bot = FakeBot()
-    seen: list[tuple[str, str]] = []
-
-    def plan_view(title: str, content: str) -> InlineKeyboardButton:
-        seen.append((title, content))
-        return InlineKeyboardButton("📋 View plan", url="https://t.me/b/app?startapp=markdown__c_x")
-
-    task = asyncio.create_task(
-        stream_reply(
-            bot=bot,
-            backend=OpenCodeBackend(oc),
-            session_id=SID,
-            chat_id=1,
-            thread_id=99,
-            prompt="x",
-            directory=str(tmp_path),
-            pending_questions=pending_questions,
-            plan_view=plan_view,
-            draft_interval=0.01,
-        )
-    )
-
-    for _ in range(200):
-        if bot.keyboards:
-            break
-        await asyncio.sleep(0.01)
-    assert bot.keyboards, "expected the plan_exit question keyboard"
-    assert seen == [("1-x.md", "# The plan\n\n- do the thing")]
-    button_callback = _question_callback(bot.keyboards[0], "📋 View plan")
-    assert button_callback is None  # URL button, not a callback button
-    # The Yes/No flow is untouched: answer and let the turn finish.
-    yes = _question_callback(bot.keyboards[0], "Yes")
-    _, token, q_index, o_index = yes.split(":")
-    assert pending_questions.resolve(token, int(q_index), int(o_index)) is True
-    await task
-    assert oc.question_replies == [("q_plan", [["Yes"]])]
-
-
-async def test_plan_exit_question_without_plan_file_sends_plain_keyboard(tmp_path) -> None:
-    pending_questions = PendingQuestions()
-    oc = PermissionOpenCode(
-        [
-            _msg_updated("assistant", AID),
-            _tool_part("cp", "plan_exit", {"status": "running", "input": {}}),
-            _plan_question("q_plan"),
-            "WAIT_QUESTION_REPLY",
-            _ev("session.idle", sessionID=SID),
-        ]
-    )
-    bot = FakeBot()
-
-    def plan_view(title: str, content: str) -> InlineKeyboardButton:  # pragma: no cover
-        raise AssertionError("plan_view must not be called when the file is missing")
-
-    task = asyncio.create_task(
-        stream_reply(
-            bot=bot,
-            backend=OpenCodeBackend(oc),
-            session_id=SID,
-            chat_id=1,
-            thread_id=99,
-            prompt="x",
-            directory=str(tmp_path),  # no plan file under it
-            pending_questions=pending_questions,
-            plan_view=plan_view,
-            draft_interval=0.01,
-        )
-    )
-
-    for _ in range(200):
-        if bot.keyboards:
-            break
-        await asyncio.sleep(0.01)
-    assert bot.keyboards
-    labels = [b.text for row in bot.keyboards[0].inline_keyboard for b in row]
-    assert "📋 View plan" not in labels
-    yes = _question_callback(bot.keyboards[0], "Yes")
-    _, token, q_index, o_index = yes.split(":")
-    pending_questions.resolve(token, int(q_index), int(o_index))
-    await task
-    assert oc.question_replies == [("q_plan", [["Yes"]])]
-
-
-async def test_ordinary_question_does_not_call_plan_view() -> None:
-    pending_questions = PendingQuestions()
-    oc = PermissionOpenCode(
-        [
-            _msg_updated("assistant", AID),
-            _question("q_1"),
-            "WAIT_QUESTION_REPLY",
-            _ev("session.idle", sessionID=SID),
-        ]
-    )
-    bot = FakeBot()
-
-    def plan_view(title: str, content: str) -> InlineKeyboardButton:  # pragma: no cover
-        raise AssertionError("plan_view must not be called for ordinary questions")
-
-    task = asyncio.create_task(
-        stream_reply(
-            bot=bot,
-            backend=OpenCodeBackend(oc),
-            session_id=SID,
-            chat_id=1,
-            thread_id=99,
-            prompt="x",
-            directory="/work/proj",
-            pending_questions=pending_questions,
-            plan_view=plan_view,
-            draft_interval=0.01,
-        )
-    )
-    for _ in range(200):
-        if len(bot.keyboards) >= 2:
-            break
-        await asyncio.sleep(0.01)
-    for keyboard, label in ((bot.keyboards[0], "Sunny"), (bot.keyboards[1], "Chips")):
-        callback = _question_callback(keyboard, label)
-        _, token, q_index, o_index = callback.split(":")
-        pending_questions.resolve(token, int(q_index), int(o_index))
-    await task
-    assert oc.question_replies == [("q_1", [["Sunny"], ["Chips"]])]
-
-
 async def test_stream_reply_subscribes_before_prompting() -> None:
     # If the stream is never established, we must not prompt into a dead sub.
     bot = FakeBot()
@@ -2102,25 +1961,6 @@ async def test_stream_reply_subscribes_before_prompting() -> None:
 
 
 # --- sticky plan mode (/plan): agent forwarding + on_plan_approved ------------
-
-
-async def test_stream_reply_plan_mode_forwards_plan_agent_to_prompt() -> None:
-    bot = FakeBot()
-    oc = PromptGatedOpenCode([_ev("session.idle", sessionID=SID)])
-    await stream_reply(
-        bot=bot,
-        backend=OpenCodeBackend(oc),
-        session_id=SID,
-        chat_id=1,
-        thread_id=99,
-        prompt="plan it",
-        directory="/work/proj",
-        plan_mode=True,
-        draft_interval=0.01,
-    )
-    assert oc.prompt_kwargs["agent"] == "plan"
-
-
 async def _run_plan_question_turn(answer_label: str, tmp_path) -> list[str]:
     """Drive a plan_exit question to ``answer_label``; return on_plan_approved calls."""
     plan_file = tmp_path / ".opencode" / "plans" / "1-x.md"
@@ -2165,56 +2005,6 @@ async def _run_plan_question_turn(answer_label: str, tmp_path) -> list[str]:
     await task
     assert oc.question_replies == [("q_plan", [[answer_label]])]
     return approved
-
-
-async def test_plan_exit_yes_fires_on_plan_approved(tmp_path) -> None:
-    # "Yes" switches the session to the build agent server-side; the callback
-    # lets the bot drop its sticky plan-mode flag in step.
-    assert await _run_plan_question_turn("Yes", tmp_path) == ["cleared"]
-
-
-async def test_plan_exit_no_does_not_fire_on_plan_approved(tmp_path) -> None:
-    # "No" keeps the session in plan mode, so the flag must stay.
-    assert await _run_plan_question_turn("No", tmp_path) == []
-
-
-async def test_ordinary_question_does_not_fire_on_plan_approved() -> None:
-    pending_questions = PendingQuestions()
-    oc = PermissionOpenCode(
-        [
-            _msg_updated("assistant", AID),
-            _question("q_1"),
-            "WAIT_QUESTION_REPLY",
-            _ev("session.idle", sessionID=SID),
-        ]
-    )
-    bot = FakeBot()
-    approved: list[str] = []
-
-    task = asyncio.create_task(
-        stream_reply(
-            bot=bot,
-            backend=OpenCodeBackend(oc),
-            session_id=SID,
-            chat_id=1,
-            thread_id=99,
-            prompt="x",
-            directory="/work/proj",
-            pending_questions=pending_questions,
-            on_plan_approved=lambda: approved.append("cleared"),
-            draft_interval=0.01,
-        )
-    )
-    for _ in range(200):
-        if len(bot.keyboards) >= 2:
-            break
-        await asyncio.sleep(0.01)
-    for keyboard, label in ((bot.keyboards[0], "Sunny"), (bot.keyboards[1], "Chips")):
-        callback = _question_callback(keyboard, label)
-        _, token, q_index, o_index = callback.split(":")
-        pending_questions.resolve(token, int(q_index), int(o_index))
-    await task
-    assert approved == []
 
 
 # --- mid-turn follow-up (TurnStepFinished) -----------------------------------

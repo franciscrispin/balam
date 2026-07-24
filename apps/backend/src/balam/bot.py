@@ -50,7 +50,7 @@ from balam.attachments import PromptFile, collect_attachments
 from balam.config import Config
 from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.markdown import escape_markdown_v2
-from balam.miniapp import make_plan_view_button, mini_app_reply
+from balam.miniapp import mini_app_reply
 from balam.router import Router, TopicRef
 from balam.streamer import _question_keyboard, stream_reply
 from balam.telegram_utils import thread_kwargs
@@ -513,33 +513,13 @@ def _start_turn(
     # (the SDK). On OpenCode the channel stays None, so they queue instead.
     follow_ups = FollowUpChannel() if backend.supports_streaming_input else None
 
-    # Snapshot-and-button factory for plan_exit questions ("View plan" in the
-    # Mini App). Only wired when app.py stashed a content store (unit tests of
-    # the bot path don't, and the streamer treats None as "no button").
     # Config is optional here so unit tests of the bot path can omit it; the
     # streamer's defaults then apply.
     config: Config | None = context.application.bot_data.get("config")
 
-    plan_view = None
-    content_store = context.application.bot_data.get("content_store")
-    if content_store is not None and config is not None:
-        plan_view = make_plan_view_button(
-            config, content_store, getattr(context.bot, "username", None)
-        )
-
-    def _on_plan_approved() -> None:
-        # The plan_exit question was answered "Yes": the server switches the
-        # session to the build agent, so the sticky flag must drop with it.
-        router.set_plan_mode(chat_id, thread_id, False)
-
     async def run() -> None:
         cancelled = False
         try:
-            # Sticky plan mode (/plan): the backend maps it to the plan agent /
-            # plan permission mode per turn. Read at turn start — not at enqueue —
-            # so a job that waited in the queue respects a plan approval or
-            # /plan off issued in the meantime.
-            plan_mode = router.plan_mode(chat_id, thread_id)
             await stream_reply(
                 bot=context.bot,
                 backend=backend,
@@ -560,9 +540,6 @@ def _start_turn(
                 allowed_tools=job.allowed_tools,
                 mcp=job.mcp,
                 files=job.files,
-                plan_mode=plan_mode,
-                plan_view=plan_view,
-                on_plan_approved=_on_plan_approved,
                 on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
                 follow_ups=follow_ups,
                 tool_stream=config.tool_stream if config is not None else "collapsed",
@@ -757,60 +734,6 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _open_context_topic(message, context.bot, router, name)
 
 
-async def _handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/plan [request]`` — put this topic in plan mode; ``/plan off`` leaves it.
-
-    OpenCode's plan agent is selected per *prompt*, not per session, so plan mode
-    is a sticky per-topic flag: while set, every prompt is sent with
-    ``agent="plan"`` (the plan agent can read everything but only write its plan
-    file). The flag drops when the plan_exit question is answered "Yes" (the
-    server then switches the session to the build agent itself) or on
-    ``/plan off``. With a ``request`` argument the planning prompt runs
-    immediately; bare ``/plan`` arms the mode for the next message.
-    """
-    message = update.message
-    if message is None:
-        return
-
-    router: Router = context.application.bot_data["router"]
-    chat_id = message.chat_id
-    thread_id = message.message_thread_id
-    args = context.args or []
-
-    if args and args[0].lower() == "off":
-        router.set_plan_mode(chat_id, thread_id, False)
-        await message.reply_text("Plan mode off — messages run the build agent again.")
-        return
-
-    if _is_forum_general_message(message):
-        # Plain General messages spawn fresh topics that would not inherit the
-        # flag, so a sticky General flag would silently do nothing.
-        await message.reply_text("Use /plan inside a topic (General messages open new topics).")
-        return
-
-    router.set_plan_mode(chat_id, thread_id, True)
-    request = " ".join(args).strip()
-    if not request:
-        await message.reply_text(
-            "📋 Plan mode on — messages here run the plan agent (read-only except its "
-            "plan file) until you approve the plan or send /plan off."
-        )
-        return
-
-    # Run the planning request right away through the shared dispatch tail (the
-    # flag is already set, so the turn derives agent="plan" when it starts).
-    await _submit_turn(
-        message,
-        context,
-        request,
-        [],
-        thread_id=thread_id,
-        queued_reply=(
-            "📋 Plan mode on. ⏳ Queued (#{position}) — I'll plan after the current turn finishes."
-        ),
-    )
-
-
 #: Scopes the Artifact tool's ``list`` action accepts; ``mine`` is its default.
 _ARTIFACT_SCOPES = ("mine", "shared", "all")
 
@@ -831,8 +754,8 @@ async def _handle_artifacts(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if _is_forum_general_message(message):
-        # Same reasoning as /plan: General messages spawn fresh topics, so the
-        # listing would land in a topic named after a bare command.
+        # General messages spawn fresh topics, so the listing would land in a
+        # topic named after a bare command.
         await message.reply_text("Use /artifacts inside a topic.")
         return
 
@@ -892,7 +815,6 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Session: {session_id or '(none yet — send a message to start)'}",
         f"Turn: {'running' if running else 'idle'}",
         f"Queued: {queued}",
-        f"Plan mode: {'on' if router.plan_mode(ref.chat_id, ref.thread_id) else 'off'}",
     ]
     await message.reply_text("\n".join(lines))
 
@@ -1720,7 +1642,6 @@ BOT_COMMANDS = [
     BotCommand("effort", "Show or set this topic's effort override"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
     BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
-    BotCommand("plan", "Plan mode for this topic (/plan [request], /plan off)"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
     BotCommand("artifacts", "List your published claude.ai artifacts (/artifacts [shared|all])"),
@@ -1799,7 +1720,6 @@ def build_application(
     app.add_handler(CommandHandler("effort", _handle_effort, filters=allowed))
     app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
     app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
-    app.add_handler(CommandHandler("plan", _handle_plan, filters=allowed))
     app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
     app.add_handler(CommandHandler("browser", _handle_browser, filters=allowed))
     app.add_handler(CommandHandler("artifacts", _handle_artifacts, filters=allowed))

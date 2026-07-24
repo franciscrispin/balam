@@ -19,8 +19,9 @@ stay backend-agnostic. SDK mode runs Claude models (a context `model` is then a
 bare Claude id).
 
 > Status: core features built — the bot↔agent round-trip over forum topics,
-> workspace contexts + `/context`, plan mode (`/plan`), and the Mini App
-> (diff viewer, markdown viewer, live noVNC browser view via `/browser`).
+> workspace contexts + `/context`, and the Mini App (diff viewer, markdown
+> viewer, live noVNC browser view via `/browser`). Plan mode (`/plan`) was
+> removed — the CLI's native natural-language planning covers it.
 
 ## Repo layout — two toolchains
 

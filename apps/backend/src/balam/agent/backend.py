@@ -87,9 +87,7 @@ class TurnRequest:
 
     ``session_id`` is ``None`` for a session's first turn on a backend that mints
     the id lazily (the SDK); the real id arrives as a
-    :class:`~balam.agent.events.SessionStarted` event. ``plan_mode`` is the
-    normalized intent — the OpenCode backend maps it to ``agent="plan"``, the SDK
-    backend to ``permission_mode="plan"``.
+    :class:`~balam.agent.events.SessionStarted` event.
 
     The context-capability fields (``allowed_tools`` / ``additional_directories``
     / ``mcp``) and the per-topic identity (``chat_id`` / ``thread_id``, used to
@@ -105,7 +103,6 @@ class TurnRequest:
     model: str | None = None
     effort: str | None = None
     files: list[PromptFile] | None = None
-    plan_mode: bool = False
     allowed_tools: list[str] = field(default_factory=list)
     additional_directories: list[str] = field(default_factory=list)
     mcp: dict[str, Any] = field(default_factory=dict)
