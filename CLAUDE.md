@@ -16,7 +16,9 @@ HTTP); the frontend stays TypeScript (ADR-0003). The agent runtime is
 in-process **Claude Agent SDK**; both implement `AgentBackend` and emit the
 normalized `balam.agent.events` vocabulary, so the streamer/router/permissions
 stay backend-agnostic. SDK mode runs Claude models (a context `model` is then a
-bare Claude id).
+bare Claude id) and **holds a turn open while background work it started is still
+running** (ADR-0015) — closing stdin would kill that work, and staying connected
+is also what lets the CLI deliver the finished task's report into the topic.
 
 > Status: core features built — the bot↔agent round-trip over forum topics,
 > workspace contexts + `/context`, and the Mini App (diff viewer, markdown
