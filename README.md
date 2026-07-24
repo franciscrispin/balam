@@ -14,7 +14,6 @@ The design and the reasons behind it live in
   replies stream live as animated drafts.
 - **Workspace contexts** — one bot drives several projects. `/context <name>`
   opens a new topic bound to that project's directory, model, and allowed tools.
-- **Plan mode** — `/plan` keeps a topic read-only until you approve the plan.
 - **Tool approvals** — pre-approved tools run without prompting; anything else
   asks via an inline keyboard, behind a symlink-safe directory boundary.
 - **Mini App viewers** — `/diff` opens a git diff viewer, and the agent can share

@@ -140,15 +140,6 @@ class Router:
         context = self._contexts.resolve_name(row[1] if row else None)
         self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=context)
 
-    def plan_mode(self, chat_id: int, thread_id: int | None) -> bool:
-        """Whether the topic's prompts should run OpenCode's plan agent (/plan)."""
-        return self._store.is_plan_mode(chat_id, thread_id)
-
-    def set_plan_mode(self, chat_id: int, thread_id: int | None, enabled: bool) -> None:
-        """Flip a topic's plan mode — set by ``/plan``, cleared by ``/plan off`` or
-        by the plan_exit question being answered "Yes" (the agent then builds)."""
-        self._store.set_plan_mode(chat_id, thread_id, enabled)
-
     def model_override(self, chat_id: int, thread_id: int | None) -> tuple[str | None, str | None]:
         """The topic's explicit model override, or ``(None, None)`` when unset."""
         provider, model, _ = self._store.get_overrides(chat_id, thread_id)

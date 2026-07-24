@@ -5,9 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from balam.config import Config
-from balam.content_store import ContentStore
 from balam.miniapp import (
-    make_plan_view_button,
     markdown_button,
     markdown_start_param,
     mini_app_reply,
@@ -40,21 +38,6 @@ def test_markdown_button_plain_url_without_shortname(make_config: Callable[..., 
 
 def test_markdown_button_none_without_public_url(make_config: Callable[..., Config]) -> None:
     assert markdown_button(make_config(), "balam_bot", "0123456789ab", "x") is None
-
-
-def test_make_plan_view_button_stores_and_links(make_config: Callable[..., Config]) -> None:
-    config = make_config(
-        balam_public_url="https://balam.example.com", balam_miniapp_shortname="balamapp"
-    )
-    store = ContentStore()
-    plan_view = make_plan_view_button(config, store, "balam_bot")
-    button = plan_view("plan.md", "# The plan")
-    assert button is not None
-    content_id = button.url.rsplit("markdown__c_", 1)[1]
-    entry = store.get(content_id)
-    assert entry is not None
-    assert entry.title == "plan.md"
-    assert entry.content == "# The plan"
 
 
 def test_mini_app_reply_direct_link(make_config: Callable[..., Config]) -> None:

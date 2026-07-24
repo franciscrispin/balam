@@ -13,13 +13,11 @@ markdown content travels as a short id (``markdown__c_<id>``) resolved by
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from urllib.parse import quote
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from balam.config import Config
-from balam.content_store import ContentStore
 
 logger = logging.getLogger(__name__)
 
@@ -140,22 +138,3 @@ def markdown_button(
         return InlineKeyboardButton(label, url=url)
 
     return None
-
-
-def make_plan_view_button(
-    config: Config,
-    content_store: ContentStore,
-    bot_username: str | None,
-) -> Callable[[str, str], InlineKeyboardButton | None]:
-    """A ``(title, content) -> button`` factory for the streamer's plan handling.
-
-    Bundles config + store + username so the streamer needs one injectable
-    callable (trivially faked in tests): it stores the markdown snapshot and
-    returns the launch button, or ``None`` when no public URL is configured.
-    """
-
-    def plan_view(title: str, content: str) -> InlineKeyboardButton | None:
-        content_id = content_store.put(title, content)
-        return markdown_button(config, bot_username, content_id, "📋 View plan")
-
-    return plan_view

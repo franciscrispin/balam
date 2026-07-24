@@ -51,19 +51,6 @@ class SessionStore:
             );
             """
         )
-        # Topics currently in plan mode (/plan). Persisted so a backend restart
-        # mid-plan doesn't silently flip the topic back to the build agent —
-        # OpenCode's agent selection is per-prompt, not per-session, so this flag
-        # is the only memory of the mode.
-        self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS topic_plan_modes (
-                chat_id   INTEGER NOT NULL,
-                thread_id INTEGER NOT NULL,
-                PRIMARY KEY (chat_id, thread_id)
-            );
-            """
-        )
         # Per-topic model/effort overrides. Kept separate from ``topic_sessions``
         # so they can be set before a session exists and survive session
         # recreation when a stale session row is deleted.
@@ -220,32 +207,6 @@ class SessionStore:
         )
         self._db.commit()
 
-    def is_plan_mode(self, chat_id: int, thread_id: int | None) -> bool:
-        """Whether the topic is in plan mode (prompts run OpenCode's plan agent)."""
-        marker = self._db.execute(
-            "SELECT 1 FROM topic_plan_modes WHERE chat_id = ? AND thread_id = ?",
-            (chat_id, self.thread_key(thread_id)),
-        ).fetchone()
-        return marker is not None
-
-    def set_plan_mode(self, chat_id: int, thread_id: int | None, enabled: bool) -> None:
-        """Flip a topic's plan-mode flag (idempotent either way)."""
-        if enabled:
-            self._db.execute(
-                """
-                INSERT INTO topic_plan_modes (chat_id, thread_id)
-                VALUES (?, ?)
-                ON CONFLICT (chat_id, thread_id) DO NOTHING
-                """,
-                (chat_id, self.thread_key(thread_id)),
-            )
-        else:
-            self._db.execute(
-                "DELETE FROM topic_plan_modes WHERE chat_id = ? AND thread_id = ?",
-                (chat_id, self.thread_key(thread_id)),
-            )
-        self._db.commit()
-
     def get_overrides(
         self, chat_id: int, thread_id: int | None
     ) -> tuple[str | None, str | None, str | None]:
@@ -343,10 +304,10 @@ class SessionStore:
 
     def purge(self, chat_id: int, thread_id: int | None) -> None:
         """Forget a topic entirely — used when the Telegram forum topic itself is
-        deleted (``/delete`` picker), so every trace is removed from all four
+        deleted (``/delete`` picker), so every trace is removed from all three
         per-topic tables."""
         key = self.thread_key(thread_id)
-        for table in ("topic_sessions", "topic_auto_names", "topic_plan_modes", "topic_overrides"):
+        for table in ("topic_sessions", "topic_auto_names", "topic_overrides"):
             self._db.execute(
                 f"DELETE FROM {table} WHERE chat_id = ? AND thread_id = ?",
                 (chat_id, key),
