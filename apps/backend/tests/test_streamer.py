@@ -6,11 +6,13 @@ from telegram import InlineKeyboardButton
 from balam.agent.opencode_backend import OpenCodeBackend, _plan_path_from_question
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile
+from balam.markdown import EXPANDABLE_QUOTE_MARKER
 from balam.streamer import (
     DraftSession,
     _format_approval_request,
     _make_transport,
     _render_todos,
+    _render_tool_group,
     stream_reply,
 )
 
@@ -304,12 +306,25 @@ async def test_finalize_emits_fallback_when_no_text() -> None:
 
 
 class _RecordBot:
-    """A bot stub recording PTB calls; can simulate MarkdownV2 parse failures."""
+    """A bot stub recording PTB calls; can simulate MarkdownV2 parse failures.
 
-    def __init__(self, *, fail_markdown: bool = False) -> None:
+    ``do_api_request`` stands in for the Bot API 10.1 rich-message endpoints PTB
+    does not wrap yet; ``fail_rich`` makes Telegram reject the rich payload the
+    way a malformed one does (``RICH_MESSAGE_EMPTY``).
+    """
+
+    def __init__(self, *, fail_markdown: bool = False, fail_rich: bool = False) -> None:
         self.fail_markdown = fail_markdown
+        self.fail_rich = fail_rich
         self.calls: list[tuple] = []
         self._id = 500
+
+    async def do_api_request(self, endpoint: str, api_kwargs: dict | None = None):
+        if self.fail_rich:
+            raise RuntimeError("Bad Request: RICH_MESSAGE_EMPTY")
+        self.calls.append((endpoint, api_kwargs or {}))
+        self._id += 1
+        return {"message_id": self._id}
 
     async def send_message_draft(self, **kwargs: object) -> None:
         self.calls.append(("draft", kwargs))
@@ -351,6 +366,135 @@ async def test_transport_edit_falls_back_to_plain_text_on_markdown_error() -> No
     # edit: MarkdownV2 raises → retried as plain text rather than dropping.
     await transport.edit_message(777, "y")
     assert any(c[0] == "edit" and c[1] == 777 and c[3] is None for c in bot.calls)
+
+
+# --- rich messages (Bot API 10.1) ---------------------------------------------
+
+#: Exercises what MarkdownV2 cannot express and what its escaper would mangle.
+RICH_GFM = "# Report\n\n| Metric | Value |\n|:---|---:|\n| Speed | 42 |\n\n- [x] done\n"
+
+
+async def test_transport_rich_send_passes_gfm_through_unescaped() -> None:
+    bot = _RecordBot()
+    transport = _make_transport(bot, chat_id=-100123, thread_id=7, rich=True)
+
+    mid = await transport.send_message(RICH_GFM)
+
+    assert mid == 501  # the live-edit fallback still needs the real id back
+    endpoint, kwargs = bot.calls[0]
+    assert endpoint == "sendRichMessage"
+    # The whole point: Telegram parses the GFM, so nothing is escaped for it.
+    assert kwargs["rich_message"]["markdown"] == RICH_GFM
+    assert kwargs["rich_message"]["skip_entity_detection"] is True
+    assert kwargs["message_thread_id"] == 7  # still routed to the topic
+
+
+async def test_transport_rich_edit_uses_rich_message_field() -> None:
+    bot = _RecordBot()
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+
+    await transport.edit_message(777, RICH_GFM)
+
+    endpoint, kwargs = bot.calls[0]
+    assert endpoint == "editMessageText"
+    assert kwargs["message_id"] == 777
+    assert kwargs["rich_message"]["markdown"] == RICH_GFM
+    assert "text" not in kwargs  # rich_message replaces text, never rides alongside
+
+
+async def test_transport_rich_draft_uses_rich_draft_endpoint() -> None:
+    bot = _RecordBot()
+    transport = _make_transport(bot, chat_id=42, thread_id=3, rich=True)
+
+    await transport.send_draft(9, RICH_GFM)
+
+    endpoint, kwargs = bot.calls[0]
+    assert endpoint == "sendRichMessageDraft"
+    assert kwargs["draft_id"] == 9
+    assert kwargs["rich_message"]["markdown"] == RICH_GFM
+
+
+async def test_rich_send_falls_back_to_markdown_v2_when_rejected() -> None:
+    bot = _RecordBot(fail_rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+
+    mid = await transport.send_message(RICH_GFM)
+
+    # Rejected rich payload → the message still lands, escaped the old way.
+    sends = [c for c in bot.calls if c[0] == "send"]
+    assert sends and sends[0][2] == "MarkdownV2"
+    assert "|:---|---:|" not in sends[0][1]  # went through the GFM renderer
+    assert mid is not None
+
+
+async def test_rich_edit_falls_back_to_markdown_v2_when_rejected() -> None:
+    bot = _RecordBot(fail_rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+
+    await transport.edit_message(777, RICH_GFM)
+
+    edits = [c for c in bot.calls if c[0] == "edit"]
+    assert edits and edits[0][1] == 777 and edits[0][3] == "MarkdownV2"
+
+
+async def test_rich_rejection_does_not_disable_rich_for_later_messages() -> None:
+    bot = _RecordBot(fail_rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+
+    await transport.send_message(RICH_GFM)  # rejected → MarkdownV2 fallback
+    bot.fail_rich = False
+    await transport.send_message(RICH_GFM)  # next one goes rich again
+
+    assert any(c[0] == "sendRichMessage" for c in bot.calls)
+
+
+#: Three finished calls — enough to fold into a collapsed group.
+GROUP = [
+    ("bash", {"command": 'echo <foo> | grep "x" > out.txt'}, "completed", "", None),
+    ("read", {"filePath": "/w/streamer.py"}, "completed", "", None),
+    ("bash", {"command": "git status --short"}, "completed", "", None),
+]
+
+
+def test_tool_group_rich_uses_native_details_block() -> None:
+    kind, text = _render_tool_group(GROUP, active=False, directory="/w", rich=True)
+
+    assert kind == "toolgroup"
+    assert text.startswith("<details><summary>🔧 ")
+    assert text.endswith("</details>")
+    # The marker only balam.markdown understands must never reach rich output.
+    assert EXPANDABLE_QUOTE_MARKER not in text
+    assert "&gt;" not in text  # shell metacharacters stay literal in codespans
+    # One list marker per call: bare lines collapse into a run-on paragraph.
+    assert len([ln for ln in text.splitlines() if ln.startswith("- ")]) == 3
+
+
+def test_tool_group_without_rich_keeps_the_expandable_quote() -> None:
+    kind, text = _render_tool_group(GROUP, active=False, directory="/w", rich=False)
+
+    assert kind == "toolgroup"
+    assert text.splitlines()[0] == f"> {EXPANDABLE_QUOTE_MARKER}"
+    assert all(line.startswith("> ") for line in text.splitlines())
+    assert "<details>" not in text
+
+
+def test_tool_group_active_summary_is_the_same_in_both_modes() -> None:
+    # An open group ticks up in place, so it stays a plain line either way —
+    # a <details> block would re-collapse on every edit, like the quote does.
+    plain = _render_tool_group(GROUP, active=True, directory="/w", rich=False)
+    rich = _render_tool_group(GROUP, active=True, directory="/w", rich=True)
+    assert plain == rich
+    assert plain[0] == "tool" and "<details>" not in plain[1]
+
+
+def test_chunk_rich_keeps_one_message_well_past_the_4096_cap() -> None:
+    from balam.rich_messages import RICH_MAX_LENGTH, chunk_rich
+
+    text = "word " * 1500  # ~7500 chars: two MarkdownV2 messages, one rich message
+    assert len(text) > 4096
+    assert len(chunk_rich(text)) == 1
+    # The cap still applies, so a genuinely huge reply is split rather than 400ing.
+    assert len(chunk_rich("x " * RICH_MAX_LENGTH)) > 1
 
 
 # --- stream_reply event-loop regression tests ---------------------------------
@@ -842,6 +986,34 @@ def test_render_todos_icons_and_fallbacks() -> None:
 def test_render_todos_nothing_renderable_returns_empty() -> None:
     assert _render_todos([]) == ""
     assert _render_todos([{"content": "  ", "status": "pending"}]) == ""
+
+
+def test_render_todos_rich_uses_native_task_list() -> None:
+    gfm = _render_todos(
+        [
+            {"content": "Write tests", "status": "completed"},
+            {"content": "Run them", "status": "in_progress"},
+            {"content": "Ship it", "status": "pending"},
+            {"content": "Old idea", "status": "cancelled"},
+        ],
+        rich=True,
+    )
+    assert gfm.splitlines() == [
+        "### 📋 Progress",
+        "",
+        "- [x] Write tests",
+        # Neither in-progress nor cancelled is done, so both stay unchecked and
+        # keep the marker a checkbox can't express.
+        "- [ ] 🔄 Run them",
+        "- [ ] Ship it",
+        "- [ ] ~~Old idea~~",
+    ]
+
+
+def test_render_todos_rich_header_alone_is_not_a_checklist() -> None:
+    # The rich header spans two lines; an empty list must still render as "".
+    assert _render_todos([], rich=True) == ""
+    assert _render_todos([{"content": " ", "status": "pending"}], rich=True) == ""
 
 
 def _todowrite_part(call_id: str, status: str, todos: list[dict[str, str]]) -> dict[str, object]:

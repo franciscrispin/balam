@@ -91,6 +91,13 @@ class Config(BaseSettings):
     # the legacy one-line-per-call stream. Mirrors TOOL_STREAM in .env.example.
     tool_stream: Literal["collapsed", "full"] = "collapsed"
 
+    # Send replies as Bot API 10.1 rich messages: Telegram parses the agent's GFM
+    # natively (tables, headings, task lists, collapsibles, 32768-char cap)
+    # instead of our MarkdownV2 escaping pass. Falls back to MarkdownV2 per
+    # message if Telegram rejects the payload. Mirrors RICH_MESSAGES in
+    # .env.example; see balam.rich_messages.
+    rich_messages: bool = False
+
     # --- noVNC live browser view (ADR-0006) ---
     # The x11vnc server exposing the agent's headed Chrome (started on demand by
     # the browser-use skill, .claude/skills/browser-use/headed-browser/). The

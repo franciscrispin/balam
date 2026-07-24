@@ -69,6 +69,13 @@ from balam.approvals import (
 from balam.attachments import PromptFile
 from balam.markdown import EXPANDABLE_QUOTE_MARKER, gfm_to_telegram
 from balam.opencode_tools import Tool
+from balam.rich_messages import (
+    chunk_rich,
+    edit_rich_message,
+    markdown_v2_fallback,
+    send_rich_draft,
+    send_rich_message,
+)
 from balam.telegram_utils import thread_kwargs
 
 logger = logging.getLogger(__name__)
@@ -468,13 +475,19 @@ _TODO_ICONS: dict[str, str] = {
 }
 
 
-def _render_todos(todos: list[Any]) -> str:
+def _render_todos(todos: list[Any], *, rich: bool = False) -> str:
     """Render a todowrite ``todos`` list as the GFM checklist for the live
     progress message. Both backends put the list in the tool input with
     ``content`` per item (``text`` kept as a defensive fallback); items without
     text are skipped, an unknown status gets the pending icon, and a cancelled
-    item is struck through. Returns ``""`` when nothing is renderable."""
-    lines = ["📋 **Progress**"]
+    item is struck through. Returns ``""`` when nothing is renderable.
+
+    ``rich`` emits a **native task list** under a heading — Telegram draws real
+    checkboxes (Bot API 10.1), so only the states a checkbox can't express keep
+    an icon: in-progress stays 🔄 and cancelled stays struck through, both
+    unchecked since neither is done.
+    """
+    lines = ["### 📋 Progress", ""] if rich else ["📋 **Progress**"]
     for todo in todos:
         if not isinstance(todo, dict):
             continue
@@ -484,8 +497,13 @@ def _render_todos(todos: list[Any]) -> str:
         status = str(todo.get("status") or "")
         if status == "cancelled":
             label = f"~~{label}~~"
-        lines.append(f"{_TODO_ICONS.get(status, '⬜')} {label}")
-    return "\n".join(lines) if len(lines) > 1 else ""
+        if rich:
+            box = "- [x] " if status == "completed" else "- [ ] "
+            lines.append(f"{box}🔄 {label}" if status == "in_progress" else f"{box}{label}")
+        else:
+            lines.append(f"{_TODO_ICONS.get(status, '⬜')} {label}")
+    # In rich mode the header costs two entries (heading + blank line).
+    return "\n".join(lines) if len(lines) > (2 if rich else 1) else ""
 
 
 def _group_phrase(entries: list[GroupEntry], *, running: bool) -> str:
@@ -567,7 +585,7 @@ def _group_detail_line(tool: str, tool_input: dict[str, Any], directory: str | N
 
 
 def _render_tool_group(
-    entries: list[GroupEntry], *, active: bool, directory: str | None
+    entries: list[GroupEntry], *, active: bool, directory: str | None, rich: bool = False
 ) -> tuple[str, str]:
     """Render a group of consecutive tool calls; returns ``(kind, text)``.
 
@@ -577,6 +595,12 @@ def _render_tool_group(
     its finished calls: one call keeps the legacy single-line form (Bash with
     its fenced command); several fold into the summary line plus one compact
     line per call inside a tap-to-expand blockquote.
+
+    ``rich`` swaps that blockquote for a native ``<details>`` block (Bot API
+    10.1), which is what the quote was imitating. This is not cosmetic: rich
+    mode sends raw GFM, so :data:`~balam.markdown.EXPANDABLE_QUOTE_MARKER` —
+    which only :mod:`balam.markdown` knows how to translate — would otherwise
+    reach the user as the literal text ``[!expandable]``.
     """
     if active:
         running = any(status not in ("completed", "error") for _t, _i, status, _o, _e in entries)
@@ -588,8 +612,15 @@ def _render_tool_group(
     if len(finished) == 1:
         tool, tool_input, status, output, error = finished[0]
         return ("tool", _render_tool_part(tool, tool_input, status, output, error, directory))
-    lines = [EXPANDABLE_QUOTE_MARKER, f"🔧 {_group_phrase(finished, running=False)}"]
-    lines += [_group_detail_line(t, i, directory) for t, i, _s, _o, _e in finished]
+    summary = f"🔧 {_group_phrase(finished, running=False)}"
+    details = [_group_detail_line(t, i, directory) for t, i, _s, _o, _e in finished]
+    if rich:
+        # Each call needs a list marker: consecutive plain lines inside <details>
+        # collapse into one run-on paragraph. Codespans keep shell metacharacters
+        # (`<`, `>`, `&`) out of the HTML parser — verified against the live API.
+        body = "\n".join(f"- {line}" for line in details)
+        return ("toolgroup", f"<details><summary>{summary}</summary>\n\n{body}\n\n</details>")
+    lines = [EXPANDABLE_QUOTE_MARKER, summary, *details]
     return ("toolgroup", "\n".join("> " + line for line in lines))
 
 
@@ -699,12 +730,28 @@ def _make_transport(
     chat_id: int,
     thread_id: int | None,
     on_sent: Callable[[int | None], None] | None = None,
+    *,
+    rich: bool = False,
 ) -> DraftTransport:
     # message_thread_id routes both the draft and the final message to the topic.
     topic_kwargs = thread_kwargs(thread_id)
 
     class _Transport:
+        # In rich mode ``text`` arrives as raw GFM (the renderer only chunks it);
+        # in MarkdownV2 mode it is already escaped. Each rich call falls back to
+        # the MarkdownV2 path for *this message only*, so one payload Telegram
+        # dislikes never disables rich mode for the rest of the turn.
+
         async def send_draft(self, draft_id: int, text: str) -> None:
+            if rich:
+                await send_rich_draft(
+                    bot,
+                    chat_id=chat_id,
+                    draft_id=draft_id,
+                    markdown=text,
+                    thread_kwargs=topic_kwargs,
+                )
+                return
             await bot.send_message_draft(
                 chat_id=chat_id,
                 draft_id=draft_id,
@@ -713,7 +760,7 @@ def _make_transport(
                 **topic_kwargs,
             )
 
-        async def send_message(self, text: str) -> int | None:
+        async def _send_markdown_v2(self, text: str) -> int | None:
             try:
                 msg = await bot.send_message(
                     chat_id=chat_id, text=text, parse_mode="MarkdownV2", **topic_kwargs
@@ -731,12 +778,55 @@ def _make_transport(
                 on_sent(message_id)
             return message_id
 
+        async def send_message(self, text: str) -> int | None:
+            if rich:
+                try:
+                    message_id = await send_rich_message(
+                        bot,
+                        chat_id=chat_id,
+                        markdown=text,
+                        thread_kwargs=topic_kwargs,
+                    )
+                except RetryAfter:
+                    raise
+                except Exception:
+                    logger.info("rich send rejected; falling back to MarkdownV2", exc_info=True)
+                else:
+                    if on_sent is not None:
+                        on_sent(message_id)
+                    return message_id
+                # Escaping the same GFM can exceed the 4096 cap that rich mode
+                # let through, so the fallback may span several messages. The
+                # last one is the live-edit anchor and the topic tail.
+                message_id = None
+                for chunk in markdown_v2_fallback(text):
+                    message_id = await self._send_markdown_v2(chunk)
+                return message_id
+            return await self._send_markdown_v2(text)
+
         async def delete_message(self, message_id: int) -> None:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
         async def edit_message(self, message_id: int, text: str) -> None:
             # edit_message_text addresses the message by id within the chat, so no
             # thread kwargs. "message is not modified" is benign (identical render).
+            if rich:
+                try:
+                    await edit_rich_message(
+                        bot, chat_id=chat_id, message_id=message_id, markdown=text
+                    )
+                except RetryAfter:
+                    raise
+                except Exception:
+                    logger.info("rich edit rejected; falling back to MarkdownV2", exc_info=True)
+                else:
+                    return
+                # Only the first chunk can be edited in place; overflow is left to
+                # finalize, which re-sends the whole text as fresh messages.
+                chunks = markdown_v2_fallback(text)
+                if not chunks:
+                    return
+                text = chunks[0]
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -787,6 +877,7 @@ async def stream_reply(
     follow_ups: FollowUpChannel | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
     tool_stream: str = "collapsed",
+    rich_messages: bool = False,
 ) -> None:
     """Run one turn through ``backend`` and stream its reply into the topic.
 
@@ -820,6 +911,12 @@ async def stream_reply(
     with a :class:`~balam.agent.events.TurnStepFinished`, on which we finalize the
     current answer/reasoning bubbles and reset so the next step streams fresh.
 
+    ``rich_messages`` (``RICH_MESSAGES``) sends the agent's GFM as Bot API 10.1
+    rich messages, which Telegram parses natively — tables, headings, task
+    lists, collapsibles, and a 32768-char cap — instead of escaping it to
+    MarkdownV2 (see :mod:`balam.rich_messages`). Any message Telegram rejects
+    falls back to the MarkdownV2 rendering on its own.
+
     ``tool_stream`` (``TOOL_STREAM``) picks how tool calls render in the
     progress stream: ``"collapsed"`` (default) folds a burst of consecutive
     calls into one summary line with the per-call detail in an expandable
@@ -849,13 +946,16 @@ async def stream_reply(
         if message_id is not None:
             last_sent_id = message_id
 
-    transport = _make_transport(bot, chat_id, thread_id, on_sent=note_sent)
+    transport = _make_transport(bot, chat_id, thread_id, on_sent=note_sent, rich=rich_messages)
     # sendMessageDraft is private-chat only; in the Bot API private chats have
     # positive ids and groups/supergroups negative ones, so the chat id alone
     # picks the streaming approach — no wasted draft call per group turn.
     native_drafts = chat_id > 0
-    reasoning_draft = DraftSession(transport, native_drafts=native_drafts)
-    answer_draft = DraftSession(transport, native_drafts=native_drafts)
+    # Rich mode hands the transport raw GFM (Telegram parses it), so the renderer
+    # only enforces the 32768-char cap instead of escaping to MarkdownV2.
+    render: Renderer = chunk_rich if rich_messages else gfm_to_telegram
+    reasoning_draft = DraftSession(transport, native_drafts=native_drafts, render=render)
+    answer_draft = DraftSession(transport, native_drafts=native_drafts, render=render)
     topic_kwargs = thread_kwargs(thread_id)
 
     streaming = True
@@ -908,7 +1008,10 @@ async def stream_reply(
         nonlocal order
         entries = [group_entries[cid] for cid in group_calls.get(group_key, ())]
         kind, text = _render_tool_group(
-            entries, active=group_key == open_group_key, directory=directory
+            entries,
+            active=group_key == open_group_key,
+            directory=directory,
+            rich=rich_messages,
         )
         prior = reasoning_parts.get(group_key)
         if prior is None:
@@ -1123,10 +1226,11 @@ async def stream_reply(
         purely cosmetic — a failed send/edit is logged and must never abort the
         turn."""
         nonlocal todo_message_id, todo_last_rendered
-        gfm = _render_todos(todos)
+        gfm = _render_todos(todos, rich=rich_messages)
         if not gfm or gfm == todo_last_rendered:
             return
-        chunks = gfm_to_telegram(gfm)
+        # Same renderer as the streams: raw GFM in rich mode, escaped otherwise.
+        chunks = render(gfm)
         if not chunks:
             return
         todo_last_rendered = gfm

@@ -566,6 +566,7 @@ def _start_turn(
                 on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
                 follow_ups=follow_ups,
                 tool_stream=config.tool_stream if config is not None else "collapsed",
+                rich_messages=config.rich_messages if config is not None else False,
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
