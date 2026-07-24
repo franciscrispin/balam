@@ -27,6 +27,12 @@ from balam.opencode import OpenCode
 from balam.permissions import build_ruleset, send_file_rules
 from balam.store import SessionStore
 
+#: Model/effort overrides are chat-global and live on the General topic's row
+#: (``thread_key(None) == 0``), which is also the only place ``/model`` and
+#: ``/effort`` may be set. Keeping them off per-topic rows is what lets a
+#: long-lived agent session stay on one model for its whole life.
+_GLOBAL_THREAD: int | None = None
+
 
 @dataclass
 class TopicRef:
@@ -140,33 +146,31 @@ class Router:
         context = self._contexts.resolve_name(row[1] if row else None)
         self._store.set(chat_id, thread_id, session_id, int(time.time() * 1000), context=context)
 
-    def model_override(self, chat_id: int, thread_id: int | None) -> tuple[str | None, str | None]:
-        """The topic's explicit model override, or ``(None, None)`` when unset."""
-        provider, model, _ = self._store.get_overrides(chat_id, thread_id)
+    def model_override(self, chat_id: int) -> tuple[str | None, str | None]:
+        """The chat's global model override, or ``(None, None)`` when unset."""
+        provider, model, _ = self._store.get_overrides(chat_id, _GLOBAL_THREAD)
         return provider, model
 
-    def set_model_override(
-        self, chat_id: int, thread_id: int | None, provider: str, model: str
-    ) -> None:
-        """Set this topic's model override."""
-        self._store.set_model_override(chat_id, thread_id, provider, model)
+    def set_model_override(self, chat_id: int, provider: str, model: str) -> None:
+        """Set the chat's global model override (``/model`` in General)."""
+        self._store.set_model_override(chat_id, _GLOBAL_THREAD, provider, model)
 
-    def reset_model_override(self, chat_id: int, thread_id: int | None) -> None:
-        """Clear this topic's model override."""
-        self._store.reset_model_override(chat_id, thread_id)
+    def reset_model_override(self, chat_id: int) -> None:
+        """Clear the chat's global model override."""
+        self._store.reset_model_override(chat_id, _GLOBAL_THREAD)
 
-    def effort_override(self, chat_id: int, thread_id: int | None) -> str | None:
-        """The topic's explicit effort override, or ``None`` when unset."""
-        _, _, effort = self._store.get_overrides(chat_id, thread_id)
+    def effort_override(self, chat_id: int) -> str | None:
+        """The chat's global effort override, or ``None`` when unset."""
+        _, _, effort = self._store.get_overrides(chat_id, _GLOBAL_THREAD)
         return effort
 
-    def set_effort_override(self, chat_id: int, thread_id: int | None, effort: str) -> None:
-        """Set this topic's effort override."""
-        self._store.set_effort_override(chat_id, thread_id, effort)
+    def set_effort_override(self, chat_id: int, effort: str) -> None:
+        """Set the chat's global effort override (``/effort`` in General)."""
+        self._store.set_effort_override(chat_id, _GLOBAL_THREAD, effort)
 
-    def reset_effort_override(self, chat_id: int, thread_id: int | None) -> None:
-        """Clear this topic's effort override."""
-        self._store.reset_effort_override(chat_id, thread_id)
+    def reset_effort_override(self, chat_id: int) -> None:
+        """Clear the chat's global effort override."""
+        self._store.reset_effort_override(chat_id, _GLOBAL_THREAD)
 
     def topic_auto_named(self, ref: TopicRef) -> bool:
         """Whether the topic has already been auto-named, or manually renamed."""
@@ -247,8 +251,11 @@ class Router:
             session_id = existing
 
         provider, model = ctx.provider_model
+        # Model/effort overrides are per *chat*, not per topic: they are set from
+        # General and apply everywhere, so a running session never has to change
+        # model or effort mid-flight.
         override_provider, override_model, override_effort = self._store.get_overrides(
-            ref.chat_id, ref.thread_id
+            ref.chat_id, _GLOBAL_THREAD
         )
         return ResolvedSession(
             session_id=session_id,

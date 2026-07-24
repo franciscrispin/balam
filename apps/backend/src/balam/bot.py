@@ -799,8 +799,8 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     name = router.current_context_name(ref)
     ctx = router.contexts.get(name)
     provider, model = ctx.provider_model
-    override_provider, override_model = router.model_override(ref.chat_id, ref.thread_id)
-    override_effort = router.effort_override(ref.chat_id, ref.thread_id)
+    override_provider, override_model = router.model_override(ref.chat_id)
+    override_effort = router.effort_override(ref.chat_id)
     session_id = router.current_session_id(ref)
     running = turns.get(ref.chat_id, ref.thread_id) is not None
     queued = turns.queue_len(ref.chat_id, ref.thread_id)
@@ -826,7 +826,13 @@ def _format_model(provider: str | None, model: str | None) -> str:
 
 
 async def _handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/model [provider/model|reset]`` — inspect or override this topic's model."""
+    """``/model [provider/model|reset]`` — inspect or set the chat-wide model.
+
+    Reading works anywhere; **setting** is General-only, because the override is
+    global rather than per topic (:data:`balam.router._GLOBAL_THREAD`). Keeping it
+    out of topics is what lets a long-lived agent session keep one model for its
+    whole life instead of having to switch mid-session.
+    """
     message = update.message
     if message is None:
         return
@@ -842,20 +848,30 @@ async def _handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not args:
         name = router.current_context_name(ref)
         provider, model = router.contexts.get(name).provider_model
-        override_provider, override_model = router.model_override(ref.chat_id, ref.thread_id)
+        override_provider, override_model = router.model_override(ref.chat_id)
         source = (
-            "topic override" if override_model else "context default" if model else "server default"
+            "global override"
+            if override_model
+            else "context default"
+            if model
+            else "server default"
         )
         await message.reply_text(
             f"Model: {_format_model(override_provider or provider, override_model or model)}\n"
             f"Source: {source}\n"
-            "Set with /model <provider/model>, reset with /model reset."
+            "Set with /model <provider/model> in General, reset with /model reset."
+        )
+        return
+
+    if not _is_forum_general_message(message):
+        await message.reply_text(
+            "The model is set for the whole workspace, so change it from General."
         )
         return
 
     value = args[0].strip()
     if value.lower() == "reset":
-        router.reset_model_override(ref.chat_id, ref.thread_id)
+        router.reset_model_override(ref.chat_id)
         name = router.current_context_name(ref)
         provider, model = router.contexts.get(name).provider_model
         await message.reply_text(f"Model reset to {_format_model(provider, model)}.")
@@ -870,12 +886,17 @@ async def _handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("Usage: /model <provider/model> or /model reset")
         return
 
-    router.set_model_override(ref.chat_id, ref.thread_id, provider, model)
-    await message.reply_text(f"Model override set to {provider}/{model}.")
+    router.set_model_override(ref.chat_id, provider, model)
+    await message.reply_text(f"Model set to {provider}/{model} for every topic.")
 
 
 async def _handle_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/effort [level|reset]`` — inspect or override this topic's effort."""
+    """``/effort [level|reset]`` — inspect or set the chat-wide effort.
+
+    General-only to set, for the same reason as :func:`_handle_model`. Effort in
+    particular cannot be changed on a live SDK client at all, so making it global
+    removes the only case that would force a session to be rebuilt mid-life.
+    """
     message = update.message
     if message is None:
         return
@@ -891,20 +912,26 @@ async def _handle_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not args:
         name = router.current_context_name(ref)
         ctx = router.contexts.get(name)
-        override = router.effort_override(ref.chat_id, ref.thread_id)
+        override = router.effort_override(ref.chat_id)
         source = (
-            "topic override" if override else "context default" if ctx.effort else "server default"
+            "global override" if override else "context default" if ctx.effort else "server default"
         )
         await message.reply_text(
             f"Effort: {override or ctx.effort or '(server default)'}\n"
             f"Source: {source}\n"
-            "Set with /effort <level>, reset with /effort reset."
+            "Set with /effort <level> in General, reset with /effort reset."
+        )
+        return
+
+    if not _is_forum_general_message(message):
+        await message.reply_text(
+            "Effort is set for the whole workspace, so change it from General."
         )
         return
 
     value = args[0].strip().lower()
     if value == "reset":
-        router.reset_effort_override(ref.chat_id, ref.thread_id)
+        router.reset_effort_override(ref.chat_id)
         name = router.current_context_name(ref)
         ctx = router.contexts.get(name)
         await message.reply_text(f"Effort reset to {ctx.effort or '(server default)'}.")
@@ -915,7 +942,7 @@ async def _handle_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text(f"Unknown effort {value!r}. Available: {allowed}")
         return
 
-    router.set_effort_override(ref.chat_id, ref.thread_id, value)
+    router.set_effort_override(ref.chat_id, value)
     await message.reply_text(f"Effort override set to {value}.")
 
 
