@@ -541,6 +541,14 @@ class ClaudeSdkBackend:
             "permission_mode": "default",
             "can_use_tool": can_use_tool,
             "include_partial_messages": True,
+            # The SDK reads the CLI's stdout as line-delimited JSON and fatally
+            # errors the turn if a single message exceeds this (default 1 MB —
+            # "JSON message exceeded maximum buffer size"). One message really can
+            # be that big: a large file read, a long bash result, or a background
+            # subagent's final report — and holding the turn open (ADR-0015) is
+            # exactly what now lets those big reports arrive instead of dying with
+            # the subprocess. 10 MB, matching open-shrimp.
+            "max_buffer_size": 10 * 1024 * 1024,
             # Keep Claude Code's native behavior (incl. natural-language planning),
             # plus what the agent cannot infer: its process only lives for this
             # turn, so anything meant to outlive it must be detached.
