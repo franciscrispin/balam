@@ -291,6 +291,24 @@ async def test_options_env_lifts_artifact_sdk_default_off() -> None:
     assert seen_options[0].env["CLAUDE_CODE_ARTIFACT"] == "1"
 
 
+async def test_options_raise_the_json_line_buffer_above_the_1mb_default() -> None:
+    # A single CLI message can exceed the SDK's 1 MB default and fatally error the
+    # turn — a big file read, a long bash result, or a held-open subagent's final
+    # report. Balam lifts the limit so those arrive instead of killing the turn.
+    seen_options: list = []
+
+    def query_fn(*, prompt, options):
+        seen_options.append(options)
+
+        async def gen():
+            yield _result()
+
+        return gen()
+
+    await _collect(ClaudeSdkBackend(query_fn=query_fn), _turn())
+    assert seen_options[0].max_buffer_size == 10 * 1024 * 1024
+
+
 async def test_ask_user_question_becomes_question_and_injects_answers() -> None:
     # AskUserQuestion must not bug the human with a tool-approval prompt; it is
     # surfaced as a structured question, and the selection is fed back to the tool
