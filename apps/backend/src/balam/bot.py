@@ -590,20 +590,28 @@ def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str 
     return None
 
 
-async def _open_context_topic(message: Any, bot: Any, router: Router, name: str) -> None:
+async def _open_context_topic(
+    message: Any, bot: Any, router: Router, name: str, *, prompt: str = ""
+) -> int | None:
     """Create a fresh forum topic bound to context ``name``, start its session,
     greet inside it, and reply with a one-tap link. Shared by ``/context <name>``
-    and ``/new``.
+    and ``/new``. Returns the new topic's thread id, or ``None`` when it couldn't
+    be opened — the caller runs ``prompt`` there (see :func:`_submit_turn`).
 
     One context per topic for life — we never rebind an existing topic, so a
     topic's session always remembers its own history. The Bot API can't move the
     user's view, so we create the topic, greet it, and hand back a deep link to
     tap. Requires a forum supergroup with the bot an admin holding "Manage
     Topics"; duplicate topic names are fine (many topics may share one context).
+
+    With a ``prompt`` the topic is named after it (``context: prompt``, as a
+    General message would), and marked auto-named so the first turn doesn't
+    rename it again.
     """
     ctx = router.contexts.contexts[name]
+    topic_name = _topic_name(name, prompt) if prompt else name
     try:
-        topic = await bot.create_forum_topic(chat_id=message.chat_id, name=name)
+        topic = await bot.create_forum_topic(chat_id=message.chat_id, name=topic_name)
     except Exception as exc:
         logger.exception("failed to create forum topic")
         await message.reply_text(
@@ -611,11 +619,13 @@ async def _open_context_topic(message: Any, bot: Any, router: Router, name: str)
             "This chat must be a forum supergroup and the bot an admin with "
             "the 'Manage Topics' permission."
         )
-        return
+        return None
 
     new_thread_id = topic.message_thread_id
     try:
-        await router.create_topic_session(message.chat_id, new_thread_id, name, name)
+        await router.create_topic_session(
+            message.chat_id, new_thread_id, topic_name, name, auto_named=bool(prompt)
+        )
     except Exception as exc:
         logger.exception("failed to start session for new topic")
         # Roll back the just-created topic: an unbound topic would silently route
@@ -625,27 +635,47 @@ async def _open_context_topic(message: Any, bot: Any, router: Router, name: str)
         except Exception:
             logger.debug("failed to delete orphan topic after session failure", exc_info=True)
         await message.reply_text(f"⚠️ Couldn't start a session for {name!r}: {exc}")
-        return
+        return None
 
     # Greet inside the new topic so it isn't empty, then hand back a one-tap link
-    # in the originating chat/topic as an inline URL button.
+    # in the originating chat/topic as an inline URL button. With a prompt the
+    # turn lands right below the header, so don't ask for a message.
+    header = f"🗂 Context {name} — {ctx.directory}"
     await bot.send_message(
         chat_id=message.chat_id,
-        text=f"🗂 Context {name} — {ctx.directory}\nSend a message to start.",
+        text=header if prompt else f"{header}\nSend a message to start.",
         message_thread_id=new_thread_id,
     )
+    opened = f"Opened {topic_name}." if prompt else f"Opened a new {name} topic."
     link = _topic_link(message.chat_id, new_thread_id, bot_id=bot.id)
     if link:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Go to topic", url=link)]])
-        await message.reply_text(f"Opened a new {name} topic.", reply_markup=keyboard)
+        await message.reply_text(opened, reply_markup=keyboard)
     else:
-        await message.reply_text(f"Opened a new {name} topic — pick it from the topic list.")
+        await message.reply_text(f"{opened} Pick it from the topic list.")
+    return new_thread_id
+
+
+def _command_remainder(text: str, *, args_consumed: int = 0) -> str:
+    """Everything after the leading ``/command`` and ``args_consumed`` argument
+    tokens, as the owner typed it.
+
+    ``context.args`` is a whitespace split, so a multi-line prompt would come
+    back collapsed onto one line; commands that forward a prompt to the agent
+    take it from the raw text instead.
+    """
+    rest = text.lstrip()
+    for _ in range(1 + args_consumed):
+        parts = rest.split(maxsplit=1)
+        rest = parts[1] if len(parts) > 1 else ""
+    return rest.strip()
 
 
 async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/context`` lists workspaces and the topic's current binding;
-    ``/context <name>`` creates a *new* topic bound to that context and replies
-    with a one-tap link to it (see :func:`_open_context_topic`)."""
+    ``/context <name> [prompt]`` creates a *new* topic bound to that context,
+    replies with a one-tap link to it (see :func:`_open_context_topic`), and runs
+    ``prompt`` there when one is given."""
     message = update.message
     if message is None:
         return
@@ -676,7 +706,10 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
         return
 
-    await _open_context_topic(message, context.bot, router, name)
+    prompt = _command_remainder(message.text or "", args_consumed=1)
+    thread_id = await _open_context_topic(message, context.bot, router, name, prompt=prompt)
+    if thread_id is not None and prompt:
+        await _submit_turn(message, context, prompt, [], thread_id=thread_id)
 
 
 def _abort_turn(
@@ -704,13 +737,21 @@ def _abort_turn(
 
 
 async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/new [name]`` — open a fresh topic with a new session.
+    """``/new [name] [prompt]`` — open a fresh topic with a new session, and run
+    ``prompt`` in it when one is given.
 
     The same flow as ``/context <name>`` (:func:`_open_context_topic`). With an
     argument, the new topic is bound to context ``name``; without one, it reuses
     the current topic's binding (``default_context`` when unbound). The current
     topic is left untouched — one context per topic for life — so its history is
     preserved and the fresh start lives in its own topic.
+
+    Everything after the context name is the first turn, so ``/new monies check
+    last month`` opens a *monies* topic and starts working there in one step —
+    the same one-step start a plain message in General gives, with the context
+    picked explicitly. The first token still has to name a context: a prompt
+    alone would silently run in whichever context this topic happens to be bound
+    to, and a plain message already covers that.
     """
     message = update.message
     if message is None:
@@ -724,6 +765,7 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             available = ", ".join(sorted(router.contexts.contexts))
             await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
             return
+        prompt = _command_remainder(message.text or "", args_consumed=1)
     else:
         ref = TopicRef(
             chat_id=message.chat_id,
@@ -731,7 +773,10 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             title=_topic_title(message, message.message_thread_id),
         )
         name = router.current_context_name(ref)
-    await _open_context_topic(message, context.bot, router, name)
+        prompt = ""
+    thread_id = await _open_context_topic(message, context.bot, router, name, prompt=prompt)
+    if thread_id is not None and prompt:
+        await _submit_turn(message, context, prompt, [], thread_id=thread_id)
 
 
 #: Scopes the Artifact tool's ``list`` action accepts; ``mine`` is its default.
@@ -1662,13 +1707,13 @@ async def _delete_message_after_delay(message: Any, delay_s: float) -> None:
 #: what makes them discoverable and reliably routed to the bot in a group, where
 #: clients dispatch slash commands by the bot's registered list.
 BOT_COMMANDS = [
-    BotCommand("new", "Open a new topic (this context, or /new <name> for another)"),
+    BotCommand("new", "Open a new topic: /new [context] [first message]"),
     BotCommand("rename", "Rename the current topic"),
     BotCommand("status", "Show this topic's context, session, and turn state"),
     BotCommand("model", "Show or set this topic's model override"),
     BotCommand("effort", "Show or set this topic's effort override"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
-    BotCommand("context", "List workspace contexts, or open a new topic bound to one"),
+    BotCommand("context", "List contexts, or /context <name> [first message] to open a topic"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
     BotCommand("artifacts", "List your published claude.ai artifacts (/artifacts [shared|all])"),

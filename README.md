@@ -18,7 +18,8 @@ The design and the reasons behind it live in
   asks via an inline keyboard, behind a symlink-safe directory boundary.
 - **Mini App viewers** — `/diff` opens a git diff viewer, and the agent can share
   files into a markdown viewer with its `send_file` tool.
-- **Topic management** — `/new`, `/rename`, `/status`, and `/cancel`.
+- **Topic management** — `/new` (optionally `/new <context> <first message>` to
+  open a topic and start working in it at once), `/rename`, `/status`, `/cancel`.
 
 ## Prerequisites
 

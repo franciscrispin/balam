@@ -64,7 +64,8 @@ roughly this sequence:
    - `_open_context_topic` / `_topic_link` — `/context <name>` and `/new <name>`
      create a *brand-new* forum topic bound to that context and reply with a
      one-tap deep link (never rebinds an existing topic — one context per topic
-     for life).
+     for life). Text after the context name is the topic's first turn, so
+     `/new <name> <prompt>` opens the topic and starts working in it at once.
 
 5. **`router.py`** — `TopicRef` → `ResolvedSession`. Maps a topic to its OpenCode
    session within its bound context; lazily **creates** a session on the first

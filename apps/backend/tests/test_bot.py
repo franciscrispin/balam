@@ -303,10 +303,18 @@ class _FakeBot:
 
 
 class _FakeMessage:
-    def __init__(self, chat_id: int, thread_id: int | None, *, is_forum: bool = False) -> None:
+    def __init__(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        *,
+        is_forum: bool = False,
+        text: str | None = None,
+    ) -> None:
         self.chat_id = chat_id
         self.message_thread_id = thread_id
         self.chat = SimpleNamespace(is_forum=is_forum)
+        self.text = text
         self.reply_to_message = None
         self.replies: list[str] = []
         self.reply_markups: list[object] = []
@@ -327,10 +335,28 @@ def _button_urls(message: _FakeMessage) -> list[str]:
     return urls
 
 
-def _update_context(bot: _FakeBot, router: Router, message: _FakeMessage, args: list[str]):
+def _update_context(
+    bot: _FakeBot,
+    router: Router,
+    message: _FakeMessage,
+    args: list[str],
+    *,
+    turns: TurnRegistry | None = None,
+):
+    """An (update, context) pair for a command handler. ``turns`` wires the turn
+    machinery too, for commands that also run a prompt (``/new <ctx> <prompt>``)."""
     update = SimpleNamespace(message=message)
+    bot_data: dict[str, object] = {"router": router}
+    if turns is not None:
+        bot_data.update(
+            {
+                "turns": turns,
+                "backend": OpenCodeBackend(_FakeOpenCode()),
+                "pending": PendingApprovals(),
+            }
+        )
     context = SimpleNamespace(
-        application=SimpleNamespace(bot_data={"router": router}),
+        application=SimpleNamespace(bot_data=bot_data),
         bot=bot,
         args=args,
     )
@@ -609,6 +635,111 @@ async def test_new_with_arg_opens_topic_in_named_context() -> None:
 
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
     assert router.current_context_name(TopicRef(SUPERGROUP, 902, "t")) == "scratch"
+
+
+async def test_new_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None:
+    # /new <ctx> <prompt> is a one-step start: open the topic, then work in it.
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    bot = _FakeBot(new_thread_id=904)
+    turns = TurnRegistry()
+    message = _FakeMessage(SUPERGROUP, thread_id=None, text="/new scratch check last month")
+    update, context = _update_context(
+        bot, router, message, ["scratch", "check", "last", "month"], turns=turns
+    )
+
+    await _handle_new(update, context)
+    turn = turns.get(SUPERGROUP, 904)
+    assert turn is not None
+    await turn.task
+
+    # The topic is named after the prompt, like a General message would name it,
+    # and bound to the requested context — not the one the command came from.
+    assert bot.created_topics == [(SUPERGROUP, "scratch: check last month")]
+    assert router.current_context_name(TopicRef(SUPERGROUP, 904, "t")) == "scratch"
+    # The prompt runs as the new topic's first turn, in that context's directory.
+    assert captured["prompt"] == "check last month"
+    assert captured["thread_id"] == 904
+    assert captured["directory"] == "/work/scratch"
+    # Already named from the prompt, so the first turn doesn't rename it again.
+    assert bot.edited_topics == []
+
+
+async def test_new_with_prompt_keeps_line_breaks(monkeypatch) -> None:
+    # context.args is a whitespace split; the prompt comes from the raw text.
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    bot = _FakeBot(new_thread_id=905)
+    turns = TurnRegistry()
+    message = _FakeMessage(SUPERGROUP, thread_id=None, text="/new scratch first line\nsecond line")
+    update, context = _update_context(
+        bot, router, message, ["scratch", "first", "line", "second", "line"], turns=turns
+    )
+
+    await _handle_new(update, context)
+    turn = turns.get(SUPERGROUP, 905)
+    assert turn is not None
+    await turn.task
+
+    assert captured["prompt"] == "first line\nsecond line"
+
+
+async def test_context_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    router = _router()
+    bot = _FakeBot(new_thread_id=906)
+    turns = TurnRegistry()
+    message = _FakeMessage(SUPERGROUP, thread_id=5, text="/context scratch tidy the notes")
+    update, context = _update_context(
+        bot, router, message, ["scratch", "tidy", "the", "notes"], turns=turns
+    )
+
+    await _handle_context(update, context)
+    turn = turns.get(SUPERGROUP, 906)
+    assert turn is not None
+    await turn.task
+
+    assert bot.created_topics == [(SUPERGROUP, "scratch: tidy the notes")]
+    assert captured["prompt"] == "tidy the notes"
+    assert captured["thread_id"] == 906
+
+
+async def test_new_without_prompt_starts_no_turn(monkeypatch) -> None:
+    # The bare form is unchanged: open the topic and wait for a message.
+    async def fail_stream_reply(**_: object) -> None:
+        raise AssertionError("no turn should run without a prompt")
+
+    monkeypatch.setattr("balam.bot.stream_reply", fail_stream_reply)
+
+    router = _router()
+    bot = _FakeBot(new_thread_id=907)
+    turns = TurnRegistry()
+    message = _FakeMessage(SUPERGROUP, thread_id=5, text="/new scratch")
+    update, context = _update_context(bot, router, message, ["scratch"], turns=turns)
+
+    await _handle_new(update, context)
+
+    assert bot.created_topics == [(SUPERGROUP, "scratch")]
+    assert turns.get(SUPERGROUP, 907) is None
+    assert any("Send a message to start." in text for _chat, text, _thread in bot.sent)
 
 
 async def test_new_with_unknown_context_reports_error() -> None:
