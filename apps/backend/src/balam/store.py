@@ -13,9 +13,40 @@ always a concrete integer pair.
 from __future__ import annotations
 
 import sqlite3
+from typing import NamedTuple
 
 #: Sentinel thread id for the General topic (no ``message_thread_id``).
 GENERAL_THREAD_ID = 0
+
+
+class ScheduleRow(NamedTuple):
+    """One row of the ``schedules`` table, exactly as stored (ADR-0016).
+
+    Deliberately raw — ``days`` is still CSV and ``enabled`` still an integer.
+    :class:`balam.schedules.Schedule` is the parsed form the rest of the code
+    uses; keeping the split means the store depends on nothing above it.
+    """
+
+    id: int
+    chat_id: int
+    context: str
+    prompt: str
+    kind: str
+    hour: int
+    minute: int
+    #: CSV of Python weekday numbers (``Mon=0`` … ``Sun=6``), or ``None`` for daily.
+    days: str | None
+    enabled: int
+    created_at: int
+    #: Epoch ms of the last run's *start*, or ``None`` until it first fires.
+    last_run_at: int | None
+
+
+_SCHEDULE_COLUMNS = ", ".join(ScheduleRow._fields)
+
+
+def _schedule_row(row: tuple) -> ScheduleRow:
+    return ScheduleRow(*row)
 
 
 class SessionStore:
@@ -66,8 +97,29 @@ class SessionStore:
             );
             """
         )
+        # Saved ``(when, context, prompt)`` triples driving /schedule (ADR-0016).
+        # Not keyed by topic: a schedule *opens* a topic when it fires, so it
+        # belongs to the chat, and outlives every topic it has ever created.
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schedules (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id     INTEGER NOT NULL,
+                context     TEXT    NOT NULL,
+                prompt      TEXT    NOT NULL,
+                kind        TEXT    NOT NULL,
+                hour        INTEGER NOT NULL,
+                minute      INTEGER NOT NULL,
+                days        TEXT,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                created_at  INTEGER NOT NULL,
+                last_run_at INTEGER
+            );
+            """
+        )
         self._migrate_auto_named()
         self._migrate_title()
+        self._migrate_schedules()
         self._db.commit()
 
     def _migrate_auto_named(self) -> None:
@@ -107,6 +159,18 @@ class SessionStore:
         if "title" not in columns:
             self._db.execute("ALTER TABLE topic_sessions ADD COLUMN title TEXT")
         self._db.execute("PRAGMA user_version = 2")
+
+    def _migrate_schedules(self) -> None:
+        """Record that the schema has reached the :class:`schedules` level (v3).
+
+        The table itself is created idempotently in ``__init__`` — it is new, so
+        unlike the two migrations above there is nothing to backfill. The version
+        bump is what a later migration reads to know this rung of the ladder has
+        been passed.
+        """
+        if self._db.execute("PRAGMA user_version").fetchone()[0] >= 3:
+            return
+        self._db.execute("PRAGMA user_version = 3")
 
     @staticmethod
     def thread_key(thread_id: int | None) -> int:
@@ -312,6 +376,83 @@ class SessionStore:
                 f"DELETE FROM {table} WHERE chat_id = ? AND thread_id = ?",
                 (chat_id, key),
             )
+        self._db.commit()
+
+    # --- schedules (ADR-0016) -------------------------------------------------
+
+    def add_schedule(
+        self,
+        *,
+        chat_id: int,
+        context: str,
+        prompt: str,
+        kind: str,
+        hour: int,
+        minute: int,
+        days: str | None,
+        created_at: int,
+    ) -> int:
+        """Save a new schedule; return its id. ``days`` is a CSV of Python
+        weekday numbers (``Mon=0`` … ``Sun=6``, i.e. :meth:`datetime.date.weekday`)
+        or ``None`` for a daily schedule."""
+        cursor = self._db.execute(
+            """
+            INSERT INTO schedules
+                (chat_id, context, prompt, kind, hour, minute, days, enabled, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (chat_id, context, prompt, kind, hour, minute, days, created_at),
+        )
+        self._db.commit()
+        return int(cursor.lastrowid or 0)
+
+    def list_schedules(self, chat_id: int) -> list[ScheduleRow]:
+        """Every schedule in a chat, oldest first (so ids read in order)."""
+        return [
+            _schedule_row(row)
+            for row in self._db.execute(
+                f"SELECT {_SCHEDULE_COLUMNS} FROM schedules WHERE chat_id = ? ORDER BY id",
+                (chat_id,),
+            ).fetchall()
+        ]
+
+    def all_schedules(self) -> list[ScheduleRow]:
+        """Every schedule across every chat — what boot registration walks."""
+        return [
+            _schedule_row(row)
+            for row in self._db.execute(
+                f"SELECT {_SCHEDULE_COLUMNS} FROM schedules ORDER BY id"
+            ).fetchall()
+        ]
+
+    def get_schedule(self, schedule_id: int) -> ScheduleRow | None:
+        row = self._db.execute(
+            f"SELECT {_SCHEDULE_COLUMNS} FROM schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        return _schedule_row(row) if row else None
+
+    def delete_schedule(self, schedule_id: int) -> bool:
+        """Drop a schedule; ``False`` if it was already gone."""
+        cursor = self._db.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def set_schedule_enabled(self, schedule_id: int, enabled: bool) -> bool:
+        """Pause or resume a schedule without losing it; ``False`` if unknown."""
+        cursor = self._db.execute(
+            "UPDATE schedules SET enabled = ? WHERE id = ?",
+            (1 if enabled else 0, schedule_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def mark_schedule_run(self, schedule_id: int, when_ms: int) -> None:
+        """Stamp a run. Written when the run *starts*, not when its turn ends, so
+        a crash mid-turn can't make the missed-run catch-up re-fire the whole
+        thing on restart."""
+        self._db.execute(
+            "UPDATE schedules SET last_run_at = ? WHERE id = ?", (when_ms, schedule_id)
+        )
         self._db.commit()
 
     def close(self) -> None:

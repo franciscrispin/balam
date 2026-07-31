@@ -304,3 +304,116 @@ def test_migrates_schema_without_title_column(tmp_path) -> None:
     assert store.list_topics(100) == [(5, None, "balam")]
     store.set_title(100, 5, "Backfilled")
     assert _titles(store, 100) == {5: "Backfilled"}
+
+
+# --- schedules (/schedule, ADR-0016) ------------------------------------------
+
+
+def _add(store: SessionStore, **overrides) -> int:
+    base = {
+        "chat_id": 100,
+        "context": "chaska",
+        "prompt": "plan my day",
+        "kind": "daily",
+        "hour": 7,
+        "minute": 30,
+        "days": None,
+        "created_at": 1_700_000_000_000,
+    }
+    base.update(overrides)
+    return store.add_schedule(**base)  # type: ignore[arg-type]
+
+
+def test_add_schedule_round_trips() -> None:
+    store = fresh_store()
+    schedule_id = _add(store)
+    row = store.get_schedule(schedule_id)
+    assert row is not None
+    assert (row.chat_id, row.context, row.prompt) == (100, "chaska", "plan my day")
+    assert (row.kind, row.hour, row.minute, row.days) == ("daily", 7, 30, None)
+    # New schedules are on, and have never run.
+    assert row.enabled == 1
+    assert row.last_run_at is None
+
+
+def test_schedule_days_are_stored_as_csv() -> None:
+    store = fresh_store()
+    row = store.get_schedule(_add(store, kind="weekdays", days="0,1,2,3,4"))
+    assert row is not None and row.days == "0,1,2,3,4"
+
+
+def test_list_schedules_is_scoped_per_chat_and_ordered_by_id() -> None:
+    store = fresh_store()
+    first = _add(store)
+    second = _add(store, hour=9)
+    _add(store, chat_id=200)
+    assert [row.id for row in store.list_schedules(100)] == [first, second]
+    assert [row.chat_id for row in store.list_schedules(200)] == [200]
+
+
+def test_all_schedules_spans_chats() -> None:
+    # What boot registration walks: the JobQueue is global, not per chat.
+    store = fresh_store()
+    _add(store)
+    _add(store, chat_id=200)
+    assert {row.chat_id for row in store.all_schedules()} == {100, 200}
+
+
+def test_get_schedule_is_none_when_unknown() -> None:
+    assert fresh_store().get_schedule(999) is None
+
+
+def test_delete_schedule_reports_whether_it_existed() -> None:
+    store = fresh_store()
+    schedule_id = _add(store)
+    assert store.delete_schedule(schedule_id) is True
+    assert store.delete_schedule(schedule_id) is False
+    assert store.get_schedule(schedule_id) is None
+
+
+def test_set_schedule_enabled_toggles_without_losing_the_row() -> None:
+    store = fresh_store()
+    schedule_id = _add(store)
+    assert store.set_schedule_enabled(schedule_id, False) is True
+    assert store.get_schedule(schedule_id).enabled == 0  # type: ignore[union-attr]
+    store.set_schedule_enabled(schedule_id, True)
+    assert store.get_schedule(schedule_id).enabled == 1  # type: ignore[union-attr]
+    assert store.set_schedule_enabled(999, False) is False
+
+
+def test_mark_schedule_run_stamps_the_row() -> None:
+    store = fresh_store()
+    schedule_id = _add(store)
+    store.mark_schedule_run(schedule_id, 1_700_000_123_000)
+    assert store.get_schedule(schedule_id).last_run_at == 1_700_000_123_000  # type: ignore[union-attr]
+
+
+def test_fresh_db_lands_on_schema_version_3() -> None:
+    store = fresh_store()
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_migrates_v2_database_to_schedules(tmp_path) -> None:
+    # An existing DB at the title-column level (v2) gains the schedules table
+    # without touching the rows it already holds.
+    path = str(tmp_path / "v2.db")
+    db = sqlite3.connect(path)
+    db.execute(
+        """
+        CREATE TABLE topic_sessions (
+            chat_id INTEGER, thread_id INTEGER, session_id TEXT, created_at INTEGER,
+            context TEXT, title TEXT, PRIMARY KEY (chat_id, thread_id)
+        )
+        """
+    )
+    db.execute("INSERT INTO topic_sessions VALUES (100, 5, 'ses_old', 1, 'balam', 'Old')")
+    db.execute("PRAGMA user_version = 2")
+    db.commit()
+    db.close()
+
+    store = SessionStore(path)
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert store.list_topics(100) == [(5, "Old", "balam")]
+    assert store.all_schedules() == []
+    schedule_id = _add(store)
+    assert store.get_schedule(schedule_id) is not None
