@@ -10,9 +10,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Fallback when ``BALAM_TIMEZONE`` is unset or blank. The VM runs UTC but the
+#: owner does not, and a schedule is written in the owner's wall clock.
+DEFAULT_TIMEZONE = "Asia/Singapore"
 
 # apps/backend/src/balam/config.py -> repo root is five parents up.
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -83,6 +88,11 @@ class Config(BaseSettings):
     # Telegram's webview in ANY chat type (groups included) — unlike a ``web_app``
     # inline button, which Telegram permits only in private chats.
     balam_miniapp_shortname: str | None = None
+    # IANA timezone every ``/schedule`` is resolved against (ADR-0016). The VM's
+    # clock is UTC and the owner's is not, so "daily 07:30" would otherwise mean
+    # 07:30 UTC — a silent 8-hour error that only shows up at the wrong hour.
+    # Validated at load (below) so a typo fails at boot, not at 07:30.
+    balam_timezone: str = DEFAULT_TIMEZONE
 
     # --- Streaming verbosity ---
     # How tool calls render in the progress stream. "collapsed" folds a burst of
@@ -133,6 +143,26 @@ class Config(BaseSettings):
             return "collapsed"
         return value
 
+    @field_validator("balam_timezone", mode="before")
+    @classmethod
+    def _blank_timezone_to_default(cls, value: object) -> object:
+        # Same reason as TOOL_STREAM: the field is a plain ``str``, so a blank
+        # env value must fall back to the default rather than become ``None``.
+        if isinstance(value, str) and value.strip() == "":
+            return DEFAULT_TIMEZONE
+        return value
+
+    @field_validator("balam_timezone")
+    @classmethod
+    def _known_timezone(cls, value: str) -> str:
+        # Fail fast next to the other trust-boundary checks: a typo'd zone would
+        # otherwise surface as a schedule firing at the wrong hour, or not at all.
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown IANA timezone {value!r} (e.g. Asia/Singapore, UTC)") from exc
+        return value
+
     @field_validator("allowed_telegram_user_id")
     @classmethod
     def _positive_user_id(cls, value: int) -> int:
@@ -144,6 +174,12 @@ class Config(BaseSettings):
     def db_path(self) -> str:
         """SQLite file backing the topic→session map (ADR-0009)."""
         return self.balam_db_path or "balam.sqlite"
+
+    @property
+    def timezone(self) -> ZoneInfo:
+        """The zone ``/schedule`` times are written in (ADR-0016). Validated at
+        load, so constructing it here cannot fail."""
+        return ZoneInfo(self.balam_timezone)
 
     @property
     def config_path(self) -> str:
