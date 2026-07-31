@@ -413,54 +413,35 @@ async def _submit_turn(
     queued_reply: str = "⏳ Queued (#{position}) — I'll run this after the current turn finishes.",
     prompt_prefix: str = "",
 ) -> None:
-    """Resolve the topic's session and run ``text`` as its turn, or park it in the
-    topic's queue when a turn is already streaming.
+    """Run ``text`` as the topic's turn, or park it in the topic's queue when a
+    turn is already streaming.
 
-    Shared dispatch tail of the message and ``/plan`` paths. ``thread_id`` is
-    explicit because a General message has already been rehomed into a freshly
-    created topic by the time it gets here; ``queued_reply`` is formatted with
-    the job's 1-based queue ``position``. ``prompt_prefix`` is prepended only to the
-    agent-facing prompt (forward/reply header) — topic auto-naming still uses the
-    owner's own ``text``.
+    The message-bound dispatch tail: it owns everything that needs a
+    :class:`~telegram.Message` — the topic title, the follow-up acknowledgement,
+    and the queued-turn reply. Resolving the session and building the job is
+    :func:`_resolve_turn_job`; :func:`start_prompt` is the same path for a caller
+    with no message.
+
+    ``thread_id`` is explicit because a General message has already been rehomed
+    into a freshly created topic by the time it gets here; ``queued_reply`` is
+    formatted with the job's 1-based queue ``position``. ``prompt_prefix`` is
+    prepended only to the agent-facing prompt (forward/reply header) — topic
+    auto-naming still uses the owner's own ``text``.
     """
-    router: Router = context.application.bot_data["router"]
     turns: TurnRegistry = context.application.bot_data["turns"]
     chat_id = message.chat_id
 
-    try:
-        ref = TopicRef(
-            chat_id=chat_id,
-            thread_id=thread_id,
-            title=_topic_title(message, thread_id),
-        )
-        resolved = await router.resolve(ref)
-        await _auto_name_topic(
-            context.bot,
-            router,
-            ref,
-            resolved.context_name,
-            text,
-            has_files=bool(files),
-        )
-    except Exception as exc:
-        # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
-        logger.exception("failed to resolve session")
-        await _notify_error(context.bot, chat_id, thread_id, exc)
-        return
-
-    job = TurnJob(
-        prompt=f"{prompt_prefix}{text}" if prompt_prefix else text,
-        session_id=resolved.session_id,
-        directory=resolved.directory,
-        provider=resolved.provider,
-        model=resolved.model,
-        effort=resolved.effort,
-        allowed_dirs=[resolved.directory, *resolved.additional_directories],
+    job = await _resolve_turn_job(
+        context,
+        chat_id,
+        thread_id,
+        text,
+        title=_topic_title(message, thread_id),
         files=files,
-        allowed_tools=resolved.allowed_tools,
-        additional_directories=resolved.additional_directories,
-        mcp=resolved.mcp,
+        prompt_prefix=prompt_prefix,
     )
+    if job is None:
+        return
 
     # A message that lands while a turn is still streaming can't fire a second
     # prompt at the same session — one turn per topic (ADR-0009). Two paths, both
@@ -488,6 +469,82 @@ async def _submit_turn(
         return
 
     _start_turn(context, chat_id, thread_id, job)
+
+
+async def _resolve_turn_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: int | None,
+    text: str,
+    *,
+    title: str,
+    files: list[PromptFile] | None = None,
+    prompt_prefix: str = "",
+) -> TurnJob | None:
+    """Resolve the topic's session, auto-name the topic if it still needs one, and
+    package everything a turn needs. ``None`` (with a notice already posted in the
+    topic) if the session couldn't be resolved at all — OpenCode down, and so on.
+
+    Split out of :func:`_submit_turn` so a caller with no originating message can
+    build the same job: the queue/follow-up decision above needs the job in hand
+    before it can choose, so it can't simply delegate to :func:`start_prompt`.
+    ``prompt_prefix`` is prepended only to the agent-facing prompt (the
+    forward/reply header) — auto-naming still uses the owner's own ``text``.
+    """
+    router: Router = context.application.bot_data["router"]
+    files = files or []
+    try:
+        ref = TopicRef(chat_id=chat_id, thread_id=thread_id, title=title)
+        resolved = await router.resolve(ref)
+        await _auto_name_topic(
+            context.bot,
+            router,
+            ref,
+            resolved.context_name,
+            text,
+            has_files=bool(files),
+        )
+    except Exception as exc:
+        # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
+        logger.exception("failed to resolve session")
+        await _notify_error(context.bot, chat_id, thread_id, exc)
+        return None
+
+    return TurnJob(
+        prompt=f"{prompt_prefix}{text}" if prompt_prefix else text,
+        session_id=resolved.session_id,
+        directory=resolved.directory,
+        provider=resolved.provider,
+        model=resolved.model,
+        effort=resolved.effort,
+        allowed_dirs=[resolved.directory, *resolved.additional_directories],
+        files=files,
+        allowed_tools=resolved.allowed_tools,
+        additional_directories=resolved.additional_directories,
+        mcp=resolved.mcp,
+    )
+
+
+async def start_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: int | None,
+    prompt: str,
+    *,
+    title: str,
+) -> bool:
+    """Run ``prompt`` as a turn in an existing topic, with no originating message.
+
+    The message-free half of :func:`_submit_turn`, for a caller that has no
+    :class:`~telegram.Message` to build one from. It deliberately has no queue
+    branch: such a caller targets a *brand-new* topic, so it can never collide
+    with a turn already running there. Returns whether the turn started.
+    """
+    job = await _resolve_turn_job(context, chat_id, thread_id, prompt, title=title)
+    if job is None:
+        return False
+    _start_turn(context, chat_id, thread_id, job)
+    return True
 
 
 def _start_turn(
@@ -590,18 +647,28 @@ def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str 
     return None
 
 
-async def _open_context_topic(
-    message: Any, bot: Any, router: Router, name: str, *, prompt: str = ""
-) -> int | None:
+class TopicOpenError(Exception):
+    """A new topic couldn't be created or bound. The message is owner-facing —
+    :func:`open_topic_in_context` has already rolled back, so the caller only has
+    to deliver it wherever it has somewhere to write."""
+
+
+async def open_topic_in_context(
+    bot: Any, router: Router, chat_id: int, name: str, *, prompt: str = ""
+) -> tuple[int, str]:
     """Create a fresh forum topic bound to context ``name``, start its session,
-    greet inside it, and reply with a one-tap link. Shared by ``/context <name>``
-    and ``/new``. Returns the new topic's thread id, or ``None`` when it couldn't
-    be opened — the caller runs ``prompt`` there (see :func:`_submit_turn`).
+    and greet inside it. Returns ``(thread_id, topic_name)``; raises
+    :class:`TopicOpenError` if the topic couldn't be opened.
+
+    Takes no originating :class:`~telegram.Message`, so a caller that has none
+    can open a topic too. The ``/context`` / ``/new`` wrapper below wants to own
+    its own reply anyway, so the "Opened …" reply and the one-tap deep-link
+    button live there rather than here.
 
     One context per topic for life — we never rebind an existing topic, so a
     topic's session always remembers its own history. The Bot API can't move the
-    user's view, so we create the topic, greet it, and hand back a deep link to
-    tap. Requires a forum supergroup with the bot an admin holding "Manage
+    user's view, so we create the topic and greet it; the caller hands back a deep
+    link to tap. Requires a forum supergroup with the bot an admin holding "Manage
     Topics"; duplicate topic names are fine (many topics may share one context).
 
     With a ``prompt`` the topic is named after it (``context: prompt``, as a
@@ -611,41 +678,57 @@ async def _open_context_topic(
     ctx = router.contexts.contexts[name]
     topic_name = _topic_name(name, prompt) if prompt else name
     try:
-        topic = await bot.create_forum_topic(chat_id=message.chat_id, name=topic_name)
+        topic = await bot.create_forum_topic(chat_id=chat_id, name=topic_name)
     except Exception as exc:
         logger.exception("failed to create forum topic")
-        await message.reply_text(
+        raise TopicOpenError(
             f"⚠️ Couldn't create a topic for {name!r}: {exc}\n"
             "This chat must be a forum supergroup and the bot an admin with "
             "the 'Manage Topics' permission."
-        )
-        return None
+        ) from exc
 
     new_thread_id = topic.message_thread_id
     try:
         await router.create_topic_session(
-            message.chat_id, new_thread_id, topic_name, name, auto_named=bool(prompt)
+            chat_id, new_thread_id, topic_name, name, auto_named=bool(prompt)
         )
     except Exception as exc:
         logger.exception("failed to start session for new topic")
         # Roll back the just-created topic: an unbound topic would silently route
         # to default_context, not the one we meant. Best-effort delete.
         try:
-            await bot.delete_forum_topic(chat_id=message.chat_id, message_thread_id=new_thread_id)
+            await bot.delete_forum_topic(chat_id=chat_id, message_thread_id=new_thread_id)
         except Exception:
             logger.debug("failed to delete orphan topic after session failure", exc_info=True)
-        await message.reply_text(f"⚠️ Couldn't start a session for {name!r}: {exc}")
-        return None
+        raise TopicOpenError(f"⚠️ Couldn't start a session for {name!r}: {exc}") from exc
 
-    # Greet inside the new topic so it isn't empty, then hand back a one-tap link
-    # in the originating chat/topic as an inline URL button. With a prompt the
-    # turn lands right below the header, so don't ask for a message.
+    # Greet inside the new topic so it isn't empty. With a prompt the turn lands
+    # right below the header, so don't ask for a message.
     header = f"🗂 Context {name} — {ctx.directory}"
     await bot.send_message(
-        chat_id=message.chat_id,
+        chat_id=chat_id,
         text=header if prompt else f"{header}\nSend a message to start.",
         message_thread_id=new_thread_id,
     )
+    return new_thread_id, topic_name
+
+
+async def _open_context_topic(
+    message: Any, bot: Any, router: Router, name: str, *, prompt: str = ""
+) -> int | None:
+    """``/context <name>`` / ``/new``'s wrapper around
+    :func:`open_topic_in_context`: open the topic, then reply in the originating
+    chat/topic with a one-tap link to it. Returns the new topic's thread id, or
+    ``None`` when it couldn't be opened — the caller runs ``prompt`` there (see
+    :func:`_submit_turn`)."""
+    try:
+        new_thread_id, topic_name = await open_topic_in_context(
+            bot, router, message.chat_id, name, prompt=prompt
+        )
+    except TopicOpenError as exc:
+        await message.reply_text(str(exc))
+        return None
+
     opened = f"Opened {topic_name}." if prompt else f"Opened a new {name} topic."
     link = _topic_link(message.chat_id, new_thread_id, bot_id=bot.id)
     if link:
