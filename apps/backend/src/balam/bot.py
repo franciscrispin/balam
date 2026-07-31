@@ -601,6 +601,7 @@ def _start_turn(
                 follow_ups=follow_ups,
                 tool_stream=config.tool_stream if config is not None else "collapsed",
                 rich_messages=config.rich_messages if config is not None else False,
+                unattended=job.unattended,
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.

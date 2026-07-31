@@ -2178,3 +2178,108 @@ async def test_stream_reply_background_notice_replaces_the_empty_fallback() -> N
     assert "1 background task was still running" in final
     assert "Start dev server" in final
     assert "without producing any text" not in final
+
+
+# --- unattended turns: a scheduled run has nobody to ask (ADR-0016) -----------
+
+
+async def test_unattended_denies_instead_of_showing_a_keyboard() -> None:
+    # The wedge this prevents: the keyboard has no timeout, so at 07:30 the turn
+    # would park forever holding the topic's running slot.
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part("c1", "bash", {"status": "running", "input": {"command": "rm -rf /"}}),
+            _permission("per_1", "c1", category="bash"),
+            "WAIT_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=OpenCodeBackend(oc),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="x",
+        directory="/work/proj",
+        pending=pending,
+        allowed_dirs=["/work/proj"],
+        draft_interval=0.01,
+        unattended=True,
+    )
+    # Refused outright, and the agent is told why so it can finish the turn.
+    assert len(oc.replies) == 1
+    request_id, reply, message = oc.replies[0]
+    assert (request_id, reply) == ("per_1", "reject")
+    assert "scheduled" in (message or "")
+    assert bot.keyboards == []
+    # And the owner can read in the morning what it wanted.
+    assert any("🚫" in text and "bash" in text.lower() for text in bot.messages)
+
+
+async def test_unattended_still_auto_allows_an_in_workspace_read() -> None:
+    # The Chaska brief's behaviour, preserved exactly.
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _tool_part(
+                "c1", "read", {"status": "running", "input": {"filePath": "/work/proj/a.py"}}
+            ),
+            _permission("per_1", "c1", category="read"),
+            "WAIT_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=OpenCodeBackend(oc),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="x",
+        directory="/work/proj",
+        pending=pending,
+        allowed_dirs=["/work/proj"],
+        draft_interval=0.01,
+        unattended=True,
+    )
+    assert oc.replies == [("per_1", "once", None)]
+    assert bot.keyboards == []
+    assert not any("🚫" in text for text in bot.messages)
+
+
+async def test_unattended_rejects_a_question_instead_of_awaiting_an_answer() -> None:
+    # asyncio.gather over the question futures has no timeout either.
+    pending_questions = PendingQuestions()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _question("q_1"),
+            "WAIT_QUESTION_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=OpenCodeBackend(oc),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="x",
+        directory="/work/proj",
+        pending=PendingApprovals(),
+        pending_questions=pending_questions,
+        allowed_dirs=["/work/proj"],
+        draft_interval=0.01,
+        unattended=True,
+    )
+    assert oc.question_rejections == ["q_1"]
+    assert oc.question_replies == []
+    assert bot.keyboards == []
+    assert any("🚫" in text and "question" in text for text in bot.messages)

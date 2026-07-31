@@ -903,6 +903,7 @@ async def stream_reply(
     draft_interval: float = DRAFT_INTERVAL_S,
     tool_stream: str = "collapsed",
     rich_messages: bool = False,
+    unattended: bool = False,
 ) -> None:
     """Run one turn through ``backend`` and stream its reply into the topic.
 
@@ -939,6 +940,13 @@ async def stream_reply(
     calls into one summary line with the per-call detail in an expandable
     blockquote (see :func:`_render_tool_group`); ``"full"`` keeps the legacy
     one-line-per-call stream.
+
+    ``unattended`` marks a turn nobody started by hand — a scheduled run
+    (ADR-0016). Approval keyboards and question keyboards both await a tap that
+    will never come, and neither has a timeout, so an unattended turn asks for
+    neither: :func:`balam.approvals.decide` denies anything past an in-workspace
+    read, questions are rejected, and each block is posted into the topic so the
+    owner can see in the morning what the agent wanted.
 
     ``todowrite`` calls are excluded from both modes: the agent's to-do list
     renders as its own live **checklist message** (``📋 Progress`` with one
@@ -1125,6 +1133,24 @@ async def stream_reply(
         else:
             await backend.reply_permission(request_id, allow=True, directory=directory)
 
+    async def note_unattended_block(detail: str) -> None:
+        """Post what a scheduled run refused, as a line in the topic.
+
+        The owner reads the topic hours later, so a silent denial would look like
+        the agent simply chose not to do the thing. Best-effort, like every other
+        progress line — a failed send must not break the turn."""
+        # The notice lands below the progress stream: seal the tool group.
+        close_open_group()
+        try:
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=f"🚫 {detail} — scheduled run, nobody to approve.",
+                **topic_kwargs,
+            )
+            note_sent(getattr(msg, "message_id", None))
+        except Exception:
+            logger.debug("failed to post unattended-block notice", exc_info=True)
+
     async def handle_permission(request: PermissionRequested) -> None:
         cwd = dirs[0] if dirs else None
         # Classify by the permission category; take edit targets from the request
@@ -1135,13 +1161,36 @@ async def stream_reply(
             paths,
             allowed_dirs=dirs,
             accept_all_edits=pending.is_accept_all_edits(sid or "") if pending else False,
+            unattended=unattended,
         )
         if verdict is Verdict.ALLOW:
             await backend.reply_permission(request.request_id, allow=True, directory=directory)
             return
+        if verdict is Verdict.DENY:
+            # Unattended only (ADR-0016): refuse rather than park the turn on a
+            # keyboard nobody will tap. The agent gets a refusal it can reason
+            # about and still finish, instead of hanging and wedging the topic.
+            await backend.reply_permission(
+                request.request_id,
+                allow=False,
+                directory=directory,
+                message=(
+                    "Denied: this is a scheduled, unattended run. Only reads inside the "
+                    "workspace are allowed. Report what you needed instead of retrying."
+                ),
+            )
+            await note_unattended_block(f"denied {request.tool}")
+            return
         await request_approval(request.request_id, request.category, request.tool, request.input)
 
     async def request_questions(request: QuestionAsked) -> None:
+        if unattended:
+            # Same wedge as an unattended approval: the question keyboard awaits a
+            # tap that will never come, and gather() has no timeout. Reject it so
+            # the turn finishes, and say so in the topic (ADR-0016).
+            await note_unattended_block("skipped a question")
+            await backend.reject_question(request.request_id, directory=directory)
+            return
         if pending_questions is None:
             await backend.reject_question(request.request_id, directory=directory)
             return

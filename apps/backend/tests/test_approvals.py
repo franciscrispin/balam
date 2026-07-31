@@ -124,6 +124,67 @@ def test_unknown_category_asks() -> None:
     assert decide("webfetch", [], allowed_dirs=DIRS, accept_all_edits=True) is Verdict.ASK
 
 
+# --- decide(unattended=True): a scheduled run has nobody to ask (ADR-0016) ----
+
+
+def test_unattended_still_allows_reads_in_workspace() -> None:
+    # The one thing a scheduled run keeps: this is what the Chaska brief does.
+    v = decide(
+        "read", ["/work/proj/a.py"], allowed_dirs=DIRS, accept_all_edits=False, unattended=True
+    )
+    assert v is Verdict.ALLOW
+
+
+def test_unattended_denies_read_outside_workspace() -> None:
+    v = decide("read", ["/etc/hosts"], allowed_dirs=DIRS, accept_all_edits=False, unattended=True)
+    assert v is Verdict.DENY
+
+
+def test_unattended_denies_read_without_a_resolvable_path() -> None:
+    assert decide("read", [], allowed_dirs=DIRS, accept_all_edits=False, unattended=True) is (
+        Verdict.DENY
+    )
+
+
+def test_unattended_denies_bash() -> None:
+    assert decide("bash", [], allowed_dirs=DIRS, accept_all_edits=True, unattended=True) is (
+        Verdict.DENY
+    )
+
+
+def test_unattended_denies_edit_even_in_workspace() -> None:
+    v = decide(
+        "edit", ["/work/proj/a.py"], allowed_dirs=DIRS, accept_all_edits=False, unattended=True
+    )
+    assert v is Verdict.DENY
+
+
+def test_unattended_denies_edit_even_with_accept_all_edits() -> None:
+    # "Accept all edits" is a choice a human made for a session they were
+    # watching; it must not carry into a turn nobody started.
+    v = decide(
+        "edit", ["/work/proj/a.py"], allowed_dirs=DIRS, accept_all_edits=True, unattended=True
+    )
+    assert v is Verdict.DENY
+
+
+def test_attended_is_the_default_and_never_denies() -> None:
+    # Every attended outcome is unchanged: DENY exists only for unattended turns.
+    cases = [
+        ("read", ["/work/proj/a.py"], False),
+        ("read", ["/etc/hosts"], False),
+        ("edit", ["/work/proj/a.py"], True),
+        ("edit", [], True),
+        ("bash", [], True),
+        ("webfetch", [], False),
+    ]
+    for category, paths, accept_all in cases:
+        assert (
+            decide(category, paths, allowed_dirs=DIRS, accept_all_edits=accept_all)
+            is not Verdict.DENY
+        )
+
+
 # --- request_target_paths: pull paths from the permission request -------------
 
 

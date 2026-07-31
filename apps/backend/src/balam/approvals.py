@@ -21,6 +21,11 @@ unknown categories — prompts. The *opt-in* half (translating ``allowed_tools``
 ``additional_directories`` into native OpenCode ``allow`` rules) lives in
 :mod:`balam.permissions`; tools pre-approved there never reach this layer. Human
 approval is the backstop for everything else.
+
+That backstop assumes a human. A **scheduled** turn (ADR-0016) has none, and the
+prompt has no timeout, so :func:`decide` takes an ``unattended`` flag that turns
+every would-be prompt into a hard :attr:`Verdict.DENY` instead of a wait nobody
+will ever end.
 """
 
 from __future__ import annotations
@@ -83,6 +88,7 @@ class Verdict(Enum):
 
     ALLOW = "allow"  # auto-approve without asking (reply "once")
     ASK = "ask"  # prompt the user with an inline keyboard
+    DENY = "deny"  # refuse outright — nobody is watching to be asked (ADR-0016)
 
 
 def _resolve(path: str, cwd: str | None) -> str:
@@ -137,6 +143,7 @@ def decide(
     *,
     allowed_dirs: list[str],
     accept_all_edits: bool,
+    unattended: bool = False,
 ) -> Verdict:
     """The directory-boundary policy, keyed on OpenCode's permission *category*.
 
@@ -145,21 +152,36 @@ def decide(
     target is in-workspace (one out-of-scope path still asks); Bash, network, and
     everything else always asks. ``target_paths`` are the absolute paths the
     request touches (see :func:`request_target_paths`).
+
+    ``unattended`` marks a turn no human started — a scheduled run at 07:30
+    (ADR-0016). There is nobody to tap the keyboard, and the prompt has no
+    timeout, so every :attr:`Verdict.ASK` would park the turn forever and wedge
+    the topic behind it. Such a turn keeps the in-workspace read and gets
+    :attr:`Verdict.DENY` for everything else: the agent receives a refusal it can
+    reason about and still finish, and the owner can read what it wanted and
+    re-run it by hand.
     """
+    #: A request we would normally hand to the user. With nobody watching, the
+    #: only safe answer is "no" — see the ``unattended`` note above.
+    blocked = Verdict.DENY if unattended else Verdict.ASK
+    in_workspace = bool(target_paths) and all(is_within(p, allowed_dirs) for p in target_paths)
+
     if category in READ_CATEGORIES:
-        if target_paths and all(is_within(p, allowed_dirs) for p in target_paths):
+        if in_workspace:
             return Verdict.ALLOW
-        return Verdict.ASK
+        return blocked
 
     if category == EDIT_CATEGORY:
+        # Never auto-allow an edit unattended, even in-workspace: "accept all
+        # edits" is a choice a human made for a session they were watching.
+        if unattended:
+            return Verdict.DENY
         if not accept_all_edits:
             return Verdict.ASK
-        if target_paths and all(is_within(p, allowed_dirs) for p in target_paths):
-            return Verdict.ALLOW
-        return Verdict.ASK
+        return Verdict.ALLOW if in_workspace else Verdict.ASK
 
     # Bash, network, subagents, unknown/MCP categories: always ask.
-    return Verdict.ASK
+    return blocked
 
 
 class Choice(StrEnum):
