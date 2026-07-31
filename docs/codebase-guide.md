@@ -106,12 +106,22 @@ roughly this sequence:
 
 10. **`turns.py`** — `TurnRegistry`: one in-flight turn per topic, so `/cancel`
     can abort it (local task + server-side abort) and `/status` can report it.
+    `TurnJob.unattended` marks a turn nobody started by hand (ADR-0016).
 
-11. **`markdown.py`** — GFM (what the agent emits) → Telegram MarkdownV2 (a
+11. **`schedules.py`** *(timers, ADR-0016)* — saved `(when, context, prompt)`
+    triples that run themselves. Owns the `<when>` parser, PTB `JobQueue`
+    registration (`schedule:<id>` job names), the fire path (open a topic →
+    `start_prompt(..., unattended=True)`), and the boot catch-up for runs missed
+    while Balam was down. `bot.py` holds only the `/schedule` command surface.
+    Two traps live here: PTB's `run_daily` numbers weekdays **Sunday=0** while we
+    store Python's `Mon=0`, and every time resolves against `BALAM_TIMEZONE`, not
+    the VM's UTC clock.
+
+12. **`markdown.py`** — GFM (what the agent emits) → Telegram MarkdownV2 (a
     stricter, aggressively-escaped dialect) via `mistune`, then chunked to ≤4096
     chars at code-block-aware boundaries.
 
-12. **`telegram_utils.py`** — tiny helper: `thread_kwargs` builds the
+13. **`telegram_utils.py`** — tiny helper: `thread_kwargs` builds the
     `message_thread_id` kwarg that routes a send to the right forum topic.
 
 ## Features → where to look
@@ -124,10 +134,12 @@ roughly this sequence:
 | Interactive tool approval (buttons) | `approvals.py` + `streamer.py:request_approval` + `bot.py:_handle_approval_callback` |
 | Workspace contexts | `contexts.py`, `config.yaml` (`config.example.yaml`) |
 | Topic ↔ session mapping | `router.py` + `store.py` |
-| Slash commands `/new /context /status /cancel` | `bot.py` (`_handle_*`, `BOT_COMMANDS`, `register_commands`) |
+| Slash commands `/new /context /status /cancel /schedule` | `bot.py` (`_handle_*`, `BOT_COMMANDS`, `register_commands`) |
 | Cancel a running turn | `bot.py:_handle_cancel` + `turns.py` + `opencode.abort_session` |
 | Trust boundary / allowlist | `config.py` + `bot.py:build_application` (filters) |
 | OpenCode HTTP/SSE | `opencode.py` |
+| Scheduled tasks (`/schedule`, ADR-0016) | `schedules.py` + `bot.py:_handle_schedule` + `store.py` (`schedules` table) + `app.py:_start_schedules` |
+| Unattended (scheduled) turn policy | `approvals.py:decide(unattended=)` → `Verdict.DENY` + `streamer.py:note_unattended_block` |
 | Live browser view (`/browser`, ADR-0006) | `vnc.py` (WS↔TCP bridge) + `server.py` (`/api/vnc/ws`, `/api/browser/status`) + `browser-view.tsx` |
 
 ## Running it

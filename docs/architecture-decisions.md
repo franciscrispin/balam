@@ -708,6 +708,83 @@ kills it immediately. That is the whole mechanism.
 
 ---
 
+## ADR-0016: Scheduled prompts are stored, not configured
+
+Status: Accepted Date: 2026-07-31
+
+### Context
+
+One prompt already runs on a timer: the Chaska daily brief, from a cron script
+outside this repo. It reaches into Balam's `.env` for the bot token, hand-writes
+a `topic_sessions` row to bind a topic, re-implements `_open_context_topic`
+badly (no rollback when the bind fails) and `markdown.py` worse (a `sed` turning
+`**x**` into `<b>x</b>`). It works, and it pins Balam's schema from a file no
+test covers.
+
+The machinery to do this properly now exists. `_open_context_topic` creates the
+topic, binds it, and rolls the topic back if the bind fails. `_start_turn` runs a
+turn from a plain `(chat_id, thread_id, TurnJob)` — it takes no `Message`. So a
+schedule is `/new <context> <prompt>` on a timer, and the work is mostly wiring.
+
+Two things are not wiring. A turn that starts at 07:30 has **nobody watching**,
+and neither the approval keyboard nor the question keyboard has a timeout. And
+PTB's `JobQueue` is **in memory**, so unlike cron it does not survive a restart.
+
+### Decision
+
+**Schedules are user data in SQLite, driven by `/schedule`** — not `config.yaml`
+entries. Contexts stay in `config.yaml` (ADR-0012) because a directory and a tool
+policy are infrastructure. A schedule is created, listed and cancelled from the
+phone and edited far more often; putting it in `config.yaml` would mean an SSH
+session to stop a 7am message.
+
+- A schedule is a saved `(when, context, prompt)` triple. When it fires it opens
+  a **fresh forum topic** bound to that context and runs the prompt there. One
+  topic per fire keeps each run's history separate — ADR-0009's reasoning
+  applied to time.
+- `when` covers `daily HH:MM`, `weekdays HH:MM`, and `<weekday> HH:MM`. All three
+  are exactly what PTB's `run_daily` takes, so v1 has no cron parser and no
+  APScheduler surface of its own. Raw cron expressions are a later extension via
+  `run_custom`.
+- Times resolve against a required-with-default **`BALAM_TIMEZONE`**, validated
+  at boot. The VM runs UTC and the owner does not; "07:30" meaning 07:30 UTC
+  would be a bug generator.
+
+**An unattended turn denies anything past an in-workspace read.** `Verdict` gains
+`DENY`, and `decide()` takes `unattended`. Reads inside the workspace still
+auto-allow; everything else is refused with a reason the agent can reason about,
+and the refusal is posted in the topic so the owner can read what it wanted and
+re-run it by hand. Questions are rejected the same way. `unattended` is a
+property of the **turn**, not the topic — the owner's reply in the morning's
+topic is attended and gets the normal keyboard.
+
+**Missed runs catch up within a bounded window.** At boot, after re-registering
+every timer, each enabled schedule's most recent due time is computed; if it is
+past, later than `last_run_at`, and within six hours, it runs now and says in the
+topic that it is late. The window is what stops a VM that was off for a week from
+producing seven topics at boot. `last_run_at` is stamped when the run **starts**,
+not when its turn ends, so a crash mid-turn cannot re-fire the whole thing.
+
+### Consequences
+
+- **A second, timer-driven entry point to the agent now exists.** It is
+  *internal* — no new external surface, and ADR-0008's Telegram gate still
+  governs everything a human sends — but it is the first path that starts a turn
+  with no human in the loop. That is exactly what the unattended policy above
+  constrains.
+- **cron survived Balam being down; this does not.** Catch-up narrows the gap to
+  "Balam was down across the due time *and* stayed down more than six hours".
+  That is the accepted cost of deleting the cron script.
+- **`bot.py` grew again.** The `/schedule` handlers land there, on top of the
+  file that is already tech-debt item #1. The store, the parser and the fire path
+  live in a new `schedules.py`; only the command surface is in `bot.py`, and it
+  should move with the rest in the planned `commands/` split.
+- **`/delete` and `/schedule cancel` share one picker.** `PendingDeletions`
+  became `PendingPicks`, a paged multi-select over `(id, label)` pairs, rather
+  than growing a second picker idiom.
+
+---
+
 ## Summary
 
 | ADR  | Decision                                                                    | Core reason                                                     |
@@ -726,3 +803,4 @@ kills it immediately. That is the whole mechanism.
 | 0013 | Expose only the Mini App via an authenticated Cloudflare tunnel (amends 0007) | Mini App needs a public HTTPS origin; `initData` is the boundary |
 | 0014 | Pluggable agent backend (OpenCode or the Claude Agent SDK) via `AGENT_BACKEND` | One seam, normalized events; SDK = Claude models + per-turn config |
 | 0015 | Hold an SDK turn open while its background work runs (amends 0014)          | Closing stdin kills background tasks; holding also delivers their report |
+| 0016 | Scheduled prompts are stored in SQLite (`/schedule`), not `config.yaml`     | Schedules are user data; unattended turns deny, missed runs catch up |

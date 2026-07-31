@@ -20,16 +20,23 @@ leverage (impact × how often the area changes), not by severity alone._
 
 One file holds: the message handler, **every** slash-command handler (`/context`,
 `/new`, `/status`, `/model`, `/effort`, `/rename`, `/diff`, `/browser`,
-`/cancel`, `/delete`), all inline-keyboard callback handlers (approvals,
-questions, delete paging/confirm), topic naming, keyboard construction, cleanup
-scheduling, and `build_application`. It is both the largest and most-changed
-file, so almost every feature edit lands here and the merge/reasoning surface is
-huge.
+`/cancel`, `/delete`, `/schedule`), all inline-keyboard callback handlers
+(approvals, questions, and both pickers' paging/confirm), topic naming, keyboard
+construction, cleanup scheduling, and `build_application`. It is both the largest
+and most-changed file, so almost every feature edit lands here and the
+merge/reasoning surface is huge.
 
 **Direction:** split by concern — e.g. `commands/` (one module per command
 group), `callbacks.py` (inline-keyboard routing), `topics.py` (naming/rename/
 create). `build_application` becomes a thin registrar. This is the single
 highest-value refactor.
+
+**Since this snapshot:** `/schedule` (ADR-0016) added its command surface and
+four callback handlers here, so the file is now past 2,100 lines. The feature
+kept its store, parser and fire path out in `schedules.py`, and the message-free
+seam it needed (`open_topic_in_context`, `start_prompt`) is exactly the `topics.py`
+extraction above, done in place — so the `commands/` split has less to untangle
+than it would have, but more lines to move.
 
 ### 2. `streamer.py` is the second god module (1,336 lines, 44 functions, 23 commits — #2 churn)
 
