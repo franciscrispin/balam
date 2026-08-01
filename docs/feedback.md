@@ -8,6 +8,45 @@ Status legend: 🔴 open · 🟡 in progress · 🟢 done
 
 ---
 
+## 2026-08-01 — the chaska cron brief cannot be retired yet
+
+**Status:** 🔴 open — blocked, not forgotten.
+
+Step 10 of `scheduled-tasks-plan.md` retires the cron daily brief once
+`/schedule daily 07:30 chaska plan my day` has run cleanly for a few days. That
+precondition is currently impossible to meet, and the reason is worth writing
+down before someone tries again:
+
+- The live `apps/backend/balam.sqlite` is at **schema v2**. `/schedule` needs
+  **v3** and its `schedules` table does not exist yet, because the running
+  process booted 2026-07-28, before the feature merged.
+- So `/schedule` has never fired in production even once. Deleting the crontab
+  entry now would leave the brief with no mechanism at all — the silent,
+  invisible failure the plan itself warns is the worst property a scheduled job
+  can have.
+
+**Sequence to actually do it:**
+
+1. Restart Balam (this also deploys the refactor). The v3 migration runs at boot
+   and creates the `schedules` table.
+2. Send `/schedule daily 07:30 chaska plan my day` and confirm the row lands.
+3. Let it fire for a few mornings **alongside** the cron entry, and compare.
+4. Then `crontab -r`, delete `personal/chaska/scripts/daily-brief.sh`, and update
+   `personal/chaska/CLAUDE.md`.
+
+**Two gaps to close before step 4**, both things the cron script does that
+`/schedule` does not:
+
+- It archives each brief to `~/.chaska/briefs/<date>.md` with 90-day retention.
+  Nothing in the `/schedule` path writes that file, so the archive stops growing
+  the day the script goes. Either fold the write into the prompt or accept losing
+  it deliberately.
+- It pins an explicit read-only tool allowlist on the headless run. `/schedule`'s
+  unattended mode (ADR-0016 §6) denies anything needing approval, which is
+  arguably stronger — worth confirming rather than assuming.
+
+---
+
 ## 2026-06-21 — `/delete` topic picker caps at 90 with no pagination
 
 **Status:** 🟢 done — fixed via real pagination (no cap). `list_topics` now orders

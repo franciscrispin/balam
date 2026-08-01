@@ -16,9 +16,9 @@
 >   became `PendingPicks`, a paged multi-select over `(id, label)` pairs that both
 >   commands share, which is what §5 was asking for.
 
-Concrete plan for the **scheduled tasks** feature deferred as Tier 3 in
-[core feature recommendations](./balam-core-feature-recommendations.md)
-("*whole workflow; not core to interactive use yet*").
+Concrete plan for the **scheduled tasks** feature, originally deferred as Tier 3
+in the core feature recommendations ("*whole workflow; not core to interactive
+use yet*") — that roadmap has since been retired, every tier having shipped.
 
 A schedule is a saved `(when, context, prompt)` triple. When it fires, Balam opens
 a fresh forum topic bound to that context and runs the prompt in it — the same
@@ -328,7 +328,6 @@ Follow `tests/` conventions (`pytest-asyncio`, fake bot objects as in
   that starts a turn with no human in the loop, and that is what §6 constrains.
 - `codebase-guide.md` — add `schedules.py` to the module list and a
   "Scheduled tasks" row to the features table.
-- `balam-core-feature-recommendations.md` — move scheduling out of Tier 3.
 - ~~`tech-debt.md`~~ — done, and the inventory has since been retired: the
   `commands/` split took the `/schedule` handlers out of `bot.py`.
 
