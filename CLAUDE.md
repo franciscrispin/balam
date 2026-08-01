@@ -4,9 +4,10 @@ Guidance for Claude Code when working in this repository.
 
 ## What Balam is
 
-A Telegram bot backed by the [OpenCode](https://opencode.ai) coding agent, plus
-a Telegram Mini App for richer views (git diffs, markdown, a live view of the
-agent's Chrome). Runs locally on an Ubuntu VM for **one** user.
+A Telegram bot fronting a coding agent — [OpenCode](https://opencode.ai) or the
+Claude Agent SDK, selected by `AGENT_BACKEND` — plus a Telegram Mini App for
+richer views (git diffs, markdown, a live view of the agent's Chrome). Runs
+locally on an Ubuntu VM for **one** user.
 
 **Read `docs/architecture-decisions.md` first** — the ADRs are the authoritative
 design and the reasons behind the choices summarized here. Load-bearing:
@@ -55,6 +56,14 @@ backend's FastAPI OpenAPI schema, from which frontend types are generated.
 | `bun run build`     | Build the Mini App                       |
 | `bun run typecheck` | Type-check `packages/*` + the frontend   |
 | `bun run lint`      | Biome lint/format (`lint:fix` autofixes) |
+| `bun run test`      | Frontend tests (`bun test`)              |
+| `bun run gen:api`   | Regenerate `packages/shared/src/api.ts`  |
+
+**CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every PR:
+backend (`ruff check`, `ruff format --check`, `pytest`), frontend (`typecheck`,
+`lint`, `test`), and an **API drift check** — it regenerates `api.ts` and fails
+if the committed file differs. Change a `server.py` route and you must run
+`bun run gen:api` and commit the result.
 
 Tooling gotchas:
 
@@ -62,6 +71,12 @@ Tooling gotchas:
   `asyncio_mode = auto` (so `async def test_*` just works). The OpenCode client
   is hand-written over `httpx` (ADR-0002/0011) — no TypeScript SDK in the
   backend. GFM→Telegram-MarkdownV2 uses `mistune`.
+- **Tests are isolated from the environment on purpose.** `Config` is a
+  pydantic-settings model, so it reads real environment variables *ahead of*
+  `.env` — and Balam runs under systemd with its whole deployment environment
+  exported. An autouse fixture in `conftest.py` strips any variable matching a
+  `Config` field and neutralizes `.env`. Do not remove it: without it five tests
+  fail only on the deployment machine, and pass everywhere else.
 - **Frontend:** Biome (2-space, width 100, double quotes); TypeScript `strict`
   with `verbatimModuleSyntax`, so type-only imports **must** use `import type`.
 - Frontend dev server is pinned to port **5180** (`strictPort`); 5173 is taken
@@ -75,9 +90,12 @@ agent:
 ```
 Mini App frontend (apps/frontend, React+Vite, TS) — diff/markdown viewers, live Chrome iframe
         │ HTTP / WebSocket
-Balam backend (apps/backend, Python: FastAPI + python-telegram-bot) — bot, serves Mini App, runs git, proxies noVNC, talks to OpenCode
-        │ HTTP + SSE  (httpx, raw OpenCode HTTP API)
-OpenCode server (separate process, NOT in this repo) — the agent: model + local tools/files + browser-use skill
+Balam backend (apps/backend, Python: FastAPI + python-telegram-bot) — bot, serves Mini App, runs git, proxies noVNC, drives the agent
+        │
+        ├─ AGENT_BACKEND=opencode    → HTTP + SSE (httpx, raw OpenCode API) to a
+        │                              separate OpenCode server, NOT in this repo
+        └─ AGENT_BACKEND=claude_sdk  → the Claude Agent SDK, in-process
+                                       (the agent: model + local tools/files + browser-use skill)
 ```
 
 Backend modules (`apps/backend/src/balam/`) — `docs/codebase-guide.md` has the
@@ -113,15 +131,26 @@ full map; the load-bearing ones:
   `content_store.py` (ephemeral markdown snapshots), `vnc.py` (noVNC bridge,
   ADR-0006), `agent_tools.py` (agent-facing `send_file`).
 
-Telegram specifics (ADR-0009): streaming uses native `send_message_draft`; forum
-topics are addressed by `message_thread_id`. Bot API ref:
+Slash commands (registered in `bot.py`'s `BOT_COMMANDS`, handled in `commands/`):
+`/new` `/rename` `/status` `/model` `/effort` `/cancel` `/context` `/diff`
+`/browser` `/artifacts` `/delete` `/schedule`. Anything *not* in that list falls
+through a catch-all handler and is forwarded verbatim to the agent, so a Claude
+slash command like `/goal` reaches it instead of being dropped.
+
+Telegram specifics (ADR-0009/0010): forum topics are addressed by
+`message_thread_id`. Streaming picks its transport from the chat type, and the
+distinction matters when reading `streamer.py`: native `sendMessageDraft` is
+**private-chat only** (a supergroup is rejected with `Textdraft_peer_invalid`),
+so the live deployment — a forum supergroup — streams by **live-editing one real
+message** instead. Both paths converge on the same finalize, including the check
+that keeps the answer at the bottom of the topic. Bot API ref:
 https://core.telegram.org/bots/api.
 
 **Workspace contexts** (ADR-0012, adapted from open-shrimp). A _context_ bundles
 a working `directory` with optional `model`/`effort`, an `allowed_tools` list, and
-optional `mcp` servers (local stdio or remote http/sse; registered with OpenCode
-before each session — `${VAR}` in values is filled from `.env`), so one bot drives
-several projects. Defined in the **required** `config.yaml`
+optional `mcp` servers (local stdio or remote http/sse; `${VAR}` in values is
+filled from `.env` — registered with OpenCode before each session, or passed to
+the SDK per turn), so one bot drives several projects. Defined in the **required** `config.yaml`
 (see `config.example.yaml`). Each topic binds to one context for its lifetime
 (`default_context` for unbound topics like General). `/context` lists contexts +
 the current binding; `/context <name>` **creates a new topic** bound to `<name>`

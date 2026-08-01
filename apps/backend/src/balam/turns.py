@@ -65,10 +65,9 @@ class TurnJob:
     ``await`` in between, leaving no window for a concurrent message to slip a
     second turn onto the same session.
 
-    Deliberately *not* captured: the plan-agent choice. ``_start_turn`` derives it
-    from the topic's plan-mode flag when the job actually runs, so a message
-    queued behind a turn respects a plan approval or ``/plan off`` that happened
-    while it waited."""
+    Anything that can change while a job waits its turn belongs in
+    :func:`start_turn`, not here — a queued message should act on the topic's
+    state when it *runs*, not when it was typed."""
 
     prompt: str
     #: ``None`` for an SDK topic awaiting its first turn (the id is minted then).
