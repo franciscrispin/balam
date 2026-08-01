@@ -69,7 +69,6 @@ from balam.approvals import (
 )
 from balam.attachments import PromptFile
 from balam.markdown import EXPANDABLE_QUOTE_MARKER, gfm_to_telegram
-from balam.opencode_tools import Tool
 from balam.rich_messages import (
     chunk_rich,
     edit_rich_message,
@@ -78,6 +77,7 @@ from balam.rich_messages import (
     send_rich_message,
 )
 from balam.telegram_utils import thread_kwargs
+from balam.tools import DISPLAY_BY_WIRE, Tool
 
 logger = logging.getLogger(__name__)
 
@@ -88,23 +88,6 @@ DRAFT_INTERVAL_S = 0.5
 #: Mini App later (Tier 2/3); for now we inline-truncate, keeping the tail.
 BASH_OUTPUT_MAX_LINES = 50
 BASH_OUTPUT_MAX_CHARS = 1500
-
-#: OpenCode's lowercase wire tool names → a friendly display label. Unknown
-#: names (e.g. MCP tools) fall through unchanged.
-_TOOL_DISPLAY: dict[str, str] = {
-    Tool.BASH: "Bash",
-    Tool.READ: "Read",
-    Tool.EDIT: "Edit",
-    Tool.WRITE: "Write",
-    Tool.GLOB: "Glob",
-    Tool.GREP: "Grep",
-    Tool.LIST: "LS",
-    Tool.WEBFETCH: "WebFetch",
-    Tool.APPLY_PATCH: "ApplyPatch",
-    Tool.TODOWRITE: "TodoWrite",
-    Tool.TASK: "Task",
-    Tool.AGENT: "Agent",
-}
 
 Renderer = Callable[[str], list[str]]
 
@@ -456,7 +439,7 @@ def _render_tool_part(
                 line += f"\n```\n{body}\n```"
         return line
 
-    display = _TOOL_DISPLAY.get(tool, tool)
+    display = DISPLAY_BY_WIRE.get(tool, tool)
     summary = _tool_summary(tool, tool_input, directory)
     line = f"🔧 {display}"
     if summary:
@@ -608,7 +591,7 @@ def _group_detail_line(tool: str, tool_input: dict[str, Any], directory: str | N
     summary = " ".join(summary.split()).replace("`", "'")
     if len(summary) > 80:
         summary = summary[:79] + "…"
-    display = _TOOL_DISPLAY.get(tool, tool)
+    display = DISPLAY_BY_WIRE.get(tool, tool)
     return f"🔧 {display} `{summary}`" if summary else f"🔧 {display}"
 
 
@@ -661,7 +644,7 @@ def _format_approval_request(
     tools fall back to the generic argument summary — the same vocabulary as the
     inline tool lines so a prompt reads like the stream around it.
     """
-    display = _TOOL_DISPLAY.get(tool, tool)
+    display = DISPLAY_BY_WIRE.get(tool, tool)
     header = f"🔐 Allow **{display}**?"
     if category and category != tool:
         header += f"\nPermission: `{category}`"

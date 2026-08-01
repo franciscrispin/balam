@@ -71,38 +71,12 @@ from balam.agent_tools import AgentTool
 from balam.contexts import ContextConfig
 from balam.mcp_config import parse_mcp_config
 from balam.permissions import build_ruleset, collapse_mcp_name, evaluate
+from balam.tools import CATEGORY_BY_SDK_NAME, WIRE_BY_SDK_NAME
 
 logger = logging.getLogger(__name__)
 
 #: Pushed by the driver's ``finally`` to tell ``run_turn`` the stream is done.
 _SENTINEL = None
-
-#: SDK tool name → OpenCode wire tool name, for display/rendering. Aligns the
-#: streamer's renderer (which special-cases ``bash`` etc. by the OpenCode
-#: vocabulary). Unknown names (MCP tools) fall through unchanged.
-_WIRE_TOOL: dict[str, str] = {
-    "Read": "read",
-    "Bash": "bash",
-    "Edit": "edit",
-    "Write": "write",
-    "MultiEdit": "edit",
-    "NotebookEdit": "edit",
-    "Glob": "glob",
-    "Grep": "grep",
-    "LS": "list",
-    "WebFetch": "webfetch",
-    "WebSearch": "websearch",
-    "Task": "task",
-    "TodoWrite": "todowrite",
-}
-
-#: SDK tool name → Balam permission *category* (what :func:`balam.approvals.decide`
-#: keys on). Derived from ``_WIRE_TOOL``: every file mutation collapses to
-#: ``edit``; unknown tools keep their name so the boundary policy treats them as
-#: "ask".
-_CATEGORY: dict[str, str] = {
-    sdk: "edit" if wire in {"write", "edit"} else wire for sdk, wire in _WIRE_TOOL.items()
-}
 
 
 #: The task-list tool family newer CLI harnesses expose *instead of*
@@ -294,16 +268,25 @@ def _apply_task_result(
 
 
 def _wire_tool(name: str) -> str:
-    return _WIRE_TOOL.get(name, name)
+    """SDK tool name → OpenCode wire name, for display/rendering.
+
+    Aligns with the streamer's renderer, which special-cases ``bash`` etc. by the
+    OpenCode vocabulary. Unknown names (MCP tools) fall through unchanged.
+    """
+    return WIRE_BY_SDK_NAME.get(name, name)
 
 
 def _category(name: str) -> str:
+    """SDK tool name → the permission category :func:`balam.approvals.decide` keys on.
+
+    Unknown tools keep their own name, so the boundary policy treats them as "ask".
+    """
     # MCP tools evaluate against the same ruleset OpenCode ships, which keys them
     # by the collapsed ``server_tool`` form. The SDK hands us the qualified
     # ``mcp__server__tool`` name, so collapse it the same way (shared with
     # :func:`balam.permissions.parse_allowed_tool`) or no ``allowed_tools`` MCP
     # entry could ever match (it would always fall through to "ask").
-    return collapse_mcp_name(name) or _CATEGORY.get(name, name)
+    return collapse_mcp_name(name) or CATEGORY_BY_SDK_NAME.get(name, name)
 
 
 def _normalize_input(tool_input: dict[str, Any]) -> dict[str, Any]:
