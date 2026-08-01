@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from types import SimpleNamespace
 
 from balam.agent.opencode_backend import OpenCodeBackend, _plan_path_from_question
@@ -2285,3 +2286,163 @@ async def test_unattended_rejects_a_question_instead_of_awaiting_an_answer() -> 
     assert oc.question_replies == []
     assert bot.keyboards == []
     assert any("🚫" in text and "question" in text for text in bot.messages)
+
+
+# --- failure and cancellation paths ------------------------------------------
+#
+# The agent blocks on a permission or question until Balam answers it. Every way
+# the prompt can fail must still send *some* answer, or the turn hangs forever
+# holding its session. These cover the paths that do that unblocking.
+
+
+class _RejectingBot(FakeBot):
+    """A bot whose keyboard sends fail — MarkdownV2 first, optionally always."""
+
+    def __init__(self, *, fail_all: bool = False) -> None:
+        super().__init__()
+        self.fail_all = fail_all
+        self.attempts = 0
+
+    async def send_message(
+        self, *, text: str, reply_markup: object = None, **kwargs: object
+    ) -> None:
+        if reply_markup is not None:
+            self.attempts += 1
+            # The first attempt is the MarkdownV2 one; it always fails here.
+            if self.fail_all or self.attempts == 1:
+                raise RuntimeError("Bad Request: can't parse entities")
+        await super().send_message(text=text, reply_markup=reply_markup, **kwargs)
+
+
+async def _run_permission(bot: FakeBot, oc: PermissionOpenCode) -> None:
+    await stream_reply(
+        bot=bot,
+        backend=OpenCodeBackend(oc),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="x",
+        directory="/work/proj",
+        pending=PendingApprovals(),
+        allowed_dirs=["/work/proj"],
+        draft_interval=0.01,
+    )
+
+
+def _out_of_scope_permission_script() -> list[object]:
+    return [
+        _msg_updated("assistant", AID),
+        _tool_part("c1", "read", {"status": "running", "input": {"filePath": "/etc/hosts"}}),
+        _permission("per_1", "c1", category="read"),
+        "WAIT_REPLY",
+        _ev("session.idle", sessionID=SID),
+    ]
+
+
+async def test_approval_keyboard_retries_in_plain_text_when_markdown_fails() -> None:
+    """A MarkdownV2 parse failure must not lose the prompt — retry it plain."""
+    oc = PermissionOpenCode(_out_of_scope_permission_script())
+    bot = _RejectingBot()
+    task = asyncio.create_task(_run_permission(bot, oc))
+    for _ in range(300):
+        if bot.keyboards:
+            break
+        await asyncio.sleep(0.01)
+    assert bot.keyboards, "expected the plain-text retry to deliver a keyboard"
+    assert bot.attempts == 2, "MarkdownV2 attempt then a plain retry"
+    # The retry still carries a usable approval token, so the owner can answer.
+    assert _token_from_keyboard(bot.keyboards[0])
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+
+
+async def test_approval_denies_when_the_keyboard_cannot_be_sent_at_all() -> None:
+    """If even the plain retry fails there is no way to ask, so deny rather than
+    leave the agent blocked on a permission that will never be answered.
+
+    The timeout is the point of the test, not boilerplate: without the deny the
+    turn does not fail, it *hangs* on a permission nobody can answer. Bounding it
+    makes that regression fail fast instead of stalling the suite.
+    """
+    oc = PermissionOpenCode(_out_of_scope_permission_script())
+    bot = _RejectingBot(fail_all=True)
+    async with asyncio.timeout(10):
+        await _run_permission(bot, oc)
+    assert oc.replies == [("per_1", "reject", "Could not prompt the user.")]
+    assert bot.keyboards == []
+
+
+async def test_cancelling_a_turn_answers_the_pending_permission() -> None:
+    """/cancel tears the turn down while the owner has not answered. The agent is
+    still blocked on that permission, so cancellation must reply too."""
+    pending = PendingApprovals()
+    oc = PermissionOpenCode(_out_of_scope_permission_script())
+    bot = FakeBot()
+    task = asyncio.create_task(
+        stream_reply(
+            bot=bot,
+            backend=OpenCodeBackend(oc),
+            session_id=SID,
+            chat_id=1,
+            thread_id=99,
+            prompt="x",
+            directory="/work/proj",
+            pending=pending,
+            allowed_dirs=["/work/proj"],
+            draft_interval=0.01,
+        )
+    )
+    for _ in range(300):
+        if bot.keyboards:
+            break
+        await asyncio.sleep(0.01)
+    assert bot.keyboards, "expected an approval keyboard"
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert oc.replies == [("per_1", "reject", "Cancelled.")]
+
+
+async def test_cancelling_a_turn_rejects_a_pending_question() -> None:
+    """Same contract for the question tool: a cancelled turn must not leave the
+    agent waiting on an answer that can no longer arrive."""
+    pending_questions = PendingQuestions()
+    oc = PermissionOpenCode(
+        [
+            _msg_updated("assistant", AID),
+            _question("q_1"),
+            "WAIT_QUESTION_REPLY",
+            _ev("session.idle", sessionID=SID),
+        ]
+    )
+    bot = FakeBot()
+    task = asyncio.create_task(
+        stream_reply(
+            bot=bot,
+            backend=OpenCodeBackend(oc),
+            session_id=SID,
+            chat_id=1,
+            thread_id=99,
+            prompt="x",
+            directory="/work/proj",
+            pending=PendingApprovals(),
+            pending_questions=pending_questions,
+            allowed_dirs=["/work/proj"],
+            draft_interval=0.01,
+        )
+    )
+    for _ in range(300):
+        if bot.keyboards:
+            break
+        await asyncio.sleep(0.01)
+    assert bot.keyboards, "expected a question keyboard"
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert oc.question_rejections == ["q_1"]
+    assert oc.question_replies == []
