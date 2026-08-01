@@ -1,12 +1,24 @@
-"""The Telegram bot: the system's trust boundary (ADR-0008).
+"""The Telegram application: what Balam listens to, and who may speak to it.
 
-Two responsibilities for this slice:
-  1. Allowlist — accept updates only from the single owner's numeric user ID;
-     everyone else is silently ignored (a stranger's update matches no handler).
-  2. Route messages — map the topic to its OpenCode session (ADR-0009), forward
-     text plus any image/document attachments (§4), and stream the agent's reply
-     back into the same topic.
-  3. Handle ``/context`` — list workspaces, or open a new topic bound to one.
+Two things live here, and only these two:
+
+  1. **The plain-message path.** A message that is not one of Balam's own
+     commands maps to its topic's session (ADR-0009), picks up any image or
+     document attachments, and becomes a turn. This is the round-trip the whole
+     system exists for, so it stays in the entry point rather than hiding in a
+     command module.
+  2. **The registrar.** :func:`build_application` builds the PTB application,
+     puts the shared state every handler reads into ``bot_data``, applies the
+     trust boundary (ADR-0008) as a handler filter, and wires each handler to
+     its command or callback pattern.
+
+Everything a handler *does* lives elsewhere — commands in :mod:`balam.commands`,
+inline-keyboard replies in :mod:`balam.callbacks`, running a turn in
+:mod:`balam.turns`, topics in :mod:`balam.topics`. The dependency arrow points
+one way: this module imports them, none of them imports this one.
+
+The allowlist itself is in :mod:`balam.auth`, because callback queries carry no
+handler filter and have to re-check it themselves.
 """
 
 from __future__ import annotations
