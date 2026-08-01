@@ -11,6 +11,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, JobQueue, Message
 from balam import schedules
 from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuestions
+from balam.auth import is_owner
 from balam.bot import (
     BOT_COMMANDS,
     _handle_approval_callback,
@@ -33,7 +34,6 @@ from balam.bot import (
     _handle_schedule_toggle_callback,
     _handle_status,
     build_application,
-    is_owner,
     register_commands,
 )
 from balam.contexts import ContextConfig, ContextsConfig

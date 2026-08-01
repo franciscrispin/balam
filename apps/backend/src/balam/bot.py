@@ -50,6 +50,7 @@ from balam.approvals import (
     PendingQuestions,
 )
 from balam.attachments import collect_attachments
+from balam.auth import callback_authorized, is_owner
 from balam.config import Config
 from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.markdown import escape_markdown_v2
@@ -77,11 +78,6 @@ from balam.turns import TurnRegistry, abort_turn, notify_error, submit_turn
 logger = logging.getLogger(__name__)
 
 APPROVAL_DELETE_DELAY_S = 2.0
-
-
-def is_owner(from_id: int | None, allowed_user_id: int) -> bool:
-    """The allowlist check, isolated for testing (ADR-0008)."""
-    return from_id is not None and from_id == allowed_user_id
 
 
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -879,7 +875,7 @@ async def _handle_picker_toggle(
     if query is None or not (query.data or "").startswith(f"{style.toggle}:"):
         return
     config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
+    if not callback_authorized(query, config):
         await query.answer()
         return
 
@@ -913,7 +909,7 @@ async def _handle_picker_page(
     if query is None or not (query.data or "").startswith(f"{style.page}:"):
         return
     config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
+    if not callback_authorized(query, config):
         await query.answer()
         return
 
@@ -947,20 +943,6 @@ async def _refresh_picker(query: Any, style: _PickerStyle, picks: PendingPicks, 
         await message.edit_reply_markup(reply_markup=markup)
     except Exception:
         logger.debug("failed to refresh %s keyboard", style.toggle, exc_info=True)
-
-
-def _callback_authorized(query: Any, config: Config) -> bool:
-    """Re-check the trust boundary (ADR-0008) for a callback: owner id, plus the
-    configured chat when set. Callbacks carry no handler filter, so each must
-    verify the sender itself."""
-    user = query.from_user
-    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
-        return False
-    if config.allowed_telegram_chat_id is not None:
-        chat = query.message.chat if query.message else None
-        if chat is None or chat.id != config.allowed_telegram_chat_id:
-            return False
-    return True
 
 
 async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1017,7 +999,7 @@ async def _handle_delete_confirm_callback(
     if query is None or not (query.data or "").startswith("deld:"):
         return
     config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
+    if not callback_authorized(query, config):
         await query.answer()
         return
 
@@ -1086,7 +1068,7 @@ async def _handle_delete_cancel_callback(
     if query is None or not (query.data or "").startswith("delx:"):
         return
     config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
+    if not callback_authorized(query, config):
         await query.answer()
         return
 
@@ -1329,7 +1311,7 @@ async def _handle_schedule_confirm_callback(
     if query is None or not (query.data or "").startswith("schd:"):
         return
     config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
+    if not callback_authorized(query, config):
         await query.answer()
         return
 
@@ -1378,7 +1360,7 @@ async def _handle_schedule_dismiss_callback(
     if query is None or not (query.data or "").startswith("schx:"):
         return
     config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
+    if not callback_authorized(query, config):
         await query.answer()
         return
 
