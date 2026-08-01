@@ -26,7 +26,6 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
     Update,
 )
 from telegram.error import BadRequest
@@ -42,7 +41,7 @@ from telegram.ext import (
 )
 
 from balam import schedules
-from balam.agent.backend import AgentBackend, FollowUp, FollowUpChannel
+from balam.agent.backend import AgentBackend
 from balam.approvals import (
     Choice,
     CustomAnswer,
@@ -50,7 +49,7 @@ from balam.approvals import (
     PendingPicks,
     PendingQuestions,
 )
-from balam.attachments import PromptFile, collect_attachments
+from balam.attachments import collect_attachments
 from balam.config import Config
 from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.markdown import escape_markdown_v2
@@ -63,10 +62,9 @@ from balam.miniapp import mini_app_reply
 from balam.router import Router, TopicRef
 from balam.schedules import describe
 from balam.store import SessionStore
-from balam.streamer import _question_keyboard, stream_reply
+from balam.streamer import _question_keyboard
 from balam.telegram_utils import thread_kwargs
 from balam.topics import (
-    auto_name_topic,
     create_topic_from_general,
     is_forum_general_message,
     open_context_topic,
@@ -74,7 +72,7 @@ from balam.topics import (
     topic_label,
     topic_title,
 )
-from balam.turns import TurnJob, TurnRegistry
+from balam.turns import TurnRegistry, abort_turn, notify_error, submit_turn
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +82,6 @@ APPROVAL_DELETE_DELAY_S = 2.0
 def is_owner(from_id: int | None, allowed_user_id: int) -> bool:
     """The allowlist check, isolated for testing (ADR-0008)."""
     return from_id is not None and from_id == allowed_user_id
-
-
-async def _notify_error(bot: Any, chat_id: int, thread_id: int | None, exc: Exception) -> None:
-    """Post a short error notice into the topic (ADR-0009 edge), swallowing any
-    delivery failure so it never masks the original error."""
-    try:
-        await bot.send_message(chat_id=chat_id, text=f"⚠️ {exc}", **thread_kwargs(thread_id))
-    except Exception:
-        logger.debug("failed to deliver error notice", exc_info=True)
 
 
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,7 +118,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         files = await collect_attachments(message, context.bot)
     except Exception as exc:
         logger.exception("failed to download attachment")
-        await _notify_error(context.bot, chat_id, thread_id, exc)
+        await notify_error(context.bot, chat_id, thread_id, exc)
         return
     if not text and not files:
         return
@@ -164,234 +153,9 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # on the prompt (Telegram drops that metadata otherwise). Never for a slash
     # command — the agent expands ``/goal`` only when it leads the prompt.
     prompt_prefix = "" if is_slash_command else forward_reply_prefix(message)
-    await _submit_turn(
+    await submit_turn(
         message, context, text, files, thread_id=thread_id, prompt_prefix=prompt_prefix
     )
-
-
-async def _submit_turn(
-    message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-    files: list[PromptFile],
-    *,
-    thread_id: int | None,
-    queued_reply: str = "⏳ Queued (#{position}) — I'll run this after the current turn finishes.",
-    prompt_prefix: str = "",
-) -> None:
-    """Run ``text`` as the topic's turn, or park it in the topic's queue when a
-    turn is already streaming.
-
-    The message-bound dispatch tail: it owns everything that needs a
-    :class:`~telegram.Message` — the topic title, the follow-up acknowledgement,
-    and the queued-turn reply. Resolving the session and building the job is
-    :func:`_resolve_turn_job`; :func:`start_prompt` is the same path for a caller
-    with no message (the scheduled runs of ADR-0016).
-
-    ``thread_id`` is explicit because a General message has already been rehomed
-    into a freshly created topic by the time it gets here; ``queued_reply`` is
-    formatted with the job's 1-based queue ``position``. ``prompt_prefix`` is
-    prepended only to the agent-facing prompt (forward/reply header) — topic
-    auto-naming still uses the owner's own ``text``.
-    """
-    turns: TurnRegistry = context.application.bot_data["turns"]
-    chat_id = message.chat_id
-
-    job = await _resolve_turn_job(
-        context,
-        chat_id,
-        thread_id,
-        text,
-        title=topic_title(message, thread_id),
-        files=files,
-        prompt_prefix=prompt_prefix,
-    )
-    if job is None:
-        return
-
-    # A message that lands while a turn is still streaming can't fire a second
-    # prompt at the same session — one turn per topic (ADR-0009). Two paths, both
-    # decided with no ``await`` between the check and the act so the running
-    # turn's teardown can't race in and lose the message:
-    #
-    #  * Streaming-input backend (the SDK): fold it into the LIVE turn so the
-    #    agent picks it up at its next step (Claude Code-style). ``offer`` returns
-    #    False only if that turn is already closing, in which case we fall through
-    #    to the queue and it runs as the next turn.
-    #  * Otherwise (OpenCode): park it in the topic's FIFO queue; the running turn
-    #    drains it when it finishes.
-    running = turns.get(chat_id, thread_id)
-    if running is not None:
-        backend: AgentBackend = context.application.bot_data["backend"]
-        if (
-            backend.supports_streaming_input
-            and running.follow_ups is not None
-            and running.follow_ups.offer(FollowUp(prompt=text, files=files))
-        ):
-            await message.reply_text("📨 Sent — I'll pick this up in the current turn.")
-            return
-        position = turns.enqueue(chat_id, thread_id, job)
-        await message.reply_text(queued_reply.format(position=position))
-        return
-
-    _start_turn(context, chat_id, thread_id, job)
-
-
-async def _resolve_turn_job(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    thread_id: int | None,
-    text: str,
-    *,
-    title: str,
-    files: list[PromptFile] | None = None,
-    prompt_prefix: str = "",
-    unattended: bool = False,
-) -> TurnJob | None:
-    """Resolve the topic's session, auto-name the topic if it still needs one, and
-    package everything a turn needs. ``None`` (with a notice already posted in the
-    topic) if the session couldn't be resolved at all — OpenCode down, and so on.
-
-    Split out of :func:`_submit_turn` so a caller with no originating message can
-    build the same job: the queue/follow-up decision above needs the job in hand
-    before it can choose, so it can't simply delegate to :func:`start_prompt`.
-    ``prompt_prefix`` is prepended only to the agent-facing prompt (the
-    forward/reply header) — auto-naming still uses the owner's own ``text``.
-    """
-    router: Router = context.application.bot_data["router"]
-    files = files or []
-    try:
-        ref = TopicRef(chat_id=chat_id, thread_id=thread_id, title=title)
-        resolved = await router.resolve(ref)
-        await auto_name_topic(
-            context.bot,
-            router,
-            ref,
-            resolved.context_name,
-            text,
-            has_files=bool(files),
-        )
-    except Exception as exc:
-        # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
-        logger.exception("failed to resolve session")
-        await _notify_error(context.bot, chat_id, thread_id, exc)
-        return None
-
-    return TurnJob(
-        prompt=f"{prompt_prefix}{text}" if prompt_prefix else text,
-        session_id=resolved.session_id,
-        directory=resolved.directory,
-        provider=resolved.provider,
-        model=resolved.model,
-        effort=resolved.effort,
-        allowed_dirs=[resolved.directory, *resolved.additional_directories],
-        files=files,
-        allowed_tools=resolved.allowed_tools,
-        additional_directories=resolved.additional_directories,
-        mcp=resolved.mcp,
-        unattended=unattended,
-    )
-
-
-async def start_prompt(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    thread_id: int | None,
-    prompt: str,
-    *,
-    title: str,
-    unattended: bool = False,
-) -> bool:
-    """Run ``prompt`` as a turn in an existing topic, with no originating message.
-
-    The message-free half of :func:`_submit_turn`, used by the scheduled path
-    (ADR-0016). It deliberately has no queue branch: a scheduled run targets a
-    *brand-new* topic, so it can never collide with a turn already running there.
-    Returns whether the turn started.
-    """
-    job = await _resolve_turn_job(
-        context, chat_id, thread_id, prompt, title=title, unattended=unattended
-    )
-    if job is None:
-        return False
-    _start_turn(context, chat_id, thread_id, job)
-    return True
-
-
-def _start_turn(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    thread_id: int | None,
-    job: TurnJob,
-) -> None:
-    """Run ``job`` as the topic's turn in a background task, then hand the running
-    slot to the next queued message when it finishes.
-
-    The turn runs as a background task registered in the turn registry, so the
-    message handler returns immediately and a concurrent ``/cancel`` update can
-    interrupt it (PTB processes updates sequentially, so awaiting in the handler
-    would block ``/cancel``).
-    """
-    backend: AgentBackend = context.application.bot_data["backend"]
-    turns: TurnRegistry = context.application.bot_data["turns"]
-    pending: PendingApprovals = context.application.bot_data["pending"]
-    router: Router = context.application.bot_data["router"]
-
-    # Mid-turn messages fold into this live turn only on a streaming-input backend
-    # (the SDK). On OpenCode the channel stays None, so they queue instead.
-    follow_ups = FollowUpChannel() if backend.supports_streaming_input else None
-
-    # Config is optional here so unit tests of the bot path can omit it; the
-    # streamer's defaults then apply.
-    config: Config | None = context.application.bot_data.get("config")
-
-    async def run() -> None:
-        cancelled = False
-        try:
-            await stream_reply(
-                bot=context.bot,
-                backend=backend,
-                session_id=job.session_id,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                prompt=job.prompt,
-                directory=job.directory,
-                provider=job.provider,
-                model=job.model,
-                effort=job.effort,
-                pending=pending,
-                pending_questions=context.application.bot_data.setdefault(
-                    "pending_questions", PendingQuestions()
-                ),
-                allowed_dirs=job.allowed_dirs,
-                additional_directories=job.additional_directories,
-                allowed_tools=job.allowed_tools,
-                mcp=job.mcp,
-                files=job.files,
-                on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
-                follow_ups=follow_ups,
-                tool_stream=config.tool_stream if config is not None else "collapsed",
-                rich_messages=config.rich_messages if config is not None else False,
-                unattended=job.unattended,
-            )
-        except asyncio.CancelledError:
-            cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
-            raise
-        except Exception as exc:
-            logger.exception("failed to handle message")
-            await _notify_error(context.bot, chat_id, thread_id, exc)
-        finally:
-            # Release the slot and hand it straight to the next queued message.
-            # clear → pop → _start_turn run without an ``await`` between them, so
-            # the slot never blinks empty and a concurrent message can't slip a
-            # second turn onto the same session.
-            turns.clear(chat_id, thread_id, task)
-            next_job = None if cancelled else turns.pop_next(chat_id, thread_id)
-            if next_job is not None:
-                _start_turn(context, chat_id, thread_id, next_job)
-
-    task = asyncio.create_task(run())
-    turns.register(chat_id, thread_id, task, job.session_id, job.directory, follow_ups)
 
 
 def _command_remainder(text: str, *, args_consumed: int = 0) -> str:
@@ -447,31 +211,7 @@ async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     prompt = _command_remainder(message.text or "", args_consumed=1)
     thread_id = await open_context_topic(message, context.bot, router, name, prompt=prompt)
     if thread_id is not None and prompt:
-        await _submit_turn(message, context, prompt, [], thread_id=thread_id)
-
-
-def _abort_turn(
-    turn: Any, backend: AgentBackend, tasks: set[asyncio.Task[None]]
-) -> asyncio.Task[None] | None:
-    """Cancel a running turn locally and abort it on the backend (best-effort).
-
-    Cancelling the local task stops streaming; the abort tells the backend to
-    stop generating. The abort runs as a background task so callers needn't await
-    the round-trip before replying — but it is anchored in ``tasks`` (with a done
-    callback that removes it) because the event loop keeps only a *weak*
-    reference to a bare task: an unanchored one can be garbage-collected
-    mid-flight, dropping the abort. ``None`` when there is no turn (or no session
-    id yet, e.g. an SDK turn that hasn't minted one — cancelling the task is
-    enough to tear down its query)."""
-    if turn is None:
-        return None
-    turn.task.cancel()
-    if not turn.session_id:
-        return None
-    task = asyncio.create_task(backend.abort(turn.session_id, directory=turn.directory))
-    tasks.add(task)
-    task.add_done_callback(tasks.discard)
-    return task
+        await submit_turn(message, context, prompt, [], thread_id=thread_id)
 
 
 async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -514,7 +254,7 @@ async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         prompt = ""
     thread_id = await open_context_topic(message, context.bot, router, name, prompt=prompt)
     if thread_id is not None and prompt:
-        await _submit_turn(message, context, prompt, [], thread_id=thread_id)
+        await submit_turn(message, context, prompt, [], thread_id=thread_id)
 
 
 #: Scopes the Artifact tool's ``list`` action accepts; ``mine`` is its default.
@@ -555,7 +295,7 @@ async def _handle_artifacts(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "take any other action. If the Artifact tool is not available in this "
         "session, say so instead of improvising."
     )
-    await _submit_turn(
+    await submit_turn(
         message,
         context,
         prompt,
@@ -839,7 +579,7 @@ async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tasks: set[asyncio.Task[None]] = context.application.bot_data.setdefault(
         "background_tasks", set()
     )
-    _abort_turn(turn, backend, tasks)
+    abort_turn(turn, backend, tasks)
     if dropped:
         await message.reply_text(f"🛑 Cancelled. Also cleared {dropped} queued message(s).")
     else:

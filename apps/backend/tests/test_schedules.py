@@ -351,7 +351,7 @@ async def test_run_schedule_opens_a_topic_and_starts_an_unattended_turn(monkeypa
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     context, store, bot, turns = _fire_env()
     assert await S.run_schedule(context, S.Schedule.from_row(store.get_schedule(1))) is True
@@ -384,7 +384,7 @@ async def test_run_schedule_stamps_the_run_before_starting_the_turn(monkeypatch)
         seen["last_run_at"] = store.get_schedule(1).last_run_at  # type: ignore[union-attr]
         raise RuntimeError("turn dies here")
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
     await S.run_schedule(context, S.Schedule.from_row(store.get_schedule(1)))
     await turns.get(SUPERGROUP, 555).task  # type: ignore[union-attr]
 
@@ -431,7 +431,7 @@ async def test_run_schedule_marks_a_catch_up_run_as_late(monkeypatch) -> None:
     async def fake_stream_reply(**_: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
     context, store, bot, turns = _fire_env()
     await S.run_schedule(
         context,
@@ -475,7 +475,7 @@ async def test_catch_up_runs_only_what_is_due(monkeypatch) -> None:
     async def fake_stream_reply(**_: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     now = dt.datetime.now(SGT).replace(microsecond=0)
     due_recently = (now - dt.timedelta(minutes=15)).timetz()
@@ -501,7 +501,7 @@ async def test_catch_up_survives_one_broken_schedule(monkeypatch) -> None:
     async def fake_stream_reply(**_: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     now = dt.datetime.now(SGT).replace(microsecond=0)
     recent = (now - dt.timedelta(minutes=5)).timetz()

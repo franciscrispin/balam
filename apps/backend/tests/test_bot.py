@@ -494,7 +494,7 @@ async def test_first_message_auto_names_existing_topic(monkeypatch) -> None:
     async def fake_stream_reply(**_: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot()
@@ -525,7 +525,7 @@ async def test_first_message_does_not_auto_name_twice(monkeypatch) -> None:
     async def fake_stream_reply(**_: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot()
@@ -560,7 +560,7 @@ async def test_general_message_creates_named_topic_in_current_context(monkeypatc
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=901)
@@ -651,7 +651,7 @@ async def test_new_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=904)
@@ -685,7 +685,7 @@ async def test_new_with_prompt_keeps_line_breaks(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=905)
@@ -709,7 +709,7 @@ async def test_context_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=906)
@@ -734,7 +734,7 @@ async def test_new_without_prompt_starts_no_turn(monkeypatch) -> None:
     async def fail_stream_reply(**_: object) -> None:
         raise AssertionError("no turn should run without a prompt")
 
-    monkeypatch.setattr("balam.bot.stream_reply", fail_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fail_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=907)
@@ -1010,7 +1010,7 @@ async def test_message_during_running_turn_is_queued_then_drains(monkeypatch) ->
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -1048,7 +1048,7 @@ async def test_queued_messages_drain_in_fifo_order(monkeypatch) -> None:
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -1080,7 +1080,7 @@ async def test_cancel_drops_queued_messages(monkeypatch) -> None:
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -1240,7 +1240,7 @@ async def test_artifacts_submits_listing_prompt(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     message = _text_msg(SUPERGROUP, 5, "/artifacts")
     update, context, turns = _message_env(message, _FakeBot())
@@ -1261,7 +1261,7 @@ async def test_artifacts_passes_scope_argument(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     message = _text_msg(SUPERGROUP, 5, "/artifacts Shared")
     update, context, turns = _message_env(message, _FakeBot())
@@ -1783,7 +1783,7 @@ async def test_message_with_photo_forwards_file_part_and_caption(monkeypatch) ->
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     bot = _AttachmentBot(b"\xff\xd8jpeg")
     message = SimpleNamespace(
@@ -1817,7 +1817,7 @@ async def test_message_prepends_forward_and_reply_header_to_prompt(monkeypatch) 
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     bot = _FakeBot()
     message = _text_msg(SUPERGROUP, 5, "please action this")
@@ -1856,7 +1856,7 @@ async def test_slash_command_posts_forwarding_marker(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     bot = _FakeBot()
     message = SimpleNamespace(
@@ -2048,7 +2048,7 @@ async def test_mid_turn_message_is_folded_into_live_turn_on_streaming_backend(
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -2084,7 +2084,7 @@ async def test_mid_turn_message_falls_back_to_queue_when_turn_is_closing(monkeyp
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -2330,7 +2330,7 @@ async def test_schedule_run_fires_it_now_unattended(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule run 1")
     update, context, store, bot, turns = _schedule_env(message, ["run", "1"])
