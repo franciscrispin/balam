@@ -16,9 +16,9 @@ jobs:
     name: Backend (Python / uv)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           cache-dependency-glob: apps/backend/uv.lock
@@ -47,7 +47,7 @@ jobs:
     name: Frontend (TypeScript / Bun)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -66,9 +66,9 @@ jobs:
     name: Generated API types are in sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           cache-dependency-glob: apps/backend/uv.lock
