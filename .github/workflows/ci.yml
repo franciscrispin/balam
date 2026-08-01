@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same PR cancels the previous run — nothing here is a deploy,
+# so only the latest commit's result matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Python / uv)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: apps/backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+        working-directory: apps/backend
+
+      - name: Lint
+        run: uv run ruff check .
+        working-directory: apps/backend
+
+      - name: Format check
+        run: uv run ruff format --check .
+        working-directory: apps/backend
+
+      # Runs with no BALAM_*/AGENT_BACKEND/TELEGRAM_* in the environment. That is
+      # deliberate and load-bearing: Config reads real env vars ahead of .env, so
+      # a machine with the deployment env exported fails 5 tests that pass here.
+      # See docs/tech-debt.md ("Tests are not hermetic").
+      - name: Tests
+        run: uv run pytest -q
+        working-directory: apps/backend
+
+  frontend:
+    name: Frontend (TypeScript / Bun)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint
+        run: bun run lint
+
+  api-drift:
+    name: Generated API types are in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: apps/backend/uv.lock
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --directory apps/backend
+          bun install --frozen-lockfile
+
+      # packages/shared/src/api.ts is generated from the backend's OpenAPI schema
+      # but nothing regenerates it automatically, so a backend route change can
+      # silently leave the frontend's types describing the old API. Regenerate and
+      # fail if the result differs from what is committed.
+      - name: Regenerate API types
+        run: bun run gen:api
+
+      - name: Fail if the working tree changed
+        run: |
+          if ! git diff --exit-code packages/shared/src/api.ts; then
+            echo "::error file=packages/shared/src/api.ts::Generated API types are stale. Run 'bun run gen:api' and commit the result."
+            exit 1
+          fi
