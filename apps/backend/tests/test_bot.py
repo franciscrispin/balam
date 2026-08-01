@@ -17,8 +17,6 @@ from balam.bot import (
     _handle_artifacts,
     _handle_cancel,
     _handle_context,
-    _handle_delete_confirm_callback,
-    _handle_delete_page_callback,
     _handle_effort,
     _handle_message,
     _handle_model,
@@ -33,6 +31,10 @@ from balam.callbacks import (
     handle_question_callback,
     handle_question_custom_callback,
     handle_question_done_callback,
+)
+from balam.commands.delete import (
+    handle_delete_confirm_callback,
+    handle_delete_page_callback,
 )
 from balam.commands.schedule import (
     handle_schedule,
@@ -1954,7 +1956,7 @@ async def test_delete_confirm_purges_topics_already_gone_from_telegram() -> None
     router._store.set(SUPERGROUP, 101, "ses_live", 1)
     router._store.set(SUPERGROUP, 202, "ses_stale", 2)
 
-    await _handle_delete_confirm_callback(update, context)
+    await handle_delete_confirm_callback(update, context)
 
     # The live topic was deleted via the API; the stale one was not re-attempted
     # past its rejection — but both local rows are gone.
@@ -2020,7 +2022,7 @@ async def test_delete_page_callback_flips_page_keeping_selection() -> None:
     query = _FakeQuery(f"delp:{token}:1", OWNER, message)
     update, context, _ = _delete_callback_env(query, pending, _FakeBot())
 
-    await _handle_delete_page_callback(update, context)
+    await handle_delete_page_callback(update, context)
 
     # The picker advanced and re-rendered; the selection survived the page flip.
     assert pending.page_info(token)[0] == 1
@@ -2034,7 +2036,7 @@ async def test_delete_page_callback_on_expired_token_clears_keyboard() -> None:
     query = _FakeQuery("delp:gone:1", OWNER, message)
     update, context, _ = _delete_callback_env(query, pending, _FakeBot())
 
-    await _handle_delete_page_callback(update, context)
+    await handle_delete_page_callback(update, context)
 
     assert query.answers and query.answers[-1] == "This picker has expired."
 
