@@ -14,15 +14,7 @@ from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuest
 from balam.auth import is_owner
 from balam.bot import (
     BOT_COMMANDS,
-    _handle_artifacts,
-    _handle_cancel,
-    _handle_context,
-    _handle_effort,
     _handle_message,
-    _handle_model,
-    _handle_new,
-    _handle_rename,
-    _handle_status,
     build_application,
     register_commands,
 )
@@ -42,6 +34,16 @@ from balam.commands.schedule import (
     handle_schedule_dismiss_callback,
     handle_schedule_toggle_callback,
 )
+from balam.commands.session import (
+    handle_cancel,
+    handle_context,
+    handle_effort,
+    handle_model,
+    handle_new,
+    handle_rename,
+    handle_status,
+)
+from balam.commands.views import handle_artifacts
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.message_text import (
     forward_reply_prefix,
@@ -382,7 +384,7 @@ async def test_context_switch_opens_new_topic_and_links_to_it() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     # A new topic is created for the context (not a rebind of thread 5).
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
@@ -402,7 +404,7 @@ async def test_context_switch_in_private_chat_links_via_web() -> None:
     message = _FakeMessage(55555555, thread_id=723626)  # fake owner user id
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     assert bot.created_topics == [(55555555, "scratch")]
     assert f"https://web.telegram.org/a/#{BOT_ID}_723639" in _button_urls(message)
@@ -414,7 +416,7 @@ async def test_context_switch_from_general_also_opens_a_topic() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None)  # General
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
     assert router.current_context_name(TopicRef(SUPERGROUP, 900, "t")) == "scratch"
@@ -426,7 +428,7 @@ async def test_unknown_context_is_rejected_without_creating_a_topic() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["nope"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     assert bot.created_topics == []
     assert any("Unknown context" in reply for reply in message.replies)
@@ -482,7 +484,7 @@ async def test_new_opens_a_new_topic_in_the_current_context() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, [])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     # A brand-new topic is created, bound to the same context as the current one.
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
@@ -609,7 +611,7 @@ async def test_rename_changes_current_topic_and_blocks_auto_name() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["Build", "fix"])
 
-    await _handle_rename(update, context)
+    await handle_rename(update, context)
 
     assert bot.edited_topics == [(SUPERGROUP, 5, "Build fix")]
     assert router.topic_auto_named(TopicRef(SUPERGROUP, 5, "t")) is True
@@ -622,7 +624,7 @@ async def test_rename_requires_name() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, [])
 
-    await _handle_rename(update, context)
+    await handle_rename(update, context)
 
     assert bot.edited_topics == []
     assert "Usage" in message.replies[-1]
@@ -644,7 +646,7 @@ async def test_new_with_arg_opens_topic_in_named_context() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
     assert router.current_context_name(TopicRef(SUPERGROUP, 902, "t")) == "scratch"
@@ -667,7 +669,7 @@ async def test_new_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None:
         bot, router, message, ["scratch", "check", "last", "month"], turns=turns
     )
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
     turn = turns.get(SUPERGROUP, 904)
     assert turn is not None
     await turn.task
@@ -701,7 +703,7 @@ async def test_new_with_prompt_keeps_line_breaks(monkeypatch) -> None:
         bot, router, message, ["scratch", "first", "line", "second", "line"], turns=turns
     )
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
     turn = turns.get(SUPERGROUP, 905)
     assert turn is not None
     await turn.task
@@ -725,7 +727,7 @@ async def test_context_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None
         bot, router, message, ["scratch", "tidy", "the", "notes"], turns=turns
     )
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
     turn = turns.get(SUPERGROUP, 906)
     assert turn is not None
     await turn.task
@@ -748,7 +750,7 @@ async def test_new_without_prompt_starts_no_turn(monkeypatch) -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5, text="/new scratch")
     update, context = _update_context(bot, router, message, ["scratch"], turns=turns)
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
     assert turns.get(SUPERGROUP, 907) is None
@@ -761,7 +763,7 @@ async def test_new_with_unknown_context_reports_error() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["nope"])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == []
     assert "Unknown context" in message.replies[-1]
@@ -773,7 +775,7 @@ async def test_new_from_unbound_topic_uses_default_context() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None)  # General — unbound
     update, context = _update_context(bot, router, message, [])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "balam")]  # default_context
     assert router.current_context_name(TopicRef(SUPERGROUP, 901, "t")) == "balam"
@@ -784,7 +786,7 @@ async def test_status_reports_context_session_and_idle() -> None:
     update, context, router, _opencode, _turns = _session_cmd_env(message)
     session_id = (await router.resolve(TopicRef(SUPERGROUP, 5, "t"))).session_id
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     reply = message.replies[-1]
     assert "balam" in reply
@@ -797,7 +799,7 @@ async def test_status_reports_running_turn() -> None:
     update, context, _router, _opencode, turns = _session_cmd_env(message)
     task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     assert "running" in message.replies[-1]
     task.cancel()
@@ -809,7 +811,7 @@ async def test_status_reports_effective_model_and_effort_overrides() -> None:
     router.set_model_override(SUPERGROUP, "anthropic", "claude-sonnet-4")
     router.set_effort_override(SUPERGROUP, "medium")
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     reply = message.replies[-1]
     assert "Model: anthropic/claude-sonnet-4" in reply
@@ -820,7 +822,7 @@ async def test_model_reports_current_effective_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, *_ = _session_cmd_env(message)
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     reply = message.replies[-1]
     assert "Model: anthropic/claude-opus-4-8" in reply
@@ -831,7 +833,7 @@ async def test_model_sets_global_override_from_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)  # General
     update, context, router, *_ = _session_cmd_env(message, ["anthropic/claude-sonnet-4"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     # Applies to an unrelated topic, not just where it was typed.
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
@@ -844,7 +846,7 @@ async def test_model_set_is_refused_outside_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, router, *_ = _session_cmd_env(message, ["anthropic/claude-sonnet-4"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     assert router.model_override(SUPERGROUP) == (None, None)
     assert "General" in message.replies[-1]
@@ -855,7 +857,7 @@ async def test_model_reset_clears_global_override() -> None:
     update, context, router, *_ = _session_cmd_env(message, ["reset"])
     router.set_model_override(SUPERGROUP, "anthropic", "claude-sonnet-4")
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
     assert resolved.model == "claude-opus-4-8"
@@ -866,7 +868,7 @@ async def test_model_rejects_unqualified_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["claude-sonnet-4"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     assert router.model_override(SUPERGROUP) == (None, None)
     assert "Usage: /model" in message.replies[-1]
@@ -876,7 +878,7 @@ async def test_model_rejects_empty_model_part() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["anthropic/"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     assert router.model_override(SUPERGROUP) == (None, None)
     assert "Usage: /model" in message.replies[-1]
@@ -886,7 +888,7 @@ async def test_effort_reports_current_effective_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, *_ = _session_cmd_env(message)
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     reply = message.replies[-1]
     assert "Effort: high" in reply
@@ -897,7 +899,7 @@ async def test_effort_sets_global_override_from_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["medium"])
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
     assert resolved.effort == "medium"
@@ -907,7 +909,7 @@ async def test_effort_set_is_refused_outside_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, router, *_ = _session_cmd_env(message, ["medium"])
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     assert router.effort_override(SUPERGROUP) is None
     assert "General" in message.replies[-1]
@@ -918,7 +920,7 @@ async def test_effort_reset_clears_global_override() -> None:
     update, context, router, *_ = _session_cmd_env(message, ["reset"])
     router.set_effort_override(SUPERGROUP, "medium")
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
     assert resolved.effort == "high"
@@ -929,7 +931,7 @@ async def test_effort_rejects_unknown_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["turbo"])
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     assert router.effort_override(SUPERGROUP) is None
     assert "Unknown effort" in message.replies[-1]
@@ -940,7 +942,7 @@ async def test_cancel_with_no_running_turn() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, *_ = _session_cmd_env(message)
 
-    await _handle_cancel(update, context)
+    await handle_cancel(update, context)
 
     assert any("No running turn" in r for r in message.replies)
 
@@ -950,7 +952,7 @@ async def test_cancel_aborts_running_turn() -> None:
     update, context, _router, opencode, turns = _session_cmd_env(message)
     task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
 
-    await _handle_cancel(update, context)
+    await handle_cancel(update, context)
     await asyncio.sleep(0)  # let the fire-and-forget abort task run
 
     with contextlib.suppress(asyncio.CancelledError):
@@ -1100,7 +1102,7 @@ async def test_cancel_drops_queued_messages(monkeypatch) -> None:
     assert turns.queue_len(SUPERGROUP, 5) == 1
 
     # /cancel stops the running turn AND clears anything queued behind it.
-    await _handle_cancel(update, context)
+    await handle_cancel(update, context)
     await asyncio.sleep(0)  # let the cancellation propagate
     with contextlib.suppress(asyncio.CancelledError):
         await first_task
@@ -1117,7 +1119,7 @@ async def test_status_reports_queue_depth() -> None:
     turns.enqueue(SUPERGROUP, 5, _job("queued one"))
     turns.enqueue(SUPERGROUP, 5, _job("queued two"))
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     assert "Queued: 2" in message.replies[-1]
     task.cancel()
@@ -1252,7 +1254,7 @@ async def test_artifacts_submits_listing_prompt(monkeypatch) -> None:
     update, context, turns = _message_env(message, _FakeBot())
     context.args = []
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
     while (turn := turns.get(SUPERGROUP, 5)) is not None:
         await turn.task
 
@@ -1273,7 +1275,7 @@ async def test_artifacts_passes_scope_argument(monkeypatch) -> None:
     update, context, turns = _message_env(message, _FakeBot())
     context.args = ["Shared"]  # scopes are case-insensitive
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
     while (turn := turns.get(SUPERGROUP, 5)) is not None:
         await turn.task
 
@@ -1285,7 +1287,7 @@ async def test_artifacts_rejects_unknown_scope() -> None:
     update, context, turns = _message_env(message, _FakeBot())
     context.args = ["bogus"]
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
 
     assert turns.get(SUPERGROUP, 5) is None
     assert "Usage: /artifacts" in message.replies[-1]
@@ -1298,7 +1300,7 @@ async def test_artifacts_refused_in_general() -> None:
     update, context, turns = _message_env(message, _FakeBot())
     context.args = []
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
 
     assert turns.get(SUPERGROUP, None) is None
     assert "inside a topic" in message.replies[-1]

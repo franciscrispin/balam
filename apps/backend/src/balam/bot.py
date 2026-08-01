@@ -11,7 +11,6 @@ Two responsibilities for this slice:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -61,26 +60,30 @@ from balam.commands.schedule import (
     handle_schedule_page_callback,
     handle_schedule_toggle_callback,
 )
+from balam.commands.session import (
+    handle_cancel,
+    handle_context,
+    handle_effort,
+    handle_model,
+    handle_new,
+    handle_rename,
+    handle_status,
+)
+from balam.commands.views import handle_artifacts, handle_browser, handle_diff
 from balam.config import Config
-from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.message_text import (
-    command_remainder,
     forward_reply_prefix,
     forwarded_slash_command,
     strip_bot_mention_from_command,
 )
-from balam.miniapp import mini_app_reply
-from balam.router import Router, TopicRef
+from balam.router import Router
 from balam.store import SessionStore
 from balam.telegram_utils import thread_kwargs
 from balam.topics import (
     create_topic_from_general,
     is_forum_general_message,
-    open_context_topic,
-    rename_forum_topic,
-    topic_title,
 )
-from balam.turns import TurnRegistry, abort_turn, notify_error, submit_turn
+from balam.turns import TurnRegistry, notify_error, submit_turn
 
 logger = logging.getLogger(__name__)
 
@@ -159,421 +162,6 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-async def _handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/context`` lists workspaces and the topic's current binding;
-    ``/context <name> [prompt]`` creates a *new* topic bound to that context,
-    replies with a one-tap link to it (see :func:`open_context_topic`), and runs
-    ``prompt`` there when one is given."""
-    message = update.message
-    if message is None:
-        return
-
-    router: Router = context.application.bot_data["router"]
-    ref = TopicRef(
-        chat_id=message.chat_id,
-        thread_id=message.message_thread_id,
-        title=topic_title(message, message.message_thread_id),
-    )
-    contexts = router.contexts
-    args = context.args or []
-
-    if not args:
-        current = router.current_context_name(ref)
-        lines = ["Workspace contexts:"]
-        for name, ctx in sorted(contexts.contexts.items()):
-            marker = "→" if name == current else "•"
-            lines.append(f"{marker} {name} — {ctx.description} ({ctx.directory})")
-        lines.append("")
-        lines.append("Switch with /context <name> (opens a new topic).")
-        await message.reply_text("\n".join(lines))
-        return
-
-    name = contexts.match_name(args[0])
-    if name is None:
-        available = ", ".join(sorted(contexts.contexts))
-        await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
-        return
-
-    prompt = command_remainder(message.text or "", args_consumed=1)
-    thread_id = await open_context_topic(message, context.bot, router, name, prompt=prompt)
-    if thread_id is not None and prompt:
-        await submit_turn(message, context, prompt, [], thread_id=thread_id)
-
-
-async def _handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/new [name] [prompt]`` — open a fresh topic with a new session, and run
-    ``prompt`` in it when one is given.
-
-    The same flow as ``/context <name>`` (:func:`open_context_topic`). With an
-    argument, the new topic is bound to context ``name``; without one, it reuses
-    the current topic's binding (``default_context`` when unbound). The current
-    topic is left untouched — one context per topic for life — so its history is
-    preserved and the fresh start lives in its own topic.
-
-    Everything after the context name is the first turn, so ``/new monies check
-    last month`` opens a *monies* topic and starts working there in one step —
-    the same one-step start a plain message in General gives, with the context
-    picked explicitly. The first token still has to name a context: a prompt
-    alone would silently run in whichever context this topic happens to be bound
-    to, and a plain message already covers that.
-    """
-    message = update.message
-    if message is None:
-        return
-
-    router: Router = context.application.bot_data["router"]
-    args = context.args or []
-    if args:
-        name = router.contexts.match_name(args[0])
-        if name is None:
-            available = ", ".join(sorted(router.contexts.contexts))
-            await message.reply_text(f"Unknown context {args[0]!r}. Available: {available}")
-            return
-        prompt = command_remainder(message.text or "", args_consumed=1)
-    else:
-        ref = TopicRef(
-            chat_id=message.chat_id,
-            thread_id=message.message_thread_id,
-            title=topic_title(message, message.message_thread_id),
-        )
-        name = router.current_context_name(ref)
-        prompt = ""
-    thread_id = await open_context_topic(message, context.bot, router, name, prompt=prompt)
-    if thread_id is not None and prompt:
-        await submit_turn(message, context, prompt, [], thread_id=thread_id)
-
-
-#: Scopes the Artifact tool's ``list`` action accepts; ``mine`` is its default.
-_ARTIFACT_SCOPES = ("mine", "shared", "all")
-
-
-async def _handle_artifacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/artifacts [shared|all]`` — list the owner's published claude.ai artifacts.
-
-    The CLI's own ``/artifacts`` is a local-jsx screen that only exists in
-    interactive sessions, so it can never run through the SDK backend. The data
-    behind it is reachable anyway: the Artifact tool's ``action:"list"`` returns
-    the published pages (title, url, updatedAt). This command submits a regular
-    turn instructing the agent to call it — which also means it degrades to a
-    plain "tool unavailable" answer on a backend without the Artifact tool
-    (OpenCode, or an account the rollout gate excludes).
-    """
-    message = update.message
-    if message is None:
-        return
-
-    if is_forum_general_message(message):
-        # General messages spawn fresh topics, so the listing would land in a
-        # topic named after a bare command.
-        await message.reply_text("Use /artifacts inside a topic.")
-        return
-
-    args = context.args or []
-    scope = args[0].lower() if args else "mine"
-    if scope not in _ARTIFACT_SCOPES:
-        await message.reply_text("Usage: /artifacts [shared|all] — default lists your own.")
-        return
-
-    prompt = (
-        f'Call the Artifact tool with action "list" and scope "{scope}", then present '
-        "the artifacts as a compact list: each title as a link to its URL, with the "
-        "updated date when available. Mention if the result was truncated. Do not "
-        "take any other action. If the Artifact tool is not available in this "
-        "session, say so instead of improvising."
-    )
-    await submit_turn(
-        message,
-        context,
-        prompt,
-        [],
-        thread_id=message.message_thread_id,
-    )
-
-
-async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/status`` — report the topic's context, session, and whether a turn runs."""
-    message = update.message
-    if message is None:
-        return
-
-    router: Router = context.application.bot_data["router"]
-    turns: TurnRegistry = context.application.bot_data["turns"]
-    config: Config = context.application.bot_data["config"]
-    ref = TopicRef(
-        chat_id=message.chat_id,
-        thread_id=message.message_thread_id,
-        title=topic_title(message, message.message_thread_id),
-    )
-
-    name = router.current_context_name(ref)
-    ctx = router.contexts.get(name)
-    provider, model = ctx.provider_model
-    override_provider, override_model = router.model_override(ref.chat_id)
-    override_effort = router.effort_override(ref.chat_id)
-    session_id = router.current_session_id(ref)
-    running = turns.get(ref.chat_id, ref.thread_id) is not None
-    queued = turns.queue_len(ref.chat_id, ref.thread_id)
-    effective_model = _format_model(override_provider or provider, override_model or model)
-
-    lines = [
-        f"Context: {name}",
-        f"Backend: {config.agent_backend}",
-        f"Directory: {ctx.directory}",
-        f"Model: {effective_model}",
-        f"Effort: {override_effort or ctx.effort or '(server default)'}",
-        f"Session: {session_id or '(none yet — send a message to start)'}",
-        f"Turn: {'running' if running else 'idle'}",
-        f"Queued: {queued}",
-    ]
-    await message.reply_text("\n".join(lines))
-
-
-def _format_model(provider: str | None, model: str | None) -> str:
-    if provider and model:
-        return f"{provider}/{model}"
-    return "(server default)"
-
-
-async def _handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/model [provider/model|reset]`` — inspect or set the chat-wide model.
-
-    Reading works anywhere; **setting** is General-only, because the override is
-    global rather than per topic (:data:`balam.router._GLOBAL_THREAD`). Keeping it
-    out of topics is what lets a long-lived agent session keep one model for its
-    whole life instead of having to switch mid-session.
-    """
-    message = update.message
-    if message is None:
-        return
-
-    router: Router = context.application.bot_data["router"]
-    ref = TopicRef(
-        chat_id=message.chat_id,
-        thread_id=message.message_thread_id,
-        title=topic_title(message, message.message_thread_id),
-    )
-    args = context.args or []
-
-    if not args:
-        name = router.current_context_name(ref)
-        provider, model = router.contexts.get(name).provider_model
-        override_provider, override_model = router.model_override(ref.chat_id)
-        source = (
-            "global override"
-            if override_model
-            else "context default"
-            if model
-            else "server default"
-        )
-        await message.reply_text(
-            f"Model: {_format_model(override_provider or provider, override_model or model)}\n"
-            f"Source: {source}\n"
-            "Set with /model <provider/model> in General, reset with /model reset."
-        )
-        return
-
-    if not is_forum_general_message(message):
-        await message.reply_text(
-            "The model is set for the whole workspace, so change it from General."
-        )
-        return
-
-    value = args[0].strip()
-    if value.lower() == "reset":
-        router.reset_model_override(ref.chat_id)
-        name = router.current_context_name(ref)
-        provider, model = router.contexts.get(name).provider_model
-        await message.reply_text(f"Model reset to {_format_model(provider, model)}.")
-        return
-
-    try:
-        provider, model = split_provider_model(value)
-    except ValueError as exc:
-        await message.reply_text(f"{exc}\nUsage: /model <provider/model> or /model reset")
-        return
-    if not provider or not model:
-        await message.reply_text("Usage: /model <provider/model> or /model reset")
-        return
-
-    router.set_model_override(ref.chat_id, provider, model)
-    await message.reply_text(f"Model set to {provider}/{model} for every topic.")
-
-
-async def _handle_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/effort [level|reset]`` — inspect or set the chat-wide effort.
-
-    General-only to set, for the same reason as :func:`_handle_model`. Effort in
-    particular cannot be changed on a live SDK client at all, so making it global
-    removes the only case that would force a session to be rebuilt mid-life.
-    """
-    message = update.message
-    if message is None:
-        return
-
-    router: Router = context.application.bot_data["router"]
-    ref = TopicRef(
-        chat_id=message.chat_id,
-        thread_id=message.message_thread_id,
-        title=topic_title(message, message.message_thread_id),
-    )
-    args = context.args or []
-
-    if not args:
-        name = router.current_context_name(ref)
-        ctx = router.contexts.get(name)
-        override = router.effort_override(ref.chat_id)
-        source = (
-            "global override" if override else "context default" if ctx.effort else "server default"
-        )
-        await message.reply_text(
-            f"Effort: {override or ctx.effort or '(server default)'}\n"
-            f"Source: {source}\n"
-            "Set with /effort <level> in General, reset with /effort reset."
-        )
-        return
-
-    if not is_forum_general_message(message):
-        await message.reply_text(
-            "Effort is set for the whole workspace, so change it from General."
-        )
-        return
-
-    value = args[0].strip().lower()
-    if value == "reset":
-        router.reset_effort_override(ref.chat_id)
-        name = router.current_context_name(ref)
-        ctx = router.contexts.get(name)
-        await message.reply_text(f"Effort reset to {ctx.effort or '(server default)'}.")
-        return
-
-    if value not in EFFORT_LEVELS:
-        allowed = ", ".join(sorted(EFFORT_LEVELS))
-        await message.reply_text(f"Unknown effort {value!r}. Available: {allowed}")
-        return
-
-    router.set_effort_override(ref.chat_id, value)
-    await message.reply_text(f"Effort override set to {value}.")
-
-
-async def _handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/rename <name>`` — rename the current forum topic."""
-    message = update.message
-    if message is None:
-        return
-
-    new_name = " ".join(context.args or []).strip()
-    if not new_name:
-        await message.reply_text("Usage: /rename <topic name>")
-        return
-    if len(new_name) > 128:
-        await message.reply_text("Topic names must be 128 characters or fewer.")
-        return
-    if message.message_thread_id is None:
-        await message.reply_text("Use /rename inside the topic you want to rename.")
-        return
-
-    try:
-        await rename_forum_topic(context.bot, message.chat_id, message.message_thread_id, new_name)
-    except Exception as exc:
-        logger.exception("failed to rename forum topic")
-        await message.reply_text(f"⚠️ Couldn't rename this topic: {exc}")
-        return
-
-    router: Router = context.application.bot_data["router"]
-    router.mark_topic_auto_named(
-        TopicRef(
-            chat_id=message.chat_id,
-            thread_id=message.message_thread_id,
-            title=topic_title(message, message.message_thread_id),
-        )
-    )
-    router.set_topic_title(message.chat_id, message.message_thread_id, new_name)
-    await message.reply_text(f"Renamed topic to {new_name}.")
-
-
-async def _handle_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/diff`` — open the Mini App git diff viewer for this topic's context."""
-    message = update.message
-    if message is None:
-        return
-
-    config: Config = context.application.bot_data["config"]
-    router: Router = context.application.bot_data["router"]
-    ref = TopicRef(
-        chat_id=message.chat_id,
-        thread_id=message.message_thread_id,
-        title=topic_title(message, message.message_thread_id),
-    )
-    name = router.current_context_name(ref)
-    text, keyboard = mini_app_reply(
-        config,
-        "diff",
-        name,
-        bot_username=getattr(context.bot, "username", None),
-        is_private=getattr(message.chat, "type", None) == "private",
-    )
-    await message.reply_text(text, reply_markup=keyboard)
-
-
-async def _handle_browser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/browser`` — open the Mini App live view of the agent's Chrome (ADR-0006).
-
-    The view is global (one X display on the VM), not per-context, so the launch
-    carries no context: a placeholder would leak into the app shell's shared
-    launch context and break the other views (e.g. the diff view 404s on an
-    unknown context name).
-    """
-    message = update.message
-    if message is None:
-        return
-
-    config: Config = context.application.bot_data["config"]
-    text, keyboard = mini_app_reply(
-        config,
-        "browser",
-        None,
-        bot_username=getattr(context.bot, "username", None),
-        is_private=getattr(message.chat, "type", None) == "private",
-        label="Watch live",
-        heading="Live browser view:",
-    )
-    await message.reply_text(text, reply_markup=keyboard)
-
-
-async def _handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/cancel`` — abort the turn running in the current topic, if any."""
-    message = update.message
-    if message is None:
-        return
-
-    backend: AgentBackend = context.application.bot_data["backend"]
-    turns: TurnRegistry = context.application.bot_data["turns"]
-
-    turn = turns.get(message.chat_id, message.message_thread_id)
-    # Drop anything queued behind the turn too — otherwise it would auto-run right
-    # after the cancelled turn settles, which is not what /cancel means.
-    dropped = turns.clear_queue(message.chat_id, message.message_thread_id)
-    if turn is None:
-        if dropped:
-            await message.reply_text(
-                f"🛑 Cleared {dropped} queued message(s); no turn was running."
-            )
-        else:
-            await message.reply_text("No running turn.")
-        return
-
-    tasks: set[asyncio.Task[None]] = context.application.bot_data.setdefault(
-        "background_tasks", set()
-    )
-    abort_turn(turn, backend, tasks)
-    if dropped:
-        await message.reply_text(f"🛑 Cancelled. Also cleared {dropped} queued message(s).")
-    else:
-        await message.reply_text("🛑 Cancelled.")
-
-
-#: Per approval choice: ``(inline note appended to the prompt — already
-#: MarkdownV2-escaped, toast shown on the callback answer)``.
 async def _handle_topic_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sync the stored title when a topic is renamed from the Telegram UI.
 
@@ -676,16 +264,16 @@ def build_application(
     if config.allowed_telegram_chat_id is not None:
         allowed = allowed & filters.Chat(chat_id=config.allowed_telegram_chat_id)
 
-    app.add_handler(CommandHandler("new", _handle_new, filters=allowed))
-    app.add_handler(CommandHandler("rename", _handle_rename, filters=allowed))
-    app.add_handler(CommandHandler("status", _handle_status, filters=allowed))
-    app.add_handler(CommandHandler("model", _handle_model, filters=allowed))
-    app.add_handler(CommandHandler("effort", _handle_effort, filters=allowed))
-    app.add_handler(CommandHandler("cancel", _handle_cancel, filters=allowed))
-    app.add_handler(CommandHandler("context", _handle_context, filters=allowed))
-    app.add_handler(CommandHandler("diff", _handle_diff, filters=allowed))
-    app.add_handler(CommandHandler("browser", _handle_browser, filters=allowed))
-    app.add_handler(CommandHandler("artifacts", _handle_artifacts, filters=allowed))
+    app.add_handler(CommandHandler("new", handle_new, filters=allowed))
+    app.add_handler(CommandHandler("rename", handle_rename, filters=allowed))
+    app.add_handler(CommandHandler("status", handle_status, filters=allowed))
+    app.add_handler(CommandHandler("model", handle_model, filters=allowed))
+    app.add_handler(CommandHandler("effort", handle_effort, filters=allowed))
+    app.add_handler(CommandHandler("cancel", handle_cancel, filters=allowed))
+    app.add_handler(CommandHandler("context", handle_context, filters=allowed))
+    app.add_handler(CommandHandler("diff", handle_diff, filters=allowed))
+    app.add_handler(CommandHandler("browser", handle_browser, filters=allowed))
+    app.add_handler(CommandHandler("artifacts", handle_artifacts, filters=allowed))
     app.add_handler(CommandHandler("delete", handle_delete, filters=allowed))
     app.add_handler(CommandHandler("schedule", handle_schedule, filters=allowed))
     app.add_handler(
