@@ -32,8 +32,6 @@ from balam.bot import (
     _handle_schedule_dismiss_callback,
     _handle_schedule_toggle_callback,
     _handle_status,
-    _topic_link,
-    _topic_name,
     build_application,
     is_owner,
     register_commands,
@@ -46,6 +44,7 @@ from balam.message_text import (
 )
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
+from balam.topics import topic_link, topic_name
 from balam.turns import TurnJob, TurnRegistry
 
 OWNER = 424242
@@ -220,16 +219,16 @@ BOT_ID = 7000000042
 
 def test_topic_link_for_private_supergroup() -> None:
     # -100<internal> → t.me/c/<internal>/<thread> (official, all clients).
-    assert _topic_link(SUPERGROUP, 42) == "https://t.me/c/1234567890/42"
+    assert topic_link(SUPERGROUP, 42) == "https://t.me/c/1234567890/42"
 
 
 def test_topic_link_for_private_chat_uses_web_address() -> None:
     # Private chat with topics has no documented deep link → Telegram Web URL.
-    assert _topic_link(55555555, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
+    assert topic_link(55555555, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
 
 
 def test_topic_link_none_for_private_chat_without_bot_id() -> None:
-    assert _topic_link(55555555, 42) is None
+    assert topic_link(55555555, 42) is None
 
 
 class _FakeOpenCode:
@@ -624,7 +623,7 @@ async def test_rename_requires_name() -> None:
 
 
 def test_topic_name_truncates_to_telegram_limit() -> None:
-    name = _topic_name("balam", "x" * 200)
+    name = topic_name("balam", "x" * 200)
 
     assert len(name) == 128
     assert name.startswith("balam: ")

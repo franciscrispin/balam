@@ -37,6 +37,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from balam.store import ScheduleRow, SessionStore
+from balam.topics import TopicOpenError, open_topic_in_context
 
 logger = logging.getLogger(__name__)
 
@@ -364,9 +365,11 @@ async def run_schedule(
     # Stamp before running, not after (see the module docstring).
     store.mark_schedule_run(schedule.id, int(time.time() * 1000))
 
-    # Imported here, not at module scope: bot.py imports this module for the
-    # /schedule handlers, so a top-level import back into it would be circular.
-    from balam.bot import TopicOpenError, open_topic_in_context, start_prompt
+    # start_prompt still needs a deferred import: bot.py imports this module for
+    # the /schedule handlers, so a top-level import back into it would be
+    # circular. TopicOpenError/open_topic_in_context now come from balam.topics,
+    # which has no such cycle.
+    from balam.bot import start_prompt
 
     try:
         thread_id, title = await open_topic_in_context(
