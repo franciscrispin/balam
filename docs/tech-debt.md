@@ -1,253 +1,205 @@
 # Tech debt inventory
 
-_Snapshot taken 2026-08-01, `feature/scheduled-tasks` @ 727d9b8 (open PR #6, so
-these numbers include `/schedule`). Backend is 11,068 lines of Python across 31
-modules; the frontend is a small React/Vite app, ~1,334 hand-written lines plus a
-310-line generated types file. Findings are ordered by leverage (impact × how
-often the area changes), not by severity alone._
+_Snapshot taken 2026-08-01, after the refactor on `refactor/tech-debt`. Backend
+is 11,509 lines of Python across 44 modules; the frontend is a small React/Vite
+app, ~1,435 hand-written lines plus a 310-line generated types file. Findings are
+ordered by leverage (impact × how often the area changes), not by severity alone._
 
-_Previous snapshot: 2026-07-13, `main` @ c4355c2. Everything below was
-re-measured against the current tree; see "Changes since the last snapshot" for
-what turned out to be wrong._
+_Previous snapshots: 2026-08-01 (pre-refactor, `feature/scheduled-tasks` @
+727d9b8) and 2026-07-13 (`main` @ c4355c2). Everything below was re-measured
+against the current tree._
 
 ## How this was measured
 
-- **Churn** = number of commits touching a file across all 149 commits. High
+- **Churn** = number of commits touching a file across all 170 commits. High
   churn + high line count = a hotspot where debt compounds fastest.
 - Signals gathered: LOC/function counts, `git log` churn, duplicated
   vocabularies, broad `except`, `# type: ignore`, timing constants, type-sync
-  mechanism, gitignore hygiene, test hermeticity, CI coverage.
-- Claims were checked by running things, not by reading alone. The test finding
-  below was reproduced in a clean `git worktree` with the environment varied.
+  mechanism, gitignore hygiene, test hermeticity, CI coverage, import cycles.
+- Claims were checked by running things, not by reading alone.
 
 ---
 
 ## Tier 1 — structural, high-leverage
 
-### 1. `bot.py` is a god module (2,271 lines, 73 functions, **44 commits — #1 churn**)
+### 1. `streamer.py` is now the largest module (1,115 lines, 32 commits — #2 churn)
 
-A _god module_ is one file that holds too many unrelated jobs. This one holds:
-the message handler, **every** slash-command handler (12 of them: `/new`,
-`/rename`, `/status`, `/model`, `/effort`, `/cancel`, `/context`, `/diff`,
-`/browser`, `/artifacts`, `/delete`, `/schedule`), **all 12** inline-keyboard
-callback handlers (approvals, questions, and the delete and schedule pickers'
-paging/confirm), topic naming, keyboard construction, cleanup scheduling, and
-`build_application`. It is both the largest and most-changed file, so almost
-every feature edit lands here and the merge/reasoning surface is large.
+Its rendering layer moved out to `stream_render.py` (485 lines), which was the
+split the previous snapshot called for. What remains is genuinely one job —
+`DraftSession` and `stream_reply`: the draft/live-edit transport, the flush
+loop, and the tail check that keeps the answer at the bottom of the topic.
 
-It grew 616 lines (+37%) and 10 commits since the last snapshot, mostly from
-`/schedule`. It is growing faster than the rest of the backend.
+It is still the biggest file in the backend, but it is no longer a _god module_
+(one file holding several unrelated jobs). Splitting it further would mean
+cutting into the streaming state machine itself, where the answer-at-tail and
+collapsed-tool-stream invariants live. That is a real risk with a much smaller
+payoff than the split already done.
 
-**Direction:** split by concern — e.g. `commands/` (one module per command
-group), `callbacks.py` (inline-keyboard routing), `topics.py` (naming/rename/
-create). `build_application` becomes a thin registrar. This is still the single
-highest-value refactor.
+**Direction:** leave it unless it grows again. If it does, the next natural seam
+is the tool-burst collapsing state, not the transport.
 
-The `/schedule` work already moved in the right direction: it kept its store,
-parser and fire path out in `schedules.py`, and the message-free seam it needed
-(`open_topic_in_context`, `start_prompt`) is the `topics.py` extraction above,
-done in place. So the `commands/` split has less to untangle than it would have,
-but more lines to move.
+### 2. The streaming invariants are under-specified in tests
 
-### 2. `streamer.py` is the second god module (1,573 lines, 44 functions, 30 commits — #2 churn)
+The two subtle behaviours in `streamer.py` — the answer bubble being deleted and
+re-sent whenever anything lands below it, and tool bursts collapsing into
+expandable blockquotes — are load-bearing, and both were found by live testing
+rather than by a failing test. `test_streamer.py` covers them partially, through
+`DraftSession` with a fake transport.
 
-Owns draft transport, live-edit fallback, tool-burst collapsing, reasoning
-overflow ordering, tool label rendering, the live todo checklist, and
-finalization. The "answer-stays-at-tail" invariant and the collapsed-tool-stream
-logic are subtle and concentrated here. Worth extracting the rendering/label
-layer from the transport/flush layer.
+This is now the highest-value work in the backend: it is what would make further
+change to `streamer.py` safe, and it is the reason item 1 is left alone.
 
-Grew 237 lines and 7 commits since the last snapshot.
-
-### 3. `agent/claude_sdk_backend.py` is a new hotspot (1,067 lines, 27 functions, 23 commits)
-
-**New in this snapshot** — it was not called out as a hotspot before, and it
-should have been. It is now the third-largest and third-most-changed backend
-module (23 commits across its whole history), and it grew 431 lines in the 8
-commits since c4355c2.
-
-It carries several independent concerns: SDK message translation, the
-`_WIRE_TOOL`/`_CATEGORY` name maps, the TaskCreate/TaskUpdate → synthetic
-`todowrite` mirror, foreign-result detection (`_FOREIGN_RESULT_GRACE_S`), and the
-background-work turn-holding policy of ADR-0015. The last two encode timing
-policy that is easy to break by accident and hard to test.
-
-Unlike `bot.py`, this one is not obviously over-large yet — flagging it now so it
-gets split before it reaches `bot.py`'s size, not after.
-
-### 4. Tool & permission vocabulary is duplicated across 4+ files
-
-The same conceptual tool set (`read`/`edit`/`bash`/`grep`/…) is redefined, in
-slightly different string forms, in:
-
-| File | Shape |
-| --- | --- |
-| `opencode_tools.py` | `Tool` enum **and** `Permission` enum |
-| `permissions.py` | permission list / `parse_allowed_tool` |
-| `streamer.py` | `_TOOL_DISPLAY` (tool → label) |
-| `agent/claude_sdk_backend.py` | `_WIRE_TOOL` (SDK name → wire) + `_CATEGORY` |
-
-Adding or renaming a tool means editing all of them, and the SDK↔OpenCode name
-mapping (`LS`→`list`, `MultiEdit`→`edit`) lives only in `_WIRE_TOOL`. There is no
-single source of truth for "what tools exist and how each backend spells them."
-
-Unchanged since the last snapshot.
-
-**Direction:** one canonical tool registry (name, wire form, display label,
-permission category) that all four consumers derive from.
+**Direction:** table-drive the tail-check cases (a message landing below the
+bubble mid-stream, at finalize, and both) against the fake transport, so the
+invariant is stated once in tests rather than implied across several scenarios.
 
 ---
 
 ## Tier 2 — worth doing
 
-### 5. Tests are not hermetic: they read the real process environment
+### 3. Broad `except Exception` (48 uses)
 
-`Config` is a pydantic-settings model. Real environment variables take precedence
-over the repo-root `.env`, and the test fixtures do not isolate either one. So
-the suite's result depends on what is exported in the shell that runs it.
+Unchanged in count, but no longer concentrated. Previously 38 of the 48 sat in
+the two god modules; the largest single file now holds 16 (`streamer.py`), with
+the rest spread thinly (`topics.py` 7, `turns.py` 3, `callbacks.py` 3,
+`commands/delete.py` 3).
 
-On a machine with Balam's deployment environment exported, **5 tests fail**:
+Most log at `debug` with `exc_info=True` or carry an explanatory comment. They
+are mostly best-effort Telegram calls where failing loudly would be worse than
+carrying on — a cosmetic keyboard refresh, or an error notice that itself fails.
+Not silent swallowing, but the count only ever grows.
 
-- `test_miniapp.py` — `test_mini_app_reply_localhost_text_only`,
-  `test_markdown_button_none_without_public_url`,
-  `test_markdown_button_plain_url_without_shortname` (all from `BALAM_PUBLIC_URL`)
-- `test_agent_tools.py::test_send_file_markdown_without_public_url_sends_without_button`
-- `test_config.py::test_agent_backend_defaults_to_opencode` (from `AGENT_BACKEND=claude_sdk`)
+**Direction:** not a sweep. When touching one of these files, narrow the handler
+to the exception actually expected.
 
-Reproduced 2026-08-01: 581 passed / 5 failed with the deployment environment
-exported; **586 passed** with those variables cleared, in the same clean worktree.
+### 4. `config.example.yaml` / `.env.example` drift
 
-This matters most for Balam itself. The bot runs under systemd with that whole
-environment set, so an agent session running inside Balam inherits it — Balam
-cannot correctly run its own test suite, while a plain developer shell and CI both
-see green. That asymmetry is exactly the kind that wastes debugging time.
+Still not checked; worth a periodic diff against `config.py`'s validated fields.
+Cheap to automate now that CI exists — the same shape as the API drift check.
 
-**Direction:** make `make_config` (and the direct `Config()` constructions in
-tests) independent of the ambient environment — clear the `BALAM_*` /
-`AGENT_BACKEND` / `TELEGRAM_*` / `OPENCODE_*` variables in an autouse fixture, and
-pass `_env_file=None` as well. Both halves are needed; see the correction note
-below for why `_env_file=None` alone is not enough.
+### 5. Scattered timing constants
 
-### 6. Two agent backends duplicate normalization logic
-
-`opencode_backend.py` and `claude_sdk_backend.py` each translate their runtime's
-tool inputs/names into the shared `balam.agent.events` vocabulary. Some helpers
-are already shared (`collapse_mcp_name`, `_normalize_input` bridges `file_path`↔
-`filePath`), but display/category maps diverge. As backends are the pluggable
-seam (ADR-0014), keeping the normalization contract in one place — closer to
-`events.py` — would reduce drift as either runtime evolves.
-
-Overlaps with #4; a canonical tool registry would remove much of it.
-
-### 7. The frontend has no tests at all
-
-There is no test runner and no test file anywhere under `apps/frontend` or
-`packages/`. `typecheck` and `lint` are the only automated checks. The app is
-small (~1,334 hand-written lines) and mostly presentational, so this is a
-reasonable trade for now — but the diff viewer and the noVNC client have real
-logic, and nothing would catch a regression in either.
-
-**Direction:** if this stays untested, treat it as a deliberate choice and say so
-here. If not, `bun test` on the two `lib/` modules with real logic is the
-cheapest useful start.
+`draft_interval`, `asyncio.sleep(0.05)`, `httpx.Timeout(connect=10, …)`,
+`wait_for_ready(timeout=30, interval=0.5)`, `_FOREIGN_RESULT_GRACE_S`, and the
+ADR-0015 background-work cap. Not centralized; harmless, but would be easier to
+tune from one place.
 
 ---
 
 ## Tier 3 — minor / keep an eye on
 
-- **Broad `except Exception` (48 uses, up from ~40).** 38 of the 48 are in the
-  two god modules (`bot.py` 22, `streamer.py` 16). Audited a sample: most log at
-  `debug` with `exc_info=True` or carry an explanatory comment (e.g. the
-  native-draft fallback). Not silent swallowing today, but the count keeps
-  growing, and a new bare handler could hide a real error unnoticed.
 - **`# type: ignore` at seams (2).** `server.py:227` casts `None` to a `Router`
   for a test-only construction; `config.py:196` `call-arg` for env-sourced
-  settings. Both are load-bearing and commented; fine, just noted.
-- **Scattered timing constants** — `draft_interval`, `asyncio.sleep(0.05)`,
-  `httpx.Timeout(connect=10, …)`, `wait_for_ready(timeout=30, interval=0.5)`,
-  plus `_FOREIGN_RESULT_GRACE_S` and the ADR-0015 background-work cap in
-  `claude_sdk_backend.py`. Not centralized; harmless but would be easier to tune
-  from one place.
-- **`config.example.yaml` / `.env.example` drift** — still not checked; worth a
-  periodic diff against `config.py`'s validated fields.
+  settings. Both are load-bearing and commented.
+- **Two deferred imports in `server.py`** (`contexts`, `store`, inside a
+  function). These serve a test-only app construction rather than breaking a
+  cycle. Worth confirming next time that file is touched.
+- **Frontend test coverage is one module deep.** `resolveLaunch` is covered; the
+  diff viewer and the noVNC client are not. A deliberate starting point, not a
+  claim of coverage.
 
 ---
 
-## Changes since the last snapshot
+## What the refactor changed
 
-Three findings from the 2026-07-13 doc did not survive re-checking. Recorded here
-so the same ground is not re-covered.
+All five structural items from the previous snapshot are resolved.
 
-- **"`balam.db` sits untracked in the repo root and is not gitignored" — wrong,
-  now removed.** The database is `balam.sqlite` (`config.py` `db_path` default,
-  and `BALAM_DB_PATH` in `.env.example`). `*.sqlite` has been in `.gitignore` all
-  along, and no file named `balam.db` exists in the repo. `git status` is clean.
-  The one real `balam.db` on this machine belongs to OpenCode and lives at
-  `~/.local/share/opencode/balam.db`, outside the repo. Nothing to fix.
+### `bot.py` split: 2,271 → 323 lines
 
-- **"Generated file is dated Jun 11; `server.py` has changed since" — no drift
-  exists.** Running `bun run gen:api` on this tree regenerates
-  `packages/shared/src/api.ts` byte-for-byte identically. Both files last changed
-  on Jun 11, in the same noVNC feature. The *risk* was real — nothing enforced
-  it — but the claimed drift was not. Now enforced by CI (see below).
+It was the largest and most-changed file in the repo, holding the message
+handler, all 12 slash commands, all 12 inline-keyboard callbacks, topic naming
+and creation, turn running, and `build_application`. It is now the plain-message
+path plus the registrar. Ten modules came out, one commit each:
 
-- **"Deployed `.env` leaks into 5 tests" — right symptom, wrong cause, and the
-  proposed fix would not have worked.** The failures persist in a clean worktree
-  that has no `.env` at all, so the file is not the source. The values come from
-  real exported environment variables. `_env_file=None` only disables the file,
-  and pydantic-settings reads real environment variables at *higher* precedence,
-  so that fix alone would leave all 5 tests failing. Rewritten as #5 above with
-  the correct cause and fix.
+| Module | What it owns |
+| --- | --- |
+| `message_text.py` | Turning a Telegram message into the text the agent sees |
+| `topics.py` | Naming, opening and linking forum topics |
+| `turns.py` | Running a turn (joined the existing turn data structures) |
+| `auth.py` | The ADR-0008 trust boundary |
+| `pickers.py` | The paged multi-select shared by `/delete` and `/schedule` |
+| `callbacks.py` | Approval and question replies |
+| `commands/session.py` | `/context` `/new` `/status` `/model` `/effort` `/rename` `/cancel` |
+| `commands/views.py` | `/diff` `/browser` `/artifacts` |
+| `commands/delete.py` | `/delete` and its callbacks |
+| `commands/schedule.py` | `/schedule` and its callbacks |
 
-### Resolved
+The dependency arrow now points one way: `bot.py` imports these; none of them
+imports `bot.py`.
 
-- **No CI existed.** The previous doc proposed wiring the `gen:api` drift check
-  into CI, but the repo had no `.github/workflows` directory at all, so there was
-  nothing to wire it into. Added in the same change as this snapshot:
-  `.github/workflows/ci.yml` runs three jobs on every push to `main` and every
-  PR — backend (`ruff check`, `ruff format --check`, `pytest`), frontend
-  (`typecheck`, `lint`), and the API type drift check (regenerate, fail if the
-  tree changed). The drift job was verified in both directions: it passes on the
-  current tree, and it fails when a route is added to `server.py` without
-  regenerating.
+### An import cycle is gone
+
+`schedules.py` could not import `bot.py` at module scope — `bot.py` imports
+`schedules` for the `/schedule` handlers — so it reached inside a function for
+`TopicOpenError`, `open_topic_in_context` and `start_prompt`. All three now live
+in `topics.py` and `turns.py`, neither of which imports `schedules`.
+`schedules.py` has no deferred imports left.
+
+### The tool registry (item 4 of the previous snapshot)
+
+`tools.py` holds one `REGISTRY` of `ToolSpec` entries — wire name, display
+label, permission category, SDK spellings. `streamer.py`, `claude_sdk_backend.py`
+and `permissions.py` derive their lookups from it instead of keeping four partial
+copies. The derived maps were diffed against the deleted ones and are identical,
+except that `websearch` had been missing from the display map and so rendered
+lowercase; completing the vocabulary fixed that.
+
+### Tests are hermetic (item 5 of the previous snapshot)
+
+An autouse fixture deletes any environment variable matching a `Config` field and
+neutralizes the repo-root `.env` for every test. The suite now passes in the
+environment Balam itself runs in.
+
+Worth recording, because the previous snapshot's proposed fix was wrong:
+`test_config.py` already passed `_env_file=None` with a comment claiming that
+made the tests hermetic, and still failed. That only disables the file; real
+environment variables bind at higher precedence.
+
+### `claude_sdk_backend.py`: 1,067 → 820 lines
+
+`agent/sdk_tasks.py` (the CLI task-list mirror and `LiveTasks`) and
+`agent/sdk_translate.py` (the SDK↔OpenCode vocabulary boundary) came out. What
+stays is the query loop, foreign-result detection, and the ADR-0015
+background-hold policy.
+
+### CI now exists, and covers more
+
+`.github/workflows/ci.yml`: backend (`ruff check`, `ruff format --check`,
+`pytest`), frontend (`typecheck`, `lint`, `test`), and the generated-API-types
+drift check. The drift job was verified in both directions — it passes on a clean
+tree and fails when a route is added to `server.py` without regenerating.
+
+### The frontend has its first tests
+
+`resolveLaunch` — how the Mini App decides what to show and which workspace to
+act on — is covered by 10 `bun test` cases, wired into `bun run test` and CI.
 
 ---
 
 ## What is notably clean (not debt)
 
-- Test coverage is broad: **22 test modules**, one per source module including
-  the two backends, permissions, approvals, streamer, schedules, and router.
-  586 tests pass in a clean environment.
-- `ruff check`, `ruff format --check`, `bun run typecheck` and `bun run lint` are
-  all green on this tree, with no suppressions beyond the two noted above.
+- **23 test modules, 594 backend tests plus 10 frontend tests**, all passing in a
+  clean environment _and_ in the deployment environment.
+- `ruff check`, `ruff format --check`, `bun run typecheck`, `bun run lint` and
+  both test suites are green, with no suppressions beyond the two noted above.
+- No import cycles anywhere in the backend; verified by importing every module.
 - ADRs are thorough and referenced from code comments — the _why_ is captured.
-- `api.ts` (frontend) is a hand-written typed client that imports generated types
-  from `@balam/shared`; it is not a parallel type definition.
-- Broad excepts largely log rather than swallow (see Tier 3).
-- `opencode_tools.py` keeps the `Tool` and `Permission` enums deliberately
-  separate, with a comment explaining exactly where they diverge. The duplication
-  in #4 is across files, not inside this one.
+- `api.ts` is a hand-written typed client over generated types, not a parallel
+  type definition, and CI now proves the generated half is in sync.
+
+Backend line count rose (11,068 → 11,509) despite no behaviour change. That is
+the cost of the split: 13 new modules, each with a docstring explaining what it
+owns and why it is separate. The trade is deliberate — total lines up about 4%,
+while the largest file dropped by 86%.
 
 ---
 
 ## Recommended order of attack
 
-Ordered by value per unit of risk. The first two are small and make the rest
-safer to attempt.
-
-1. **Make the tests hermetic (#5)** — small, self-contained, and it is the only
-   item currently costing time on every run. Do this first: until it is done,
-   Balam cannot run its own suite, which makes every later refactor harder to
-   verify from inside the bot.
-2. **Introduce the canonical tool registry (#4)** — medium, well-bounded, and it
-   removes most of #6 as a side effect. Unblocks safe work on either backend.
-3. **Split `bot.py` by command group (#1)** — the big one. Do it incrementally,
-   one command module at a time, leaning on `test_bot.py`. Land each module as
-   its own commit so a regression is easy to bisect.
-4. **Extract `streamer.py`'s rendering layer (#2)** — after #3, and carefully:
-   the answer-at-tail and collapsed-tool-stream invariants live here and are
-   under-specified in tests.
-5. **Split `claude_sdk_backend.py` (#3)** — lowest urgency of the four
-   structural items, but the cheapest to do *now* rather than at 2,000 lines.
-6. **Decide on frontend tests (#7)** — either write the first few or record the
-   decision not to.
+1. **Pin the streaming invariants in tests (#2)** — the highest-value work left,
+   and what makes any further change to `streamer.py` safe.
+2. **Add the config-example drift check (#4)** — small, and CI is now there to
+   run it.
+3. **Leave `streamer.py` alone (#1)** unless it grows. The remaining split cuts
+   into the state machine, so #2 should come first.
+4. Narrow broad excepts opportunistically (#3), when already in the file.
