@@ -36,22 +36,32 @@ collapsed-tool-stream invariants live. That is a real risk with a much smaller
 payoff than the split already done.
 
 **Direction:** leave it unless it grows again. If it does, the next natural seam
-is the tool-burst collapsing state, not the transport.
+is the tool-burst collapsing state, not the transport. It is now safer to attempt
+than the previous snapshot implied — see item 2.
 
-### 2. The streaming invariants are under-specified in tests
+Remaining uncovered lines in `streamer.py` are mostly best-effort Telegram error
+branches (a failed edit, a failed delete) whose only behaviour is to log and
+carry on. Those are cheap to reach and low value to pin.
 
-The two subtle behaviours in `streamer.py` — the answer bubble being deleted and
-re-sent whenever anything lands below it, and tool bursts collapsing into
-expandable blockquotes — are load-bearing, and both were found by live testing
-rather than by a failing test. `test_streamer.py` covers them partially, through
-`DraftSession` with a fake transport.
+### 2. ~~The streaming invariants are under-specified in tests~~ — corrected
 
-This is now the highest-value work in the backend: it is what would make further
-change to `streamer.py` safe, and it is the reason item 1 is left alone.
+**This claim was wrong, and is recorded here rather than quietly deleted.**
 
-**Direction:** table-drive the tail-check cases (a message landing below the
-bubble mid-stream, at finalize, and both) against the fake transport, so the
-invariant is stated once in tests rather than implied across several scenarios.
+The previous snapshot said the answer-at-tail and collapsed-tool-stream
+invariants were under-specified. Measuring instead of asserting shows they were
+already well covered: `test_streamer.py` has ten tests on the tail check alone
+(`_drop_if_stale` at flush and at finalize, delete-failure fallback, no-tail,
+overflow deferral, re-anchor below a question) and six on tool-group collapsing.
+
+What was actually thin, at 77% line coverage, was the **pure rendering** half —
+the per-tool branches of `_tool_summary` and `_group_phrase`. Splitting
+`stream_render.py` out is what made that visible and cheap to fix.
+
+Now covered: `stream_render.py` 77% → **96%**, `streamer.py` 86% → **91%**
+(measured with `pytest-cov`, which is not a project dependency — run it with
+`uv run --with pytest-cov pytest --cov=balam.streamer --cov=balam.stream_render`).
+
+The lesson worth keeping: "feels untested" is not evidence. Measure first.
 
 ---
 
@@ -196,10 +206,11 @@ while the largest file dropped by 86%.
 
 ## Recommended order of attack
 
-1. **Pin the streaming invariants in tests (#2)** — the highest-value work left,
-   and what makes any further change to `streamer.py` safe.
-2. **Add the config-example drift check (#4)** — small, and CI is now there to
-   run it.
-3. **Leave `streamer.py` alone (#1)** unless it grows. The remaining split cuts
-   into the state machine, so #2 should come first.
-4. Narrow broad excepts opportunistically (#3), when already in the file.
+1. **Add the config-example drift check (#4)** — now the cheapest real win, and
+   CI is there to run it.
+2. **Leave `streamer.py` alone (#1)** unless it grows. It is one job at 1,115
+   lines, and the rendering split already took the easy half.
+3. Narrow broad excepts opportunistically (#3), when already in the file.
+4. Consider adding `pytest-cov` as a dev dependency and a coverage floor to CI.
+   Item 2 is a worked example of guessing wrong about coverage; a number in CI
+   removes the guessing.
