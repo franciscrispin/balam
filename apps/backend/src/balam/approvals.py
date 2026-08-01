@@ -21,6 +21,11 @@ unknown categories — prompts. The *opt-in* half (translating ``allowed_tools``
 ``additional_directories`` into native OpenCode ``allow`` rules) lives in
 :mod:`balam.permissions`; tools pre-approved there never reach this layer. Human
 approval is the backstop for everything else.
+
+That backstop assumes a human. A **scheduled** turn (ADR-0016) has none, and the
+prompt has no timeout, so :func:`decide` takes an ``unattended`` flag that turns
+every would-be prompt into a hard :attr:`Verdict.DENY` instead of a wait nobody
+will ever end.
 """
 
 from __future__ import annotations
@@ -83,6 +88,7 @@ class Verdict(Enum):
 
     ALLOW = "allow"  # auto-approve without asking (reply "once")
     ASK = "ask"  # prompt the user with an inline keyboard
+    DENY = "deny"  # refuse outright — nobody is watching to be asked (ADR-0016)
 
 
 def _resolve(path: str, cwd: str | None) -> str:
@@ -137,6 +143,7 @@ def decide(
     *,
     allowed_dirs: list[str],
     accept_all_edits: bool,
+    unattended: bool = False,
 ) -> Verdict:
     """The directory-boundary policy, keyed on OpenCode's permission *category*.
 
@@ -145,21 +152,36 @@ def decide(
     target is in-workspace (one out-of-scope path still asks); Bash, network, and
     everything else always asks. ``target_paths`` are the absolute paths the
     request touches (see :func:`request_target_paths`).
+
+    ``unattended`` marks a turn no human started — a scheduled run at 07:30
+    (ADR-0016). There is nobody to tap the keyboard, and the prompt has no
+    timeout, so every :attr:`Verdict.ASK` would park the turn forever and wedge
+    the topic behind it. Such a turn keeps the in-workspace read and gets
+    :attr:`Verdict.DENY` for everything else: the agent receives a refusal it can
+    reason about and still finish, and the owner can read what it wanted and
+    re-run it by hand.
     """
+    #: A request we would normally hand to the user. With nobody watching, the
+    #: only safe answer is "no" — see the ``unattended`` note above.
+    blocked = Verdict.DENY if unattended else Verdict.ASK
+    in_workspace = bool(target_paths) and all(is_within(p, allowed_dirs) for p in target_paths)
+
     if category in READ_CATEGORIES:
-        if target_paths and all(is_within(p, allowed_dirs) for p in target_paths):
+        if in_workspace:
             return Verdict.ALLOW
-        return Verdict.ASK
+        return blocked
 
     if category == EDIT_CATEGORY:
+        # Never auto-allow an edit unattended, even in-workspace: "accept all
+        # edits" is a choice a human made for a session they were watching.
+        if unattended:
+            return Verdict.DENY
         if not accept_all_edits:
             return Verdict.ASK
-        if target_paths and all(is_within(p, allowed_dirs) for p in target_paths):
-            return Verdict.ALLOW
-        return Verdict.ASK
+        return Verdict.ALLOW if in_workspace else Verdict.ASK
 
     # Bash, network, subagents, unknown/MCP categories: always ask.
-    return Verdict.ASK
+    return blocked
 
 
 class Choice(StrEnum):
@@ -450,45 +472,50 @@ class PendingQuestions:
 
 
 @dataclass
-class _PendingDeletion:
+class _PendingPick:
     chat_id: int
-    thread_ids: list[int]
+    item_ids: list[int]
     labels: list[str]
     selected: set[int] = field(default_factory=set)
     page: int = 0
 
 
-class PendingDeletions:
-    """Outstanding ``/delete`` topic-picker selections, keyed by callback token.
+class PendingPicks:
+    """Outstanding paged multi-select picker state, keyed by callback token.
+
+    Two commands use this shape: ``/delete`` picks forum topics (by thread id) and
+    ``/schedule cancel`` picks schedules (by schedule id, ADR-0016). Both are a
+    checklist over ``(id, label)`` pairs, so both share this class rather than
+    growing a second picker idiom; only the callback prefixes and what confirm
+    *does* with the ids differ.
 
     Unlike :class:`PendingApprovals` / :class:`PendingQuestions` there is no future
     to resolve — the picker is a purely Telegram-side multi-select, and the confirm
-    callback reads the chosen thread ids and deletes the topics itself. One instance
+    callback reads the chosen ids and acts on them itself. One instance per command
     lives in ``bot_data`` for the bot's lifetime; tokens are discarded on confirm or
     cancel.
 
-    The full topic list is snapshotted at ``/delete`` time and paged one
-    :data:`PAGE_SIZE`-sized window at a time; selection is tracked by ``thread_id``
-    across the whole snapshot, so topics chosen on different pages are all deleted
-    together on confirm.
+    The full list is snapshotted when the command runs and paged one
+    :data:`PAGE_SIZE`-sized window at a time; selection is tracked by id across the
+    whole snapshot, so items chosen on different pages are all acted on together.
     """
 
-    #: Topics shown per picker page. Small enough that the keyboard stays tappable
+    #: Items shown per picker page. Small enough that the keyboard stays tappable
     #: and Prev/Next is meaningful, well under Telegram's ~100-button cap.
     PAGE_SIZE = 8
 
     def __init__(self) -> None:
-        self._pending: dict[str, _PendingDeletion] = {}
+        self._pending: dict[str, _PendingPick] = {}
 
-    def register(self, chat_id: int, topics: list[tuple[int, str]]) -> str:
-        """Open a picker over ``topics`` (``(thread_id, label)`` pairs); return its
+    def register(self, chat_id: int, items: list[tuple[int, str]]) -> str:
+        """Open a picker over ``items`` (``(id, label)`` pairs); return its
         callback token. The full list is kept and paged; nothing is selected
         initially and the picker opens on the first page."""
         token = uuid.uuid4().hex[:16]
-        self._pending[token] = _PendingDeletion(
+        self._pending[token] = _PendingPick(
             chat_id=chat_id,
-            thread_ids=[thread_id for thread_id, _ in topics],
-            labels=[label for _, label in topics],
+            item_ids=[item_id for item_id, _ in items],
+            labels=[label for _, label in items],
         )
         return token
 
@@ -499,24 +526,24 @@ class PendingDeletions:
         pending = self._pending.get(token)
         return pending.chat_id if pending else None
 
-    def _page_count(self, pending: _PendingDeletion) -> int:
-        return max(1, -(-len(pending.thread_ids) // self.PAGE_SIZE))
+    def _page_count(self, pending: _PendingPick) -> int:
+        return max(1, -(-len(pending.item_ids) // self.PAGE_SIZE))
 
     def entries(self, token: str) -> list[tuple[int, str, bool]] | None:
-        """``(thread_id, label, is_selected)`` for the current page's window, in
-        display order. Selection state reflects the whole snapshot, not just this
-        page. ``None`` if the token expired."""
+        """``(id, label, is_selected)`` for the current page's window, in display
+        order. Selection state reflects the whole snapshot, not just this page.
+        ``None`` if the token expired."""
         pending = self._pending.get(token)
         if pending is None:
             return None
         start = pending.page * self.PAGE_SIZE
-        window = list(zip(pending.thread_ids, pending.labels, strict=True))[
+        window = list(zip(pending.item_ids, pending.labels, strict=True))[
             start : start + self.PAGE_SIZE
         ]
-        return [(thread_id, label, thread_id in pending.selected) for thread_id, label in window]
+        return [(item_id, label, item_id in pending.selected) for item_id, label in window]
 
     def page_info(self, token: str) -> tuple[int, int, int, int] | None:
-        """``(page, page_count, total_topics, selected_count)`` for the picker, or
+        """``(page, page_count, total_items, selected_count)`` for the picker, or
         ``None`` if the token expired. ``page`` is zero-based."""
         pending = self._pending.get(token)
         if pending is None:
@@ -524,7 +551,7 @@ class PendingDeletions:
         return (
             pending.page,
             self._page_count(pending),
-            len(pending.thread_ids),
+            len(pending.item_ids),
             len(pending.selected),
         )
 
@@ -537,22 +564,22 @@ class PendingDeletions:
         pending.page = max(0, min(page, self._page_count(pending) - 1))
         return pending.page
 
-    def toggle(self, token: str, thread_id: int) -> bool | None:
-        """Flip a topic's selection; ``True``/``False`` for the new state, or
-        ``None`` if the token expired or the thread isn't in this picker."""
+    def toggle(self, token: str, item_id: int) -> bool | None:
+        """Flip an item's selection; ``True``/``False`` for the new state, or
+        ``None`` if the token expired or the item isn't in this picker."""
         pending = self._pending.get(token)
-        if pending is None or thread_id not in pending.thread_ids:
+        if pending is None or item_id not in pending.item_ids:
             return None
-        if thread_id in pending.selected:
-            pending.selected.discard(thread_id)
+        if item_id in pending.selected:
+            pending.selected.discard(item_id)
             return False
-        pending.selected.add(thread_id)
+        pending.selected.add(item_id)
         return True
 
-    def selected_thread_ids(self, token: str) -> list[int] | None:
-        """Selected thread ids across the whole snapshot, in display order, or
-        ``None`` if the token expired."""
+    def selected_ids(self, token: str) -> list[int] | None:
+        """Selected ids across the whole snapshot, in display order, or ``None``
+        if the token expired."""
         pending = self._pending.get(token)
         if pending is None:
             return None
-        return [t for t in pending.thread_ids if t in pending.selected]
+        return [i for i in pending.item_ids if i in pending.selected]

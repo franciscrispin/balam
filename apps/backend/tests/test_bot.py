@@ -2,13 +2,15 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from telegram import Chat, Message, MessageEntity, PhotoSize, Update, User
 from telegram.error import BadRequest
-from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler, JobQueue, MessageHandler
 
+from balam import schedules
 from balam.agent.opencode_backend import OpenCodeBackend
-from balam.approvals import Choice, PendingApprovals, PendingDeletions, PendingQuestions
+from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuestions
 from balam.bot import (
     BOT_COMMANDS,
     _forward_reply_prefix,
@@ -27,6 +29,10 @@ from balam.bot import (
     _handle_question_custom_callback,
     _handle_question_done_callback,
     _handle_rename,
+    _handle_schedule,
+    _handle_schedule_confirm_callback,
+    _handle_schedule_dismiss_callback,
+    _handle_schedule_toggle_callback,
     _handle_status,
     _strip_bot_mention_from_command,
     _topic_link,
@@ -1907,7 +1913,7 @@ class _DeleteBot(_FakeBot):
         await super().delete_forum_topic(chat_id=chat_id, message_thread_id=message_thread_id)
 
 
-def _delete_callback_env(query: _FakeQuery, pending_deletions: PendingDeletions, bot: _FakeBot):
+def _delete_callback_env(query: _FakeQuery, pending_deletions: PendingPicks, bot: _FakeBot):
     config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=None)
     router = _router()
     update = SimpleNamespace(callback_query=query)
@@ -1930,7 +1936,7 @@ async def test_delete_confirm_purges_topics_already_gone_from_telegram() -> None
     # permanent failure — the API answers TOPIC_ID_INVALID and the row was never
     # purged, so it kept reappearing in the picker, un-clearable. Now the stale
     # row is purged and the deletion counts as success.
-    pending = PendingDeletions()
+    pending = PendingPicks()
     token = pending.register(SUPERGROUP, [(101, "live"), (202, "stale")])
     assert pending.toggle(token, 101) is True
     assert pending.toggle(token, 202) is True
@@ -1960,8 +1966,8 @@ def _topics(n: int) -> list[tuple[int, str]]:
 
 def test_delete_picker_pages_the_snapshot() -> None:
     # The picker windows the full snapshot PAGE_SIZE topics at a time.
-    pending = PendingDeletions()
-    size = PendingDeletions.PAGE_SIZE
+    pending = PendingPicks()
+    size = PendingPicks.PAGE_SIZE
     token = pending.register(SUPERGROUP, _topics(size * 2 + 1))
 
     page, page_count, total, selected = pending.page_info(token)
@@ -1980,8 +1986,8 @@ def test_delete_picker_pages_the_snapshot() -> None:
 def test_delete_picker_selection_persists_across_pages() -> None:
     # A topic checked on one page stays selected after paging away and is included
     # at confirm — the whole point of real pagination over the old cap.
-    pending = PendingDeletions()
-    size = PendingDeletions.PAGE_SIZE
+    pending = PendingPicks()
+    size = PendingPicks.PAGE_SIZE
     token = pending.register(SUPERGROUP, _topics(size + 2))
 
     assert pending.toggle(token, 1) is True  # page 0
@@ -1989,19 +1995,19 @@ def test_delete_picker_selection_persists_across_pages() -> None:
     assert pending.toggle(token, size + 2) is True  # page 1
     # Selection count spans the snapshot, not just the visible page.
     assert pending.page_info(token)[3] == 2
-    assert pending.selected_thread_ids(token) == [1, size + 2]
+    assert pending.selected_ids(token) == [1, size + 2]
 
 
 def test_delete_picker_expired_token_is_inert() -> None:
-    pending = PendingDeletions()
+    pending = PendingPicks()
     assert pending.entries("nope") is None
     assert pending.page_info("nope") is None
     assert pending.set_page("nope", 0) is None
 
 
 async def test_delete_page_callback_flips_page_keeping_selection() -> None:
-    pending = PendingDeletions()
-    size = PendingDeletions.PAGE_SIZE
+    pending = PendingPicks()
+    size = PendingPicks.PAGE_SIZE
     token = pending.register(SUPERGROUP, _topics(size + 1))
     assert pending.toggle(token, 1) is True
 
@@ -2013,12 +2019,12 @@ async def test_delete_page_callback_flips_page_keeping_selection() -> None:
 
     # The picker advanced and re-rendered; the selection survived the page flip.
     assert pending.page_info(token)[0] == 1
-    assert pending.selected_thread_ids(token) == [1]
+    assert pending.selected_ids(token) == [1]
     assert message.reply_markups  # keyboard was refreshed
 
 
 async def test_delete_page_callback_on_expired_token_clears_keyboard() -> None:
-    pending = PendingDeletions()
+    pending = PendingPicks()
     message = _FakeCBMessage()
     query = _FakeQuery("delp:gone:1", OWNER, message)
     update, context, _ = _delete_callback_env(query, pending, _FakeBot())
@@ -2099,3 +2105,427 @@ async def test_mid_turn_message_falls_back_to_queue_when_turn_is_closing(monkeyp
     await running.task
     while (turn := turns.get(SUPERGROUP, 5)) is not None:
         await turn.task
+
+
+# --- /schedule (ADR-0016) -----------------------------------------------------
+
+
+def _schedule_env(message: _FakeMessage, args: list[str], *, bot: _FakeBot | None = None):
+    """An (update, context) pair for /schedule, plus the store/bot/turns handles."""
+    bot = bot or _FakeBot(new_thread_id=555)
+    store = SessionStore(":memory:")
+    contexts = ContextsConfig(
+        default_context="chaska",
+        contexts={
+            "chaska": ContextConfig(directory="/work/chaska", description="Chaska"),
+            "balam": ContextConfig(directory="/work/balam", description="Balam"),
+        },
+    )
+    router = Router(store, _FakeOpenCode(), contexts)
+    turns = TurnRegistry()
+    update = SimpleNamespace(message=message)
+    context = SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={
+                "router": router,
+                "store": store,
+                "turns": turns,
+                "backend": OpenCodeBackend(_FakeOpenCode()),
+                "pending": PendingApprovals(),
+                "pending_schedule_picks": PendingPicks(),
+                "config": SimpleNamespace(
+                    timezone=ZoneInfo("Asia/Singapore"),
+                    allowed_telegram_user_id=OWNER,
+                    allowed_telegram_chat_id=None,
+                    tool_stream="collapsed",
+                    rich_messages=False,
+                ),
+            },
+            job_queue=JobQueue(),
+        ),
+        bot=bot,
+        args=args,
+    )
+    return update, context, store, bot, turns
+
+
+def test_bot_commands_includes_schedule() -> None:
+    assert "schedule" in {c.command for c in BOT_COMMANDS}
+
+
+async def test_schedule_create_saves_and_arms_a_timer() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 chaska plan my day")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["daily", "07:30", "chaska", "plan", "my", "day"]
+    )
+
+    await _handle_schedule(update, context)
+
+    (row,) = store.list_schedules(SUPERGROUP)
+    assert (row.context, row.prompt, row.kind) == ("chaska", "plan my day", "daily")
+    assert (row.hour, row.minute, row.days) == (7, 30, None)
+    # And the timer exists, named after the row, so it actually fires.
+    assert len(context.application.job_queue.get_jobs_by_name(f"schedule:{row.id}")) == 1
+    assert "every day at 07:30" in message.replies[-1]
+
+
+async def test_schedule_create_keeps_line_breaks_in_the_prompt() -> None:
+    # context.args is a whitespace split; the prompt comes from the raw text.
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 chaska first line\nsecond")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["daily", "07:30", "chaska", "first", "line", "second"]
+    )
+
+    await _handle_schedule(update, context)
+
+    assert store.list_schedules(SUPERGROUP)[0].prompt == "first line\nsecond"
+
+
+async def test_schedule_create_stores_weekdays_in_python_numbering() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule weekdays 09:00 balam standup")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["weekdays", "09:00", "balam", "standup"]
+    )
+
+    await _handle_schedule(update, context)
+
+    assert store.list_schedules(SUPERGROUP)[0].days == "0,1,2,3,4"
+
+
+async def test_schedule_create_rejects_an_unknown_context_without_saving() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 nope do a thing")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["daily", "07:30", "nope", "do", "a", "thing"]
+    )
+
+    await _handle_schedule(update, context)
+
+    assert store.list_schedules(SUPERGROUP) == []
+    assert "Unknown context" in message.replies[-1]
+
+
+async def test_schedule_create_rejects_a_bad_time_without_saving() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 25:00 chaska x")
+    update, context, store, _bot, _turns = _schedule_env(message, ["daily", "25:00", "chaska", "x"])
+
+    await _handle_schedule(update, context)
+
+    assert store.list_schedules(SUPERGROUP) == []
+    assert "/schedule daily 07:30" in message.replies[-1]
+
+
+async def test_schedule_create_requires_a_prompt() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 chaska")
+    update, context, store, _bot, _turns = _schedule_env(message, ["daily", "07:30", "chaska"])
+
+    await _handle_schedule(update, context)
+
+    assert store.list_schedules(SUPERGROUP) == []
+    assert "prompt" in message.replies[-1]
+
+
+async def test_schedule_list_shows_saved_schedules() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule")
+    update, context, store, _bot, _turns = _schedule_env(message, [])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="plan my day",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+
+    await _handle_schedule(update, context)
+
+    reply = message.replies[-1]
+    assert "#1" in reply and "every day at 07:30" in reply and "chaska" in reply
+    # The timezone is named, because 07:30 is meaningless without it.
+    assert "Asia/Singapore" in reply
+
+
+async def test_schedule_list_is_empty_with_usage() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule")
+    update, context, _store, _bot, _turns = _schedule_env(message, [])
+
+    await _handle_schedule(update, context)
+
+    assert "No schedules yet" in message.replies[-1]
+
+
+async def test_schedule_off_pauses_and_drops_the_timer() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule off 1")
+    update, context, store, _bot, _turns = _schedule_env(message, ["off", "1"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+    schedules.register_one(
+        context.application.job_queue,
+        schedules.Schedule.from_row(store.get_schedule(1)),
+        ZoneInfo("Asia/Singapore"),
+    )
+
+    await _handle_schedule(update, context)
+
+    assert store.get_schedule(1).enabled == 0
+    assert context.application.job_queue.get_jobs_by_name("schedule:1") == ()
+    assert "Paused" in message.replies[-1]
+
+
+async def test_schedule_on_resumes_and_rearms_the_timer() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule on 1")
+    update, context, store, _bot, _turns = _schedule_env(message, ["on", "1"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+    store.set_schedule_enabled(1, False)
+
+    await _handle_schedule(update, context)
+
+    assert store.get_schedule(1).enabled == 1
+    assert len(context.application.job_queue.get_jobs_by_name("schedule:1")) == 1
+
+
+async def test_schedule_by_id_refuses_a_schedule_from_another_chat() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule off 1")
+    update, context, store, _bot, _turns = _schedule_env(message, ["off", "1"])
+    store.add_schedule(
+        chat_id=999,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+
+    await _handle_schedule(update, context)
+
+    assert store.get_schedule(1).enabled == 1
+    assert "No schedule #1 here" in message.replies[-1]
+
+
+async def test_schedule_run_fires_it_now_unattended(monkeypatch) -> None:
+    # The point of /schedule run: a 24-hour feedback loop becomes a 5-second one.
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule run 1")
+    update, context, store, bot, turns = _schedule_env(message, ["run", "1"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="plan my day",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+
+    await _handle_schedule(update, context)
+    turn = turns.get(SUPERGROUP, 555)
+    assert turn is not None
+    await turn.task
+
+    assert bot.created_topics == [(SUPERGROUP, "chaska: plan my day")]
+    assert captured["prompt"] == "plan my day"
+    assert captured["unattended"] is True
+
+
+async def test_schedule_cancel_opens_a_picker() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule cancel")
+    update, context, store, _bot, _turns = _schedule_env(message, ["cancel"])
+    for hour in (7, 9):
+        store.add_schedule(
+            chat_id=SUPERGROUP,
+            context="chaska",
+            prompt="p",
+            kind="daily",
+            hour=hour,
+            minute=0,
+            days=None,
+            created_at=1,
+        )
+
+    await _handle_schedule(update, context)
+
+    labels = _button_texts(message.reply_markups[-1])
+    assert any("#1" in label for label in labels)
+    assert any("#2" in label for label in labels)
+    assert any("Cancel selected" in label for label in labels)
+
+
+async def test_schedule_cancel_with_nothing_to_cancel() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule cancel")
+    update, context, _store, _bot, _turns = _schedule_env(message, ["cancel"])
+
+    await _handle_schedule(update, context)
+
+    assert message.replies[-1] == "No schedules to cancel."
+
+
+def _schedule_callback_env(query: _FakeQuery, picks: PendingPicks, store: SessionStore):
+    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=None)
+    update = SimpleNamespace(callback_query=query)
+    context = SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={
+                "config": config,
+                "pending_schedule_picks": picks,
+                "store": store,
+            },
+            job_queue=JobQueue(),
+        ),
+        bot=_FakeBot(),
+    )
+    return update, context
+
+
+async def test_schedule_confirm_deletes_the_selected_rows_and_their_timers() -> None:
+    store = SessionStore(":memory:")
+    for hour in (7, 9):
+        store.add_schedule(
+            chat_id=SUPERGROUP,
+            context="chaska",
+            prompt="p",
+            kind="daily",
+            hour=hour,
+            minute=0,
+            days=None,
+            created_at=1,
+        )
+    picks = PendingPicks()
+    token = picks.register(SUPERGROUP, [(1, "#1"), (2, "#2")])
+    picks.toggle(token, 1)
+
+    cb_message = _FakeCBMessage()
+    query = _FakeQuery(f"schd:{token}", OWNER, cb_message)
+    update, context = _schedule_callback_env(query, picks, store)
+    schedules.register_one(
+        context.application.job_queue,
+        schedules.Schedule.from_row(store.get_schedule(1)),
+        ZoneInfo("Asia/Singapore"),
+    )
+
+    await _handle_schedule_confirm_callback(update, context)
+
+    assert store.get_schedule(1) is None
+    assert store.get_schedule(2) is not None  # unselected, untouched
+    assert context.application.job_queue.get_jobs_by_name("schedule:1") == ()
+    assert "Cancelled 1 schedule(s)." in cb_message.edited[-1]
+
+
+async def test_schedule_confirm_requires_a_selection() -> None:
+    store = SessionStore(":memory:")
+    picks = PendingPicks()
+    token = picks.register(SUPERGROUP, [(1, "#1")])
+    query = _FakeQuery(f"schd:{token}", OWNER, _FakeCBMessage())
+    update, context = _schedule_callback_env(query, picks, store)
+
+    await _handle_schedule_confirm_callback(update, context)
+
+    assert query.answers[-1] == "Select at least one schedule."
+
+
+async def test_schedule_confirm_ignores_a_stranger() -> None:
+    store = SessionStore(":memory:")
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=0,
+        days=None,
+        created_at=1,
+    )
+    picks = PendingPicks()
+    token = picks.register(SUPERGROUP, [(1, "#1")])
+    picks.toggle(token, 1)
+    query = _FakeQuery(f"schd:{token}", OWNER + 1, _FakeCBMessage())
+    update, context = _schedule_callback_env(query, picks, store)
+
+    await _handle_schedule_confirm_callback(update, context)
+
+    assert store.get_schedule(1) is not None
+
+
+async def test_schedule_toggle_callback_checks_a_row() -> None:
+    store = SessionStore(":memory:")
+    picks = PendingPicks()
+    token = picks.register(SUPERGROUP, [(1, "#1"), (2, "#2")])
+    query = _FakeQuery(f"sch:{token}:2", OWNER, _FakeCBMessage())
+    update, context = _schedule_callback_env(query, picks, store)
+
+    await _handle_schedule_toggle_callback(update, context)
+
+    assert picks.selected_ids(token) == [2]
+    assert query.answers[-1] == "Selected."
+
+
+async def test_schedule_dismiss_callback_cancels_nothing() -> None:
+    store = SessionStore(":memory:")
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=0,
+        days=None,
+        created_at=1,
+    )
+    picks = PendingPicks()
+    token = picks.register(SUPERGROUP, [(1, "#1")])
+    picks.toggle(token, 1)
+    cb_message = _FakeCBMessage()
+    query = _FakeQuery(f"schx:{token}", OWNER, cb_message)
+    update, context = _schedule_callback_env(query, picks, store)
+
+    await _handle_schedule_dismiss_callback(update, context)
+
+    assert store.get_schedule(1) is not None
+    assert "Nothing cancelled" in cb_message.edited[-1]
+
+
+def test_schedule_and_delete_pickers_use_distinct_callback_prefixes() -> None:
+    # PTB dispatches a callback to the first matching pattern, so an overlap
+    # would silently send schedule taps to the topic-deleting handler.
+    app = _build(None)
+    handlers = [
+        h for h in app.handlers[0] if isinstance(h, CallbackQueryHandler) and h.pattern is not None
+    ]
+    patterns = [h.pattern.pattern for h in handlers]
+    assert patterns.index("^schd:") < patterns.index("^sch:")
+    for data, expected in (
+        ("del:t:1", "^del:"),
+        ("delp:t:1", "^delp:"),
+        ("sch:t:1", "^sch:"),
+        ("schp:t:1", "^schp:"),
+        ("schd:t", "^schd:"),
+        ("schx:t", "^schx:"),
+    ):
+        first = next(h for h in handlers if h.pattern.match(data))
+        assert first.pattern.pattern == expected, data

@@ -7,8 +7,11 @@ Boot sequence:
   3. Open the SQLite topic→session map (ADR-0009).
   4. Start the FastAPI Mini App server (ADR-0003) as an asyncio task alongside
      the bot, bound to 127.0.0.1 (ADR-0007). Done in ``post_init``.
-  5. Start the bot via long polling (ADR-0007: no public URL).
-  6. Stop the Mini App server, close OpenCode + SQLite on shutdown
+  5. Re-arm the ``/schedule`` timers and run anything missed while Balam was
+     down (ADR-0016) — last in ``post_init``, so a caught-up run finds a ready
+     backend and a listening tool server.
+  6. Start the bot via long polling (ADR-0007: no public URL).
+  7. Stop the Mini App server, close OpenCode + SQLite on shutdown
      (``post_shutdown``).
 
 The same FastAPI server also bridges the noVNC WebSocket for the live-Chrome
@@ -22,8 +25,9 @@ import logging
 import sys
 
 import uvicorn
-from telegram.ext import Application
+from telegram.ext import Application, CallbackContext
 
+from balam import schedules
 from balam.agent.backend import AgentBackend
 from balam.agent.claude_sdk_backend import ClaudeSdkBackend
 from balam.agent.opencode_backend import OpenCodeBackend
@@ -150,6 +154,34 @@ def main() -> None:
         application.bot_data["uvicorn_task"] = asyncio.create_task(server.serve())
         logger.info("Mini App server listening on http://127.0.0.1:%s", config.balam_port)
 
+        # Scheduled prompts (ADR-0016). The JobQueue is in memory, so every
+        # schedule is re-registered on each boot, and anything that came due
+        # while Balam was down is caught up here — both last, so a caught-up run
+        # starts with the backend ready and the tool server listening.
+        await _start_schedules(application)
+
+    async def _start_schedules(application: Application) -> None:
+        """Re-arm the ``/schedule`` timers and run whatever was missed."""
+        job_queue = application.job_queue
+        if job_queue is None:
+            # A silent None here would mean every schedule quietly never fires,
+            # which is the one failure mode a scheduled feature cannot have.
+            logger.error(
+                "job queue unavailable — /schedule timers will NOT fire. "
+                "Install python-telegram-bot[job-queue] (APScheduler) and restart."
+            )
+            return
+        registered = schedules.register_all(job_queue, store, config.timezone)
+        logger.info(
+            "registered %s scheduled task(s) (timezone %s)", registered, config.balam_timezone
+        )
+        # The scheduled path is written against the CallbackContext a job callback
+        # receives; post_init holds only the Application, so build the real thing
+        # around it rather than a stand-in.
+        caught_up = await schedules.catch_up(CallbackContext(application))
+        if caught_up:
+            logger.info("caught up %s missed schedule(s)", caught_up)
+
     async def _post_shutdown(application: Application) -> None:
         try:
             if server is not None:
@@ -165,7 +197,12 @@ def main() -> None:
             store.close()
 
     app = build_application(
-        config, backend, router, post_init=_post_init, post_shutdown=_post_shutdown
+        config,
+        backend,
+        router,
+        store=store,
+        post_init=_post_init,
+        post_shutdown=_post_shutdown,
     )
 
     logger.info(

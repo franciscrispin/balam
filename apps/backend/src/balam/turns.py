@@ -72,6 +72,12 @@ class TurnJob:
     allowed_tools: list[str] = field(default_factory=list)
     additional_directories: list[str] = field(default_factory=list)
     mcp: dict[str, Any] = field(default_factory=dict)
+    #: Nobody is watching this turn — a scheduled run (ADR-0016). Approval and
+    #: question keyboards are refused rather than awaited, since neither has a
+    #: timeout and an unanswered one would hold the topic's running slot forever.
+    #: A property of the *turn*, not the topic: the owner's reply in the morning's
+    #: topic starts from a ``Message`` and is attended like any other.
+    unattended: bool = False
 
 
 class TurnRegistry:

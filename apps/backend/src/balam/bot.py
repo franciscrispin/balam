@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Bot,
@@ -38,12 +42,13 @@ from telegram.ext import (
     filters,
 )
 
+from balam import schedules
 from balam.agent.backend import AgentBackend, FollowUp, FollowUpChannel
 from balam.approvals import (
     Choice,
     CustomAnswer,
     PendingApprovals,
-    PendingDeletions,
+    PendingPicks,
     PendingQuestions,
 )
 from balam.attachments import PromptFile, collect_attachments
@@ -52,6 +57,8 @@ from balam.contexts import EFFORT_LEVELS, split_provider_model
 from balam.markdown import escape_markdown_v2
 from balam.miniapp import mini_app_reply
 from balam.router import Router, TopicRef
+from balam.schedules import describe
+from balam.store import SessionStore
 from balam.streamer import _question_keyboard, stream_reply
 from balam.telegram_utils import thread_kwargs
 from balam.turns import TurnJob, TurnRegistry
@@ -413,54 +420,35 @@ async def _submit_turn(
     queued_reply: str = "⏳ Queued (#{position}) — I'll run this after the current turn finishes.",
     prompt_prefix: str = "",
 ) -> None:
-    """Resolve the topic's session and run ``text`` as its turn, or park it in the
-    topic's queue when a turn is already streaming.
+    """Run ``text`` as the topic's turn, or park it in the topic's queue when a
+    turn is already streaming.
 
-    Shared dispatch tail of the message and ``/plan`` paths. ``thread_id`` is
-    explicit because a General message has already been rehomed into a freshly
-    created topic by the time it gets here; ``queued_reply`` is formatted with
-    the job's 1-based queue ``position``. ``prompt_prefix`` is prepended only to the
-    agent-facing prompt (forward/reply header) — topic auto-naming still uses the
-    owner's own ``text``.
+    The message-bound dispatch tail: it owns everything that needs a
+    :class:`~telegram.Message` — the topic title, the follow-up acknowledgement,
+    and the queued-turn reply. Resolving the session and building the job is
+    :func:`_resolve_turn_job`; :func:`start_prompt` is the same path for a caller
+    with no message (the scheduled runs of ADR-0016).
+
+    ``thread_id`` is explicit because a General message has already been rehomed
+    into a freshly created topic by the time it gets here; ``queued_reply`` is
+    formatted with the job's 1-based queue ``position``. ``prompt_prefix`` is
+    prepended only to the agent-facing prompt (forward/reply header) — topic
+    auto-naming still uses the owner's own ``text``.
     """
-    router: Router = context.application.bot_data["router"]
     turns: TurnRegistry = context.application.bot_data["turns"]
     chat_id = message.chat_id
 
-    try:
-        ref = TopicRef(
-            chat_id=chat_id,
-            thread_id=thread_id,
-            title=_topic_title(message, thread_id),
-        )
-        resolved = await router.resolve(ref)
-        await _auto_name_topic(
-            context.bot,
-            router,
-            ref,
-            resolved.context_name,
-            text,
-            has_files=bool(files),
-        )
-    except Exception as exc:
-        # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
-        logger.exception("failed to resolve session")
-        await _notify_error(context.bot, chat_id, thread_id, exc)
-        return
-
-    job = TurnJob(
-        prompt=f"{prompt_prefix}{text}" if prompt_prefix else text,
-        session_id=resolved.session_id,
-        directory=resolved.directory,
-        provider=resolved.provider,
-        model=resolved.model,
-        effort=resolved.effort,
-        allowed_dirs=[resolved.directory, *resolved.additional_directories],
+    job = await _resolve_turn_job(
+        context,
+        chat_id,
+        thread_id,
+        text,
+        title=_topic_title(message, thread_id),
         files=files,
-        allowed_tools=resolved.allowed_tools,
-        additional_directories=resolved.additional_directories,
-        mcp=resolved.mcp,
+        prompt_prefix=prompt_prefix,
     )
+    if job is None:
+        return
 
     # A message that lands while a turn is still streaming can't fire a second
     # prompt at the same session — one turn per topic (ADR-0009). Two paths, both
@@ -488,6 +476,87 @@ async def _submit_turn(
         return
 
     _start_turn(context, chat_id, thread_id, job)
+
+
+async def _resolve_turn_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: int | None,
+    text: str,
+    *,
+    title: str,
+    files: list[PromptFile] | None = None,
+    prompt_prefix: str = "",
+    unattended: bool = False,
+) -> TurnJob | None:
+    """Resolve the topic's session, auto-name the topic if it still needs one, and
+    package everything a turn needs. ``None`` (with a notice already posted in the
+    topic) if the session couldn't be resolved at all — OpenCode down, and so on.
+
+    Split out of :func:`_submit_turn` so a caller with no originating message can
+    build the same job: the queue/follow-up decision above needs the job in hand
+    before it can choose, so it can't simply delegate to :func:`start_prompt`.
+    ``prompt_prefix`` is prepended only to the agent-facing prompt (the
+    forward/reply header) — auto-naming still uses the owner's own ``text``.
+    """
+    router: Router = context.application.bot_data["router"]
+    files = files or []
+    try:
+        ref = TopicRef(chat_id=chat_id, thread_id=thread_id, title=title)
+        resolved = await router.resolve(ref)
+        await _auto_name_topic(
+            context.bot,
+            router,
+            ref,
+            resolved.context_name,
+            text,
+            has_files=bool(files),
+        )
+    except Exception as exc:
+        # Couldn't even resolve the session (OpenCode down, etc.) — report and stop.
+        logger.exception("failed to resolve session")
+        await _notify_error(context.bot, chat_id, thread_id, exc)
+        return None
+
+    return TurnJob(
+        prompt=f"{prompt_prefix}{text}" if prompt_prefix else text,
+        session_id=resolved.session_id,
+        directory=resolved.directory,
+        provider=resolved.provider,
+        model=resolved.model,
+        effort=resolved.effort,
+        allowed_dirs=[resolved.directory, *resolved.additional_directories],
+        files=files,
+        allowed_tools=resolved.allowed_tools,
+        additional_directories=resolved.additional_directories,
+        mcp=resolved.mcp,
+        unattended=unattended,
+    )
+
+
+async def start_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: int | None,
+    prompt: str,
+    *,
+    title: str,
+    unattended: bool = False,
+) -> bool:
+    """Run ``prompt`` as a turn in an existing topic, with no originating message.
+
+    The message-free half of :func:`_submit_turn`, used by the scheduled path
+    (ADR-0016). It deliberately has no queue branch: a scheduled run targets a
+    *brand-new* topic, so it can never collide with a turn already running there.
+    Returns whether the turn started.
+    """
+    job = await _resolve_turn_job(
+        context, chat_id, thread_id, prompt, title=title, unattended=unattended
+    )
+    if job is None:
+        return False
+    _start_turn(context, chat_id, thread_id, job)
+    return True
 
 
 def _start_turn(
@@ -544,6 +613,7 @@ def _start_turn(
                 follow_ups=follow_ups,
                 tool_stream=config.tool_stream if config is not None else "collapsed",
                 rich_messages=config.rich_messages if config is not None else False,
+                unattended=job.unattended,
             )
         except asyncio.CancelledError:
             cancelled = True  # /cancel aborted the turn; don't auto-run queued work.
@@ -590,18 +660,29 @@ def _topic_link(chat_id: int, thread_id: int, bot_id: int | None = None) -> str 
     return None
 
 
-async def _open_context_topic(
-    message: Any, bot: Any, router: Router, name: str, *, prompt: str = ""
-) -> int | None:
+class TopicOpenError(Exception):
+    """A new topic couldn't be created or bound. The message is owner-facing —
+    :func:`open_topic_in_context` has already rolled back, so the caller only has
+    to deliver it wherever it has somewhere to write."""
+
+
+async def open_topic_in_context(
+    bot: Any, router: Router, chat_id: int, name: str, *, prompt: str = ""
+) -> tuple[int, str]:
     """Create a fresh forum topic bound to context ``name``, start its session,
-    greet inside it, and reply with a one-tap link. Shared by ``/context <name>``
-    and ``/new``. Returns the new topic's thread id, or ``None`` when it couldn't
-    be opened — the caller runs ``prompt`` there (see :func:`_submit_turn`).
+    and greet inside it. Returns ``(thread_id, topic_name)``; raises
+    :class:`TopicOpenError` if the topic couldn't be opened.
+
+    Takes no originating :class:`~telegram.Message`, because two callers have
+    none to give: ``/schedule`` fires from a timer (ADR-0016), and the
+    ``/context`` / ``/new`` wrapper below wants to own its own reply anyway. The
+    "Opened …" reply and the one-tap deep-link button therefore live in
+    :func:`_open_context_topic`, not here.
 
     One context per topic for life — we never rebind an existing topic, so a
     topic's session always remembers its own history. The Bot API can't move the
-    user's view, so we create the topic, greet it, and hand back a deep link to
-    tap. Requires a forum supergroup with the bot an admin holding "Manage
+    user's view, so we create the topic and greet it; the caller hands back a deep
+    link to tap. Requires a forum supergroup with the bot an admin holding "Manage
     Topics"; duplicate topic names are fine (many topics may share one context).
 
     With a ``prompt`` the topic is named after it (``context: prompt``, as a
@@ -611,41 +692,57 @@ async def _open_context_topic(
     ctx = router.contexts.contexts[name]
     topic_name = _topic_name(name, prompt) if prompt else name
     try:
-        topic = await bot.create_forum_topic(chat_id=message.chat_id, name=topic_name)
+        topic = await bot.create_forum_topic(chat_id=chat_id, name=topic_name)
     except Exception as exc:
         logger.exception("failed to create forum topic")
-        await message.reply_text(
+        raise TopicOpenError(
             f"⚠️ Couldn't create a topic for {name!r}: {exc}\n"
             "This chat must be a forum supergroup and the bot an admin with "
             "the 'Manage Topics' permission."
-        )
-        return None
+        ) from exc
 
     new_thread_id = topic.message_thread_id
     try:
         await router.create_topic_session(
-            message.chat_id, new_thread_id, topic_name, name, auto_named=bool(prompt)
+            chat_id, new_thread_id, topic_name, name, auto_named=bool(prompt)
         )
     except Exception as exc:
         logger.exception("failed to start session for new topic")
         # Roll back the just-created topic: an unbound topic would silently route
         # to default_context, not the one we meant. Best-effort delete.
         try:
-            await bot.delete_forum_topic(chat_id=message.chat_id, message_thread_id=new_thread_id)
+            await bot.delete_forum_topic(chat_id=chat_id, message_thread_id=new_thread_id)
         except Exception:
             logger.debug("failed to delete orphan topic after session failure", exc_info=True)
-        await message.reply_text(f"⚠️ Couldn't start a session for {name!r}: {exc}")
-        return None
+        raise TopicOpenError(f"⚠️ Couldn't start a session for {name!r}: {exc}") from exc
 
-    # Greet inside the new topic so it isn't empty, then hand back a one-tap link
-    # in the originating chat/topic as an inline URL button. With a prompt the
-    # turn lands right below the header, so don't ask for a message.
+    # Greet inside the new topic so it isn't empty. With a prompt the turn lands
+    # right below the header, so don't ask for a message.
     header = f"🗂 Context {name} — {ctx.directory}"
     await bot.send_message(
-        chat_id=message.chat_id,
+        chat_id=chat_id,
         text=header if prompt else f"{header}\nSend a message to start.",
         message_thread_id=new_thread_id,
     )
+    return new_thread_id, topic_name
+
+
+async def _open_context_topic(
+    message: Any, bot: Any, router: Router, name: str, *, prompt: str = ""
+) -> int | None:
+    """``/context <name>`` / ``/new``'s wrapper around
+    :func:`open_topic_in_context`: open the topic, then reply in the originating
+    chat/topic with a one-tap link to it. Returns the new topic's thread id, or
+    ``None`` when it couldn't be opened — the caller runs ``prompt`` there (see
+    :func:`_submit_turn`)."""
+    try:
+        new_thread_id, topic_name = await open_topic_in_context(
+            bot, router, message.chat_id, name, prompt=prompt
+        )
+    except TopicOpenError as exc:
+        await message.reply_text(str(exc))
+        return None
+
     opened = f"Opened {topic_name}." if prompt else f"Opened a new {name} topic."
     link = _topic_link(message.chat_id, new_thread_id, bot_id=bot.id)
     if link:
@@ -1315,60 +1412,167 @@ def _topic_label(title: str | None, context_name: str | None, thread_id: int) ->
     return base if len(base) <= 48 else base[:47] + "…"
 
 
-def _delete_keyboard(
+@dataclass(frozen=True)
+class _PickerStyle:
+    """What distinguishes one paged multi-select picker from another: its four
+    callback prefixes and its confirm button's label. ``/delete`` and ``/schedule
+    cancel`` share the keyboard, the paging, and :class:`PendingPicks`; only these
+    differ, plus what the confirm handler does with the chosen ids."""
+
+    toggle: str
+    page: str
+    confirm: str
+    cancel: str
+    confirm_label: str
+
+
+#: Distinct prefixes per picker — PTB dispatches a callback to the first pattern
+#: that matches, so two pickers must never share one.
+_DELETE_PICKER = _PickerStyle("del", "delp", "deld", "delx", "🗑 Delete selected")
+_SCHEDULE_PICKER = _PickerStyle("sch", "schp", "schd", "schx", "🗑 Cancel selected")
+
+
+def _picker_keyboard(
+    style: _PickerStyle,
     token: str,
     entries: list[tuple[int, str, bool]],
     page: int = 0,
     page_count: int = 1,
     selected_count: int = 0,
 ) -> InlineKeyboardMarkup:
-    """Checklist for the current page of topics (``del:<token>:<thread_id>``), a
-    Prev/Next navigation row when the snapshot spans more than one page
-    (``delp:<token>:<page>``), and the confirm/cancel row. ``selected_count`` spans
-    the whole snapshot, so the confirm button reflects picks made on other pages."""
+    """Checklist for the current page (``<toggle>:<token>:<id>``), a Prev/Next
+    navigation row when the snapshot spans more than one page
+    (``<page>:<token>:<page>``), and the confirm/cancel row. ``selected_count``
+    spans the whole snapshot, so the confirm button reflects picks made on other
+    pages."""
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
                 f"{'☑️' if selected else '☐'} {label}",
-                callback_data=f"del:{token}:{thread_id}",
+                callback_data=f"{style.toggle}:{token}:{item_id}",
             )
         ]
-        for thread_id, label, selected in entries
+        for item_id, label, selected in entries
     ]
     if page_count > 1:
         nav: list[InlineKeyboardButton] = []
         if page > 0:
-            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"delp:{token}:{page - 1}"))
+            nav.append(
+                InlineKeyboardButton("◀ Prev", callback_data=f"{style.page}:{token}:{page - 1}")
+            )
         # The indicator points at the current page, so tapping it is a harmless no-op.
         nav.append(
             InlineKeyboardButton(
-                f"Page {page + 1}/{page_count}", callback_data=f"delp:{token}:{page}"
+                f"Page {page + 1}/{page_count}", callback_data=f"{style.page}:{token}:{page}"
             )
         )
         if page < page_count - 1:
-            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"delp:{token}:{page + 1}"))
+            nav.append(
+                InlineKeyboardButton("Next ▶", callback_data=f"{style.page}:{token}:{page + 1}")
+            )
         rows.append(nav)
-    confirm_label = "🗑 Delete selected"
+    confirm_label = style.confirm_label
     if selected_count:
         confirm_label += f" ({selected_count})"
     rows.append(
         [
-            InlineKeyboardButton(confirm_label, callback_data=f"deld:{token}"),
-            InlineKeyboardButton("Cancel", callback_data=f"delx:{token}"),
+            InlineKeyboardButton(confirm_label, callback_data=f"{style.confirm}:{token}"),
+            InlineKeyboardButton("Cancel", callback_data=f"{style.cancel}:{token}"),
         ]
     )
     return InlineKeyboardMarkup(rows)
 
 
-def _delete_markup(pending_deletions: PendingDeletions, token: str) -> InlineKeyboardMarkup | None:
-    """Build the picker keyboard from current snapshot state, or ``None`` if the
+def _picker_markup(
+    style: _PickerStyle, picks: PendingPicks, token: str
+) -> InlineKeyboardMarkup | None:
+    """Build a picker keyboard from current snapshot state, or ``None`` if the
     token expired."""
-    entries = pending_deletions.entries(token)
-    info = pending_deletions.page_info(token)
+    entries = picks.entries(token)
+    info = picks.page_info(token)
     if entries is None or info is None:
         return None
     page, page_count, _total, selected = info
-    return _delete_keyboard(token, entries, page, page_count, selected)
+    return _picker_keyboard(style, token, entries, page, page_count, selected)
+
+
+async def _handle_picker_toggle(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, style: _PickerStyle, bot_data_key: str
+) -> None:
+    """Toggle an item's checkbox (``<toggle>:<token>:<id>``). Shared by both
+    pickers — only the prefix set and which ``bot_data`` snapshot to read differ."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith(f"{style.toggle}:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed selection.")
+        return
+    _, token, item_id_raw = parts
+    try:
+        item_id = int(item_id_raw)
+    except ValueError:
+        await query.answer("Malformed selection.")
+        return
+
+    picks: PendingPicks = context.application.bot_data[bot_data_key]
+    state = picks.toggle(token, item_id)
+    if state is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer("Selected." if state else "Unselected.")
+    await _refresh_picker(query, style, picks, token)
+
+
+async def _handle_picker_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, style: _PickerStyle, bot_data_key: str
+) -> None:
+    """Flip a picker to another page (``<page>:<token>:<page>``). Selections are
+    kept in the snapshot, so paging never loses what's already checked."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith(f"{style.page}:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Malformed request.")
+        return
+    _, token, page_raw = parts
+    try:
+        page = int(page_raw)
+    except ValueError:
+        await query.answer("Malformed request.")
+        return
+
+    picks: PendingPicks = context.application.bot_data[bot_data_key]
+    if picks.set_page(token, page) is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    await query.answer()
+    await _refresh_picker(query, style, picks, token)
+
+
+async def _refresh_picker(query: Any, style: _PickerStyle, picks: PendingPicks, token: str) -> None:
+    """Redraw a picker's keyboard in place; a failed edit is cosmetic only."""
+    markup = _picker_markup(style, picks, token)
+    message = getattr(query, "message", None)
+    if markup is None or message is None:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        logger.debug("failed to refresh %s keyboard", style.toggle, exc_info=True)
 
 
 def _callback_authorized(query: Any, config: Config) -> bool:
@@ -1402,7 +1606,7 @@ async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("No topics to delete.")
         return
 
-    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
+    pending_deletions: PendingPicks = context.application.bot_data["pending_deletions"]
     token = pending_deletions.register(
         message.chat_id,
         [(thread_id, _topic_label(title, ctx, thread_id)) for thread_id, title, ctx in topics],
@@ -1414,85 +1618,21 @@ async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\n\n{info[2]} topics across {info[1]} pages — use ◀ ▶ to browse. "
             "Selections persist across pages."
         )
-    await message.reply_text(text, reply_markup=_delete_markup(pending_deletions, token))
+    await message.reply_text(
+        text, reply_markup=_picker_markup(_DELETE_PICKER, pending_deletions, token)
+    )
 
 
 async def _handle_delete_toggle_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Toggle a topic's checkbox in the /delete picker (``del:<token>:<thread_id>``)."""
-    query = update.callback_query
-    if query is None or not (query.data or "").startswith("del:"):
-        return
-    config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
-        await query.answer()
-        return
-
-    parts = (query.data or "").split(":", 2)
-    if len(parts) != 3:
-        await query.answer("Malformed selection.")
-        return
-    _, token, thread_id_raw = parts
-    try:
-        thread_id = int(thread_id_raw)
-    except ValueError:
-        await query.answer("Malformed selection.")
-        return
-
-    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
-    state = pending_deletions.toggle(token, thread_id)
-    if state is None:
-        await query.answer("This picker has expired.")
-        await _clear_keyboard(query)
-        return
-    await query.answer("Selected." if state else "Unselected.")
-    markup = _delete_markup(pending_deletions, token)
-    message = getattr(query, "message", None)
-    if markup is None or message is None:
-        return
-    try:
-        await message.edit_reply_markup(reply_markup=markup)
-    except Exception:
-        logger.debug("failed to refresh delete keyboard", exc_info=True)
+    await _handle_picker_toggle(update, context, _DELETE_PICKER, "pending_deletions")
 
 
 async def _handle_delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Flip the /delete picker to another page (``delp:<token>:<page>``). Selections
-    are kept in the snapshot, so paging never loses what's already checked."""
-    query = update.callback_query
-    if query is None or not (query.data or "").startswith("delp:"):
-        return
-    config: Config = context.application.bot_data["config"]
-    if not _callback_authorized(query, config):
-        await query.answer()
-        return
-
-    parts = (query.data or "").split(":", 2)
-    if len(parts) != 3:
-        await query.answer("Malformed request.")
-        return
-    _, token, page_raw = parts
-    try:
-        page = int(page_raw)
-    except ValueError:
-        await query.answer("Malformed request.")
-        return
-
-    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
-    if pending_deletions.set_page(token, page) is None:
-        await query.answer("This picker has expired.")
-        await _clear_keyboard(query)
-        return
-    await query.answer()
-    markup = _delete_markup(pending_deletions, token)
-    message = getattr(query, "message", None)
-    if markup is None or message is None:
-        return
-    try:
-        await message.edit_reply_markup(reply_markup=markup)
-    except Exception:
-        logger.debug("failed to page delete keyboard", exc_info=True)
+    """Flip the /delete picker to another page (``delp:<token>:<page>``)."""
+    await _handle_picker_page(update, context, _DELETE_PICKER, "pending_deletions")
 
 
 async def _handle_delete_confirm_callback(
@@ -1513,8 +1653,8 @@ async def _handle_delete_confirm_callback(
         return
     token = parts[1]
 
-    pending_deletions: PendingDeletions = context.application.bot_data["pending_deletions"]
-    thread_ids = pending_deletions.selected_thread_ids(token)
+    pending_deletions: PendingPicks = context.application.bot_data["pending_deletions"]
+    thread_ids = pending_deletions.selected_ids(token)
     chat_id = pending_deletions.chat_id(token)
     if thread_ids is None or chat_id is None:
         await query.answer("This picker has expired.")
@@ -1586,6 +1726,298 @@ async def _handle_delete_cancel_callback(
             await message.edit_text(text="🗑 Delete cancelled.", reply_markup=None)
         except Exception:
             logger.debug("failed to finalize cancel message", exc_info=True)
+
+
+# --- /schedule (ADR-0016) -----------------------------------------------------
+
+#: Words that lead a ``/schedule`` sub-command rather than a recurrence. A create
+#: always starts with a when-token (``daily`` / ``weekdays`` / a weekday), so the
+#: two can never be confused.
+_SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off")
+
+_SCHEDULE_USAGE = (
+    "Usage:\n"
+    "/schedule — list\n"
+    "/schedule daily 07:30 <context> <prompt> — create\n"
+    "/schedule cancel — pick schedules to remove\n"
+    "/schedule run <id> — fire one now\n"
+    "/schedule off <id> · /schedule on <id> — pause / resume"
+)
+
+
+def _schedule_label(schedule: schedules.Schedule) -> str:
+    """Button label for the /schedule cancel picker."""
+    base = f"#{schedule.id} {describe(schedule.when)} · {schedule.context}"
+    return base if len(base) <= 48 else base[:47] + "…"
+
+
+def _format_schedule(schedule: schedules.Schedule, tz: ZoneInfo) -> str:
+    """One schedule as three list lines: when/where, prompt, last run."""
+    state = "" if schedule.enabled else " ⏸ paused"
+    lines = [
+        f"#{schedule.id} · {describe(schedule.when)} · {schedule.context}{state}",
+        f"   {schedules.summarize(schedule.prompt, 120)}",
+    ]
+    if schedule.last_run_at is not None:
+        last = datetime.fromtimestamp(schedule.last_run_at / 1000, tz)
+        lines.append(f"   last run {last:%Y-%m-%d %H:%M}")
+    return "\n".join(lines)
+
+
+def _schedule_timezone(context: ContextTypes.DEFAULT_TYPE) -> ZoneInfo:
+    """The configured schedule timezone; UTC when no config is wired (tests)."""
+    config: Config | None = context.application.bot_data.get("config")
+    tz = getattr(config, "timezone", None)
+    return tz if isinstance(tz, ZoneInfo) else ZoneInfo("UTC")
+
+
+async def _handle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/schedule`` — run a prompt on a timer (ADR-0016).
+
+    Bare, it lists this chat's schedules. ``/schedule <when> <context> <prompt>``
+    saves a new one; ``cancel`` / ``run`` / ``on`` / ``off`` manage the existing
+    ones. See :data:`_SCHEDULE_USAGE` for the full surface and
+    :func:`balam.schedules.parse_when` for the ``<when>`` grammar.
+    """
+    message = update.message
+    if message is None:
+        return
+    args = context.args or []
+    if not args:
+        await _schedule_list(message, context)
+        return
+
+    head = args[0].strip().lower()
+    if head == "cancel":
+        await _schedule_cancel(message, context)
+        return
+    if head in ("run", "on", "off"):
+        await _schedule_by_id(message, context, head, args[1:])
+        return
+    await _schedule_create(message, context, args)
+
+
+async def _schedule_list(message: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store: SessionStore = context.application.bot_data["store"]
+    rows = store.list_schedules(message.chat_id)
+    if not rows:
+        await message.reply_text(f"No schedules yet.\n\n{_SCHEDULE_USAGE}")
+        return
+    tz = _schedule_timezone(context)
+    body = "\n".join(_format_schedule(schedules.Schedule.from_row(row), tz) for row in rows)
+    await message.reply_text(f"🗓 Schedules (times in {tz.key}):\n{body}\n\n{_SCHEDULE_USAGE}")
+
+
+async def _schedule_create(
+    message: Any, context: ContextTypes.DEFAULT_TYPE, args: list[str]
+) -> None:
+    router: Router = context.application.bot_data["router"]
+    store: SessionStore = context.application.bot_data["store"]
+
+    try:
+        when = schedules.parse_when(args)
+    except schedules.ScheduleError as exc:
+        await message.reply_text(str(exc))
+        return
+
+    if len(args) < 3:
+        await message.reply_text(f"I also need a context and a prompt.\n\n{_SCHEDULE_USAGE}")
+        return
+    name = router.contexts.match_name(args[2])
+    if name is None:
+        available = ", ".join(sorted(router.contexts.contexts))
+        await message.reply_text(f"Unknown context {args[2]!r}. Available: {available}")
+        return
+
+    # The prompt comes from the raw text, not context.args: that is a whitespace
+    # split and would collapse a multi-line prompt onto one line.
+    prompt = _command_remainder(message.text or "", args_consumed=3)
+    if not prompt:
+        await message.reply_text(f"I need a prompt to run.\n\n{_SCHEDULE_USAGE}")
+        return
+
+    schedule_id = store.add_schedule(
+        chat_id=message.chat_id,
+        context=name,
+        prompt=prompt,
+        kind=when.kind,
+        hour=when.hour,
+        minute=when.minute,
+        days=when.days_csv,
+        created_at=int(time.time() * 1000),
+    )
+    tz = _schedule_timezone(context)
+    job_queue = getattr(context.application, "job_queue", None)
+    if job_queue is None:
+        # Saved but inert. Say so rather than implying a timer exists — a silent
+        # None here is exactly the failure ADR-0016 calls out.
+        await message.reply_text(
+            f"⚠️ Saved schedule #{schedule_id}, but the job queue is unavailable, so it "
+            "will not fire until Balam restarts with python-telegram-bot[job-queue]."
+        )
+        return
+    row = store.get_schedule(schedule_id)
+    assert row is not None  # just inserted
+    schedules.register_one(job_queue, schedules.Schedule.from_row(row), tz)
+    await message.reply_text(
+        f"🗓 Schedule #{schedule_id} saved — {describe(when)} ({tz.key}) in {name}.\n"
+        f"{schedules.summarize(prompt, 120)}\n\n"
+        f"Test it now with /schedule run {schedule_id}."
+    )
+
+
+async def _schedule_by_id(
+    message: Any, context: ContextTypes.DEFAULT_TYPE, action: str, rest: list[str]
+) -> None:
+    """``/schedule run|on|off <id>``."""
+    store: SessionStore = context.application.bot_data["store"]
+    if not rest:
+        await message.reply_text(f"Which schedule? /schedule {action} <id>")
+        return
+    try:
+        schedule_id = int(rest[0].lstrip("#"))
+    except ValueError:
+        await message.reply_text(f"{rest[0]!r} isn't a schedule id. /schedule {action} <id>")
+        return
+    row = store.get_schedule(schedule_id)
+    if row is None or row.chat_id != message.chat_id:
+        await message.reply_text(f"No schedule #{schedule_id} here.")
+        return
+    schedule = schedules.Schedule.from_row(row)
+    tz = _schedule_timezone(context)
+    job_queue = getattr(context.application, "job_queue", None)
+
+    if action == "run":
+        # The whole point of this sub-command: a 24-hour feedback loop becomes a
+        # 5-second one. It runs unattended, exactly as the timer would.
+        await message.reply_text(f"▶️ Running schedule #{schedule_id} now…")
+        await schedules.run_schedule(context, schedule)
+        return
+
+    enable = action == "on"
+    if schedule.enabled == enable:
+        await message.reply_text(f"Schedule #{schedule_id} is already {'on' if enable else 'off'}.")
+        return
+    store.set_schedule_enabled(schedule_id, enable)
+    if job_queue is not None:
+        if enable:
+            schedules.register_one(job_queue, replace(schedule, enabled=True), tz)
+        else:
+            schedules.unregister(job_queue, schedule_id)
+    await message.reply_text(
+        f"{'▶️ Resumed' if enable else '⏸ Paused'} schedule #{schedule_id} — "
+        f"{describe(schedule.when)}."
+    )
+
+
+async def _schedule_cancel(message: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/schedule cancel`` — the paged multi-select picker, mirroring /delete."""
+    store: SessionStore = context.application.bot_data["store"]
+    rows = store.list_schedules(message.chat_id)
+    if not rows:
+        await message.reply_text("No schedules to cancel.")
+        return
+
+    picks: PendingPicks = context.application.bot_data["pending_schedule_picks"]
+    token = picks.register(
+        message.chat_id,
+        [(row.id, _schedule_label(schedules.Schedule.from_row(row))) for row in rows],
+    )
+    text = "🗑 Select schedules to cancel, then tap “Cancel selected”."
+    info = picks.page_info(token)
+    if info and info[1] > 1:
+        text += (
+            f"\n\n{info[2]} schedules across {info[1]} pages — use ◀ ▶ to browse. "
+            "Selections persist across pages."
+        )
+    await message.reply_text(text, reply_markup=_picker_markup(_SCHEDULE_PICKER, picks, token))
+
+
+async def _handle_schedule_toggle_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Toggle a schedule's checkbox in the picker (``sch:<token>:<id>``)."""
+    await _handle_picker_toggle(update, context, _SCHEDULE_PICKER, "pending_schedule_picks")
+
+
+async def _handle_schedule_page_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Flip the /schedule cancel picker to another page (``schp:<token>:<page>``)."""
+    await _handle_picker_page(update, context, _SCHEDULE_PICKER, "pending_schedule_picks")
+
+
+async def _handle_schedule_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Delete the schedules selected in the picker (``schd:<token>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("schd:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 1)
+    if len(parts) != 2:
+        await query.answer("Malformed request.")
+        return
+    token = parts[1]
+
+    picks: PendingPicks = context.application.bot_data["pending_schedule_picks"]
+    schedule_ids = picks.selected_ids(token)
+    if schedule_ids is None:
+        await query.answer("This picker has expired.")
+        await _clear_keyboard(query)
+        return
+    if not schedule_ids:
+        await query.answer("Select at least one schedule.")
+        return
+    picks.discard(token)
+
+    store: SessionStore = context.application.bot_data["store"]
+    job_queue = getattr(context.application, "job_queue", None)
+    cancelled = 0
+    for schedule_id in schedule_ids:
+        # Drop the timer first: a row that survives a failed delete still has no
+        # job, which is the safe direction (nothing fires unannounced).
+        if job_queue is not None:
+            schedules.unregister(job_queue, schedule_id)
+        if store.delete_schedule(schedule_id):
+            cancelled += 1
+
+    await query.answer(f"Cancelled {cancelled} schedule(s).")
+    message = getattr(query, "message", None)
+    if message is not None:
+        try:
+            await message.edit_text(text=f"🗑 Cancelled {cancelled} schedule(s).", reply_markup=None)
+        except Exception:
+            logger.debug("failed to finalize schedule cancel message", exc_info=True)
+
+
+async def _handle_schedule_dismiss_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Dismiss the /schedule cancel picker, cancelling nothing (``schx:<token>``)."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("schx:"):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not _callback_authorized(query, config):
+        await query.answer()
+        return
+
+    parts = (query.data or "").split(":", 1)
+    if len(parts) == 2:
+        context.application.bot_data["pending_schedule_picks"].discard(parts[1])
+    await query.answer("Dismissed.")
+    message = getattr(query, "message", None)
+    if message is not None:
+        try:
+            await message.edit_text(text="🗑 Nothing cancelled.", reply_markup=None)
+        except Exception:
+            logger.debug("failed to finalize schedule dismiss message", exc_info=True)
 
 
 async def _handle_topic_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1718,6 +2150,7 @@ BOT_COMMANDS = [
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
     BotCommand("artifacts", "List your published claude.ai artifacts (/artifacts [shared|all])"),
     BotCommand("delete", "Delete topics — pick which ones to remove"),
+    BotCommand("schedule", "Run a prompt on a schedule: /schedule daily 07:30 <context> <prompt>"),
 ]
 
 
@@ -1743,6 +2176,7 @@ def build_application(
     backend: AgentBackend,
     router: Router,
     *,
+    store: SessionStore | None = None,
     post_init: Any = None,
     post_shutdown: Any = None,
 ) -> Application:
@@ -1764,14 +2198,19 @@ def build_application(
     app.bot_data["config"] = config
     app.bot_data["backend"] = backend
     app.bot_data["router"] = router
+    # The SQLite store, for the one caller that isn't topic→session routing:
+    # /schedule reads and writes the schedules table directly (ADR-0016).
+    app.bot_data["store"] = store
     # In-flight turns, keyed by topic, so /cancel can interrupt a running reply.
     app.bot_data["turns"] = TurnRegistry()
     # Outstanding tool-approval prompts + per-session "accept all edits" state.
     app.bot_data["pending"] = PendingApprovals()
     # Outstanding OpenCode question-tool prompts.
     app.bot_data["pending_questions"] = PendingQuestions()
-    # Outstanding /delete topic-picker selections.
-    app.bot_data["pending_deletions"] = PendingDeletions()
+    # Outstanding picker selections: /delete over topics, /schedule cancel over
+    # schedules. Same class, one snapshot each (see PendingPicks).
+    app.bot_data["pending_deletions"] = PendingPicks()
+    app.bot_data["pending_schedule_picks"] = PendingPicks()
     # Anchors fire-and-forget background tasks (e.g. /cancel's server-side abort)
     # so the loop's weak task references can't let them be GC'd mid-flight.
     app.bot_data["background_tasks"] = set()
@@ -1796,6 +2235,7 @@ def build_application(
     app.add_handler(CommandHandler("browser", _handle_browser, filters=allowed))
     app.add_handler(CommandHandler("artifacts", _handle_artifacts, filters=allowed))
     app.add_handler(CommandHandler("delete", _handle_delete, filters=allowed))
+    app.add_handler(CommandHandler("schedule", _handle_schedule, filters=allowed))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & allowed,
@@ -1823,5 +2263,9 @@ def build_application(
     app.add_handler(CallbackQueryHandler(_handle_delete_cancel_callback, pattern=r"^delx:"))
     app.add_handler(CallbackQueryHandler(_handle_delete_page_callback, pattern=r"^delp:"))
     app.add_handler(CallbackQueryHandler(_handle_delete_toggle_callback, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(_handle_schedule_confirm_callback, pattern=r"^schd:"))
+    app.add_handler(CallbackQueryHandler(_handle_schedule_dismiss_callback, pattern=r"^schx:"))
+    app.add_handler(CallbackQueryHandler(_handle_schedule_page_callback, pattern=r"^schp:"))
+    app.add_handler(CallbackQueryHandler(_handle_schedule_toggle_callback, pattern=r"^sch:"))
 
     return app

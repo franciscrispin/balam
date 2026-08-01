@@ -5,7 +5,7 @@ from balam.approvals import (
     READ_CATEGORIES,
     Choice,
     PendingApprovals,
-    PendingDeletions,
+    PendingPicks,
     Verdict,
     decide,
     is_edit,
@@ -124,6 +124,67 @@ def test_unknown_category_asks() -> None:
     assert decide("webfetch", [], allowed_dirs=DIRS, accept_all_edits=True) is Verdict.ASK
 
 
+# --- decide(unattended=True): a scheduled run has nobody to ask (ADR-0016) ----
+
+
+def test_unattended_still_allows_reads_in_workspace() -> None:
+    # The one thing a scheduled run keeps: this is what the Chaska brief does.
+    v = decide(
+        "read", ["/work/proj/a.py"], allowed_dirs=DIRS, accept_all_edits=False, unattended=True
+    )
+    assert v is Verdict.ALLOW
+
+
+def test_unattended_denies_read_outside_workspace() -> None:
+    v = decide("read", ["/etc/hosts"], allowed_dirs=DIRS, accept_all_edits=False, unattended=True)
+    assert v is Verdict.DENY
+
+
+def test_unattended_denies_read_without_a_resolvable_path() -> None:
+    assert decide("read", [], allowed_dirs=DIRS, accept_all_edits=False, unattended=True) is (
+        Verdict.DENY
+    )
+
+
+def test_unattended_denies_bash() -> None:
+    assert decide("bash", [], allowed_dirs=DIRS, accept_all_edits=True, unattended=True) is (
+        Verdict.DENY
+    )
+
+
+def test_unattended_denies_edit_even_in_workspace() -> None:
+    v = decide(
+        "edit", ["/work/proj/a.py"], allowed_dirs=DIRS, accept_all_edits=False, unattended=True
+    )
+    assert v is Verdict.DENY
+
+
+def test_unattended_denies_edit_even_with_accept_all_edits() -> None:
+    # "Accept all edits" is a choice a human made for a session they were
+    # watching; it must not carry into a turn nobody started.
+    v = decide(
+        "edit", ["/work/proj/a.py"], allowed_dirs=DIRS, accept_all_edits=True, unattended=True
+    )
+    assert v is Verdict.DENY
+
+
+def test_attended_is_the_default_and_never_denies() -> None:
+    # Every attended outcome is unchanged: DENY exists only for unattended turns.
+    cases = [
+        ("read", ["/work/proj/a.py"], False),
+        ("read", ["/etc/hosts"], False),
+        ("edit", ["/work/proj/a.py"], True),
+        ("edit", [], True),
+        ("bash", [], True),
+        ("webfetch", [], False),
+    ]
+    for category, paths, accept_all in cases:
+        assert (
+            decide(category, paths, allowed_dirs=DIRS, accept_all_edits=accept_all)
+            is not Verdict.DENY
+        )
+
+
 # --- request_target_paths: pull paths from the permission request -------------
 
 
@@ -200,39 +261,39 @@ async def test_discard_makes_token_unresolvable() -> None:
     assert pending.resolve(token, Choice.ALLOW) is False
 
 
-# --- PendingDeletions: /delete topic picker -----------------------------------
+# --- PendingPicks: /delete topic picker -----------------------------------
 
 
 def test_deletions_register_starts_with_nothing_selected() -> None:
-    pending = PendingDeletions()
+    pending = PendingPicks()
     token = pending.register(100, [(5, "First"), (7, "Second")])
     assert pending.chat_id(token) == 100
     assert pending.entries(token) == [(5, "First", False), (7, "Second", False)]
-    assert pending.selected_thread_ids(token) == []
+    assert pending.selected_ids(token) == []
 
 
 def test_deletions_toggle_flips_and_reports_selection_in_order() -> None:
-    pending = PendingDeletions()
+    pending = PendingPicks()
     token = pending.register(100, [(5, "First"), (7, "Second")])
     assert pending.toggle(token, 7) is True
     assert pending.toggle(token, 5) is True
     assert pending.toggle(token, 7) is False  # toggling again unselects
     # Reported in display order, not selection order.
-    assert pending.selected_thread_ids(token) == [5]
+    assert pending.selected_ids(token) == [5]
     assert pending.entries(token) == [(5, "First", True), (7, "Second", False)]
 
 
 def test_deletions_toggle_unknown_thread_or_token_returns_none() -> None:
-    pending = PendingDeletions()
+    pending = PendingPicks()
     token = pending.register(100, [(5, "First")])
     assert pending.toggle(token, 999) is None
     assert pending.toggle("nope", 5) is None
 
 
 def test_deletions_discard_expires_the_token() -> None:
-    pending = PendingDeletions()
+    pending = PendingPicks()
     token = pending.register(100, [(5, "First")])
     pending.discard(token)
     assert pending.entries(token) is None
-    assert pending.selected_thread_ids(token) is None
+    assert pending.selected_ids(token) is None
     assert pending.chat_id(token) is None

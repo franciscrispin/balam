@@ -46,3 +46,24 @@ def test_tool_stream_accepts_full_and_blank_means_default() -> None:
 def test_tool_stream_rejects_unknown_value() -> None:
     with pytest.raises(ValidationError):
         Config(**_BASE, tool_stream="verbose")  # type: ignore[arg-type]
+
+
+# --- BALAM_TIMEZONE: what a /schedule time means (ADR-0016) -------------------
+
+
+def test_timezone_defaults_to_singapore() -> None:
+    cfg = Config(**_BASE)  # type: ignore[arg-type]
+    assert cfg.balam_timezone == "Asia/Singapore"
+    assert cfg.timezone.key == "Asia/Singapore"
+
+
+def test_timezone_accepts_another_zone_and_blank_means_default() -> None:
+    assert Config(**_BASE, balam_timezone="UTC").timezone.key == "UTC"  # type: ignore[arg-type]
+    assert Config(**_BASE, balam_timezone=" ").balam_timezone == "Asia/Singapore"  # type: ignore[arg-type]
+
+
+def test_timezone_rejects_a_typo_at_load() -> None:
+    # The whole point of validating here: a typo must fail at boot, next to the
+    # other trust-boundary checks — not at 07:30 when the schedule doesn't fire.
+    with pytest.raises(ValidationError):
+        Config(**_BASE, balam_timezone="Asia/Singapura")  # type: ignore[arg-type]

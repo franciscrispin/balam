@@ -20,6 +20,11 @@ The design and the reasons behind it live in
   files into a markdown viewer with its `send_file` tool.
 - **Topic management** — `/new` (optionally `/new <context> <first message>` to
   open a topic and start working in it at once), `/rename`, `/status`, `/cancel`.
+- **Scheduled prompts** — `/schedule daily 07:30 <context> <prompt>` opens a fresh
+  topic and runs that prompt on a timer, in your timezone (`BALAM_TIMEZONE`). A
+  scheduled turn has nobody to approve tools, so it is refused anything past a
+  read inside its workspace, and runs missed while Balam was down are caught up
+  within six hours of when they were due.
 
 ## Prerequisites
 

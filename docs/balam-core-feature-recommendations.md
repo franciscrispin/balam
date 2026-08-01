@@ -39,7 +39,6 @@ sessions by hand.
 ## Tier 3 — Defer (costly or blocked)
 
 - **noVNC live Chrome** (ADR-0006) — blocked on VM X11/VNC infra, not code.
-- **Scheduled tasks** — whole workflow; not core to interactive use yet.
 
 Shipped since this doc was written: `allowed_tools` enforcement (the hybrid
 native-ruleset + local-boundary model; see ADR-0012 and `balam.permissions`);
@@ -47,7 +46,10 @@ the **markdown viewer** with open-shrimp's two triggers — an agent-facing
 `send_file` MCP tool whose `.md` sends carry a "📖 Preview" button, and a
 "📋 View plan" button on OpenCode's native `plan_exit` approval question
 (`balam.agent_tools` + `balam.content_store`; review-comments mode in the
-viewer remains a deferred follow-up).
+viewer remains a deferred follow-up); and **scheduled tasks** (`/schedule`),
+which left Tier 3 once `_open_context_topic` and `_start_turn` made a schedule
+just `/new <context> <prompt>` on a timer — see ADR-0016, `balam.schedules`, and
+[the plan it was built from](./scheduled-tasks-plan.md).
 
 Out of scope per ADRs (open-shrimp breadth, not Balam's single-user local design):
 sandboxing, computer-use GUI tools, voice/STT, multi-instance packaging, macOS app.

@@ -21,9 +21,10 @@ running** (ADR-0015) — closing stdin would kill that work, and staying connect
 is also what lets the CLI deliver the finished task's report into the topic.
 
 > Status: core features built — the bot↔agent round-trip over forum topics,
-> workspace contexts + `/context`, and the Mini App (diff viewer, markdown
-> viewer, live noVNC browser view via `/browser`). Plan mode (`/plan`) was
-> removed — the CLI's native natural-language planning covers it.
+> workspace contexts + `/context`, the Mini App (diff viewer, markdown
+> viewer, live noVNC browser view via `/browser`), and scheduled prompts
+> (`/schedule`, ADR-0016). Plan mode (`/plan`) was removed — the CLI's native
+> natural-language planning covers it.
 
 ## Repo layout — two toolchains
 
@@ -87,7 +88,9 @@ seam, ADR-0014: `events.py` normalized event types, `backend.py` protocol +
 topic→session map), `router.py` (topic→context→session, lazy create; registers
 Balam's per-topic MCP tool server),
 `markdown.py` (GFM→MarkdownV2), `streamer.py` (animated `send_message_draft`
-streaming), `bot.py` (PTB: allowlist, chat scoping, message handler, `/context`,
+streaming), `schedules.py` (`/schedule` timers on PTB's `JobQueue` — parser,
+registration, fire path, boot catch-up; ADR-0016), `bot.py` (PTB: allowlist, chat
+scoping, message handler, `/context`,
 `setMyCommands`), `server.py` (FastAPI Mini App + `/api` + `/mcp` routes),
 `agent_tools.py` (agent-facing `send_file` tool served to OpenCode as a remote
 MCP server, per-topic scope tokens), `content_store.py` (ephemeral markdown
