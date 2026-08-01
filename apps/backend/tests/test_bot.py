@@ -14,7 +14,6 @@ from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuest
 from balam.auth import is_owner
 from balam.bot import (
     BOT_COMMANDS,
-    _handle_approval_callback,
     _handle_artifacts,
     _handle_cancel,
     _handle_context,
@@ -24,9 +23,6 @@ from balam.bot import (
     _handle_message,
     _handle_model,
     _handle_new,
-    _handle_question_callback,
-    _handle_question_custom_callback,
-    _handle_question_done_callback,
     _handle_rename,
     _handle_schedule,
     _handle_schedule_confirm_callback,
@@ -35,6 +31,12 @@ from balam.bot import (
     _handle_status,
     build_application,
     register_commands,
+)
+from balam.callbacks import (
+    handle_approval_callback,
+    handle_question_callback,
+    handle_question_custom_callback,
+    handle_question_done_callback,
 )
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.message_text import (
@@ -1368,7 +1370,7 @@ async def test_approval_callback_owner_allow_resolves_future() -> None:
     query = _FakeQuery(f"appr:allow:{token}", OWNER, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert future.done() and future.result() is Choice.ALLOW
     assert query.message.edited  # outcome annotated, keyboard removed
@@ -1382,7 +1384,7 @@ async def test_approval_callback_owner_allow_deletes_prompt_after_edit() -> None
     query = _FakeQuery(f"appr:allow:{token}", OWNER, message)
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
@@ -1397,7 +1399,7 @@ async def test_approval_callback_all_sets_accept_all_edits() -> None:
     query = _FakeQuery(f"appr:all:{token}", OWNER, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert future.result() is Choice.ALL
     assert pending.is_accept_all_edits("ses_y") is True
@@ -1412,7 +1414,7 @@ async def test_approval_callback_deny_does_not_delete_prompt() -> None:
     query = _FakeQuery(f"appr:deny:{token}", OWNER, message)
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
@@ -1427,7 +1429,7 @@ async def test_approval_callback_ignores_stranger() -> None:
     query = _FakeQuery(f"appr:allow:{token}", 999, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert not future.done()  # a stranger's tap never resolves the approval
 
@@ -1439,7 +1441,7 @@ async def test_approval_callback_rejects_owner_in_other_chat() -> None:
     query = _FakeQuery(f"appr:allow:{token}", OWNER, _FakeCBMessage(chat_id=111))
     update, context = _callback_env(query, pending, chat_id=SUPERGROUP)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert not future.done()
 
@@ -1449,7 +1451,7 @@ async def test_approval_callback_expired_token_is_acknowledged() -> None:
     query = _FakeQuery("appr:allow:gone", OWNER, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert any("expired" in (a or "").lower() for a in query.answers)
     # The stale keyboard is still stripped (edit with the original text, no buttons).
@@ -1480,7 +1482,7 @@ async def test_question_callback_single_select_resolves_and_clears_keyboard() ->
     query = _FakeQuery(f"qst:{token}:0:1", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_callback(update, context)
+    await handle_question_callback(update, context)
 
     assert futures[0].result() == ["Tea"]
     assert "✅ *Answered:* Tea" in query.message.edited[-1]
@@ -1495,7 +1497,7 @@ async def test_question_callback_multi_select_toggles_without_resolving() -> Non
     query = _FakeQuery(f"qst:{token}:0:1", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_callback(update, context)
+    await handle_question_callback(update, context)
 
     assert not futures[0].done()
     assert query.answers == ["Selected."]
@@ -1516,8 +1518,8 @@ async def test_question_callback_multi_select_can_unselect() -> None:
     query = _FakeQuery(f"qst:{token}:0:1", OWNER, message)
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_callback(update, context)
-    await _handle_question_callback(update, context)
+    await handle_question_callback(update, context)
+    await handle_question_callback(update, context)
 
     assert not futures[0].done()
     assert query.answers == ["Selected.", "Unselected."]
@@ -1537,7 +1539,7 @@ async def test_question_done_callback_requires_selection() -> None:
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert not futures[0].done()
     assert query.answers == ["Select at least one option."]
@@ -1557,7 +1559,7 @@ async def test_question_done_callback_resolves_multi_select() -> None:
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert futures[0].result() == ["Coffee", "Water"]
     assert "✅ *Answered:* Coffee, Water" in query.message.edited[-1]
@@ -1579,7 +1581,7 @@ async def test_question_done_callback_resolves_multi_select_with_custom_answer()
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert futures[0].result() == ["Tea", "kombucha"]
 
@@ -1594,7 +1596,7 @@ async def test_question_done_callback_allows_custom_only_multi_select() -> None:
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert futures[0].result() == ["sparkling water"]
 
@@ -1607,7 +1609,7 @@ async def test_question_custom_callback_arms_next_topic_message() -> None:
     query = _FakeQuery(f"qstc:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_custom_callback(update, context)
+    await handle_question_custom_callback(update, context)
 
     assert not futures[0].done()
     assert query.message.edited
@@ -1625,7 +1627,7 @@ async def test_question_custom_callback_multi_select_keeps_keyboard_visible() ->
     query = _FakeQuery(f"qstc:{token}:0", OWNER, message)
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_custom_callback(update, context)
+    await handle_question_custom_callback(update, context)
 
     assert not futures[0].done()
     assert not message.edited
