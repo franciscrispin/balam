@@ -24,7 +24,7 @@ from balam.approvals import Choice, CustomAnswer, PendingApprovals, PendingQuest
 from balam.auth import is_owner
 from balam.config import Config
 from balam.markdown import escape_markdown_v2
-from balam.streamer import _question_keyboard
+from balam.stream_render import _question_keyboard
 from balam.telegram_utils import clear_keyboard
 
 logger = logging.getLogger(__name__)
