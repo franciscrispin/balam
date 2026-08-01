@@ -327,7 +327,7 @@ session.
 - **The one-tap link is environment-dependent** because the Bot API cannot focus
   the client on a chat and has **no documented deep link to a topic in a private
   chat** (thread-targeting `t.me`/`tg://` links are supergroup/channel only). So
-  `_topic_link` emits: for a `-100…` supergroup (the live deployment), the official
+  `topics.topic_link` emits: for a `-100…` supergroup (the live deployment), the official
   `t.me/c/<internal>/<thread>` (all clients); for the private-chat fallback, the
   Telegram **Web** address `web.telegram.org/a/#<bot_id>_<thread>` — how the Web
   client itself routes to the topic (verified to open it cold). Web-only, but the
@@ -716,13 +716,14 @@ Status: Accepted Date: 2026-07-31
 
 One prompt already runs on a timer: the Chaska daily brief, from a cron script
 outside this repo. It reaches into Balam's `.env` for the bot token, hand-writes
-a `topic_sessions` row to bind a topic, re-implements `_open_context_topic`
+a `topic_sessions` row to bind a topic, re-implements `topics.open_context_topic`
 badly (no rollback when the bind fails) and `markdown.py` worse (a `sed` turning
 `**x**` into `<b>x</b>`). It works, and it pins Balam's schema from a file no
 test covers.
 
-The machinery to do this properly now exists. `_open_context_topic` creates the
-topic, binds it, and rolls the topic back if the bind fails. `_start_turn` runs a
+The machinery to do this properly now exists. `topics.open_context_topic` creates
+the topic, binds it, and rolls the topic back if the bind fails. `turns.start_turn`
+runs a
 turn from a plain `(chat_id, thread_id, TurnJob)` — it takes no `Message`. So a
 schedule is `/new <context> <prompt>` on a timer, and the work is mostly wiring.
 
@@ -775,10 +776,11 @@ not when its turn ends, so a crash mid-turn cannot re-fire the whole thing.
 - **cron survived Balam being down; this does not.** Catch-up narrows the gap to
   "Balam was down across the due time *and* stayed down more than six hours".
   That is the accepted cost of deleting the cron script.
-- **`bot.py` grew again.** The `/schedule` handlers land there, on top of the
-  file that is already tech-debt item #1. The store, the parser and the fire path
-  live in a new `schedules.py`; only the command surface is in `bot.py`, and it
-  should move with the rest in the planned `commands/` split.
+- **`bot.py` grew again** — since resolved. The `/schedule` handlers first landed
+  in `bot.py`, on top of the file that was then the largest in the repo. The
+  store, the parser and the fire path went into a new `schedules.py`; the command
+  surface has since moved to `commands/schedule.py` in the `commands/` split, and
+  `bot.py` is now the plain-message path plus the registrar.
 - **`/delete` and `/schedule cancel` share one picker.** `PendingDeletions`
   became `PendingPicks`, a paged multi-select over `(id, label)` pairs, rather
   than growing a second picker idiom.
