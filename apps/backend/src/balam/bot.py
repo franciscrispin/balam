@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -24,8 +24,6 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeDefault,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Update,
 )
 from telegram.error import BadRequest
@@ -60,11 +58,18 @@ from balam.message_text import (
     strip_bot_mention_from_command,
 )
 from balam.miniapp import mini_app_reply
+from balam.pickers import (
+    DELETE_PICKER,
+    SCHEDULE_PICKER,
+    handle_picker_page,
+    handle_picker_toggle,
+    picker_markup,
+)
 from balam.router import Router, TopicRef
 from balam.schedules import describe
 from balam.store import SessionStore
 from balam.streamer import _question_keyboard
-from balam.telegram_utils import thread_kwargs
+from balam.telegram_utils import clear_keyboard, thread_kwargs
 from balam.topics import (
     create_topic_from_general,
     is_forum_general_message,
@@ -632,12 +637,12 @@ async def _handle_approval_callback(update: Update, context: ContextTypes.DEFAUL
     pending: PendingApprovals = context.application.bot_data["pending"]
     if not pending.resolve(token, choice):
         await query.answer("This approval has expired.")
-        await _clear_keyboard(query)
+        await clear_keyboard(query)
         return
 
     note, toast = _CHOICE_FEEDBACK[choice]
     await query.answer(toast)
-    updated = await _clear_keyboard(query, note=note)
+    updated = await clear_keyboard(query, note=note)
     if updated and choice is not Choice.DENY:
         _schedule_approval_cleanup(context, query.message)
 
@@ -676,7 +681,7 @@ async def _handle_question_callback(update: Update, context: ContextTypes.DEFAUL
         selected = pending_questions.toggle(token, q_index, o_index)
         if selected is None:
             await query.answer("This question has expired.")
-            await _clear_keyboard(query)
+            await clear_keyboard(query)
             return
         await query.answer("Selected." if selected else "Unselected.")
         await _refresh_question_keyboard(query, pending_questions, token, q_index)
@@ -685,11 +690,11 @@ async def _handle_question_callback(update: Update, context: ContextTypes.DEFAUL
     labels = pending_questions.labels(token, q_index)
     if not pending_questions.resolve(token, q_index, o_index):
         await query.answer("This question has expired.")
-        await _clear_keyboard(query)
+        await clear_keyboard(query)
         return
     chosen = [labels[o_index]] if labels and 0 <= o_index < len(labels) else []
     await query.answer("Answered.")
-    await _clear_keyboard(query, note=_answered_note(chosen))
+    await clear_keyboard(query, note=_answered_note(chosen))
 
 
 async def _handle_question_done_callback(
@@ -730,10 +735,10 @@ async def _handle_question_done_callback(
         return
     if finished is None:
         await query.answer("This question has expired.")
-        await _clear_keyboard(query)
+        await clear_keyboard(query)
         return
     await query.answer("Answered.")
-    await _clear_keyboard(query, note=_answered_note(chosen))
+    await clear_keyboard(query, note=_answered_note(chosen))
 
 
 async def _handle_question_custom_callback(
@@ -773,176 +778,13 @@ async def _handle_question_custom_callback(
     pending_questions: PendingQuestions = context.application.bot_data["pending_questions"]
     if not pending_questions.await_custom(token, q_index, chat.id, thread_id):
         await query.answer("This question has expired.")
-        await _clear_keyboard(query)
+        await clear_keyboard(query)
         return
     if pending_questions.is_multiple(token, q_index):
         await query.answer("Send your custom answer, then tap Done.")
         return
     await query.answer("Send your answer as the next message in this topic.")
-    await _clear_keyboard(query, note=r"Reply with your answer\.")
-
-
-@dataclass(frozen=True)
-class _PickerStyle:
-    """What distinguishes one paged multi-select picker from another: its four
-    callback prefixes and its confirm button's label. ``/delete`` and ``/schedule
-    cancel`` share the keyboard, the paging, and :class:`PendingPicks`; only these
-    differ, plus what the confirm handler does with the chosen ids."""
-
-    toggle: str
-    page: str
-    confirm: str
-    cancel: str
-    confirm_label: str
-
-
-#: Distinct prefixes per picker — PTB dispatches a callback to the first pattern
-#: that matches, so two pickers must never share one.
-_DELETE_PICKER = _PickerStyle("del", "delp", "deld", "delx", "🗑 Delete selected")
-_SCHEDULE_PICKER = _PickerStyle("sch", "schp", "schd", "schx", "🗑 Cancel selected")
-
-
-def _picker_keyboard(
-    style: _PickerStyle,
-    token: str,
-    entries: list[tuple[int, str, bool]],
-    page: int = 0,
-    page_count: int = 1,
-    selected_count: int = 0,
-) -> InlineKeyboardMarkup:
-    """Checklist for the current page (``<toggle>:<token>:<id>``), a Prev/Next
-    navigation row when the snapshot spans more than one page
-    (``<page>:<token>:<page>``), and the confirm/cancel row. ``selected_count``
-    spans the whole snapshot, so the confirm button reflects picks made on other
-    pages."""
-    rows: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(
-                f"{'☑️' if selected else '☐'} {label}",
-                callback_data=f"{style.toggle}:{token}:{item_id}",
-            )
-        ]
-        for item_id, label, selected in entries
-    ]
-    if page_count > 1:
-        nav: list[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(
-                InlineKeyboardButton("◀ Prev", callback_data=f"{style.page}:{token}:{page - 1}")
-            )
-        # The indicator points at the current page, so tapping it is a harmless no-op.
-        nav.append(
-            InlineKeyboardButton(
-                f"Page {page + 1}/{page_count}", callback_data=f"{style.page}:{token}:{page}"
-            )
-        )
-        if page < page_count - 1:
-            nav.append(
-                InlineKeyboardButton("Next ▶", callback_data=f"{style.page}:{token}:{page + 1}")
-            )
-        rows.append(nav)
-    confirm_label = style.confirm_label
-    if selected_count:
-        confirm_label += f" ({selected_count})"
-    rows.append(
-        [
-            InlineKeyboardButton(confirm_label, callback_data=f"{style.confirm}:{token}"),
-            InlineKeyboardButton("Cancel", callback_data=f"{style.cancel}:{token}"),
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
-
-
-def _picker_markup(
-    style: _PickerStyle, picks: PendingPicks, token: str
-) -> InlineKeyboardMarkup | None:
-    """Build a picker keyboard from current snapshot state, or ``None`` if the
-    token expired."""
-    entries = picks.entries(token)
-    info = picks.page_info(token)
-    if entries is None or info is None:
-        return None
-    page, page_count, _total, selected = info
-    return _picker_keyboard(style, token, entries, page, page_count, selected)
-
-
-async def _handle_picker_toggle(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, style: _PickerStyle, bot_data_key: str
-) -> None:
-    """Toggle an item's checkbox (``<toggle>:<token>:<id>``). Shared by both
-    pickers — only the prefix set and which ``bot_data`` snapshot to read differ."""
-    query = update.callback_query
-    if query is None or not (query.data or "").startswith(f"{style.toggle}:"):
-        return
-    config: Config = context.application.bot_data["config"]
-    if not callback_authorized(query, config):
-        await query.answer()
-        return
-
-    parts = (query.data or "").split(":", 2)
-    if len(parts) != 3:
-        await query.answer("Malformed selection.")
-        return
-    _, token, item_id_raw = parts
-    try:
-        item_id = int(item_id_raw)
-    except ValueError:
-        await query.answer("Malformed selection.")
-        return
-
-    picks: PendingPicks = context.application.bot_data[bot_data_key]
-    state = picks.toggle(token, item_id)
-    if state is None:
-        await query.answer("This picker has expired.")
-        await _clear_keyboard(query)
-        return
-    await query.answer("Selected." if state else "Unselected.")
-    await _refresh_picker(query, style, picks, token)
-
-
-async def _handle_picker_page(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, style: _PickerStyle, bot_data_key: str
-) -> None:
-    """Flip a picker to another page (``<page>:<token>:<page>``). Selections are
-    kept in the snapshot, so paging never loses what's already checked."""
-    query = update.callback_query
-    if query is None or not (query.data or "").startswith(f"{style.page}:"):
-        return
-    config: Config = context.application.bot_data["config"]
-    if not callback_authorized(query, config):
-        await query.answer()
-        return
-
-    parts = (query.data or "").split(":", 2)
-    if len(parts) != 3:
-        await query.answer("Malformed request.")
-        return
-    _, token, page_raw = parts
-    try:
-        page = int(page_raw)
-    except ValueError:
-        await query.answer("Malformed request.")
-        return
-
-    picks: PendingPicks = context.application.bot_data[bot_data_key]
-    if picks.set_page(token, page) is None:
-        await query.answer("This picker has expired.")
-        await _clear_keyboard(query)
-        return
-    await query.answer()
-    await _refresh_picker(query, style, picks, token)
-
-
-async def _refresh_picker(query: Any, style: _PickerStyle, picks: PendingPicks, token: str) -> None:
-    """Redraw a picker's keyboard in place; a failed edit is cosmetic only."""
-    markup = _picker_markup(style, picks, token)
-    message = getattr(query, "message", None)
-    if markup is None or message is None:
-        return
-    try:
-        await message.edit_reply_markup(reply_markup=markup)
-    except Exception:
-        logger.debug("failed to refresh %s keyboard", style.toggle, exc_info=True)
+    await clear_keyboard(query, note=r"Reply with your answer\.")
 
 
 async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -975,7 +817,7 @@ async def _handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Selections persist across pages."
         )
     await message.reply_text(
-        text, reply_markup=_picker_markup(_DELETE_PICKER, pending_deletions, token)
+        text, reply_markup=picker_markup(DELETE_PICKER, pending_deletions, token)
     )
 
 
@@ -983,12 +825,12 @@ async def _handle_delete_toggle_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Toggle a topic's checkbox in the /delete picker (``del:<token>:<thread_id>``)."""
-    await _handle_picker_toggle(update, context, _DELETE_PICKER, "pending_deletions")
+    await handle_picker_toggle(update, context, DELETE_PICKER, "pending_deletions")
 
 
 async def _handle_delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Flip the /delete picker to another page (``delp:<token>:<page>``)."""
-    await _handle_picker_page(update, context, _DELETE_PICKER, "pending_deletions")
+    await handle_picker_page(update, context, DELETE_PICKER, "pending_deletions")
 
 
 async def _handle_delete_confirm_callback(
@@ -1014,7 +856,7 @@ async def _handle_delete_confirm_callback(
     chat_id = pending_deletions.chat_id(token)
     if thread_ids is None or chat_id is None:
         await query.answer("This picker has expired.")
-        await _clear_keyboard(query)
+        await clear_keyboard(query)
         return
     if not thread_ids:
         await query.answer("Select at least one topic.")
@@ -1286,21 +1128,21 @@ async def _schedule_cancel(message: Any, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\n\n{info[2]} schedules across {info[1]} pages — use ◀ ▶ to browse. "
             "Selections persist across pages."
         )
-    await message.reply_text(text, reply_markup=_picker_markup(_SCHEDULE_PICKER, picks, token))
+    await message.reply_text(text, reply_markup=picker_markup(SCHEDULE_PICKER, picks, token))
 
 
 async def _handle_schedule_toggle_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Toggle a schedule's checkbox in the picker (``sch:<token>:<id>``)."""
-    await _handle_picker_toggle(update, context, _SCHEDULE_PICKER, "pending_schedule_picks")
+    await handle_picker_toggle(update, context, SCHEDULE_PICKER, "pending_schedule_picks")
 
 
 async def _handle_schedule_page_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Flip the /schedule cancel picker to another page (``schp:<token>:<page>``)."""
-    await _handle_picker_page(update, context, _SCHEDULE_PICKER, "pending_schedule_picks")
+    await handle_picker_page(update, context, SCHEDULE_PICKER, "pending_schedule_picks")
 
 
 async def _handle_schedule_confirm_callback(
@@ -1325,7 +1167,7 @@ async def _handle_schedule_confirm_callback(
     schedule_ids = picks.selected_ids(token)
     if schedule_ids is None:
         await query.answer("This picker has expired.")
-        await _clear_keyboard(query)
+        await clear_keyboard(query)
         return
     if not schedule_ids:
         await query.answer("Select at least one schedule.")
@@ -1420,26 +1262,6 @@ def _answered_note(answers: list[str]) -> str:
         return r"✅ Answered\."
     joined = ", ".join(answers)
     return f"✅ *Answered:* {escape_markdown_v2(joined)}"
-
-
-async def _clear_keyboard(query: Any, note: str | None = None) -> bool:
-    """Strip a spent approval keyboard, appending a one-line outcome when given.
-
-    ``note`` (when set) must already be MarkdownV2-escaped. Best-effort: a failed
-    edit — e.g. a message too old to edit — is logged, not raised; the callback
-    answer already told the user the outcome.
-    """
-    message = getattr(query, "message", None)
-    if message is None:
-        return False
-    original = message.text_markdown_v2 or message.text or ""
-    text = f"{original}\n\n{note}" if note else original
-    try:
-        await message.edit_text(text=text, parse_mode="MarkdownV2", reply_markup=None)
-        return True
-    except Exception:
-        logger.debug("failed to update spent approval message", exc_info=True)
-        return False
 
 
 async def _refresh_question_keyboard(
