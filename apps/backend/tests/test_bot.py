@@ -13,8 +13,6 @@ from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuestions
 from balam.bot import (
     BOT_COMMANDS,
-    _forward_reply_prefix,
-    _forwarded_slash_command,
     _handle_approval_callback,
     _handle_artifacts,
     _handle_cancel,
@@ -34,7 +32,6 @@ from balam.bot import (
     _handle_schedule_dismiss_callback,
     _handle_schedule_toggle_callback,
     _handle_status,
-    _strip_bot_mention_from_command,
     _topic_link,
     _topic_name,
     build_application,
@@ -42,6 +39,11 @@ from balam.bot import (
     register_commands,
 )
 from balam.contexts import ContextConfig, ContextsConfig
+from balam.message_text import (
+    forward_reply_prefix,
+    forwarded_slash_command,
+    strip_bot_mention_from_command,
+)
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
 from balam.turns import TurnJob, TurnRegistry
@@ -67,16 +69,16 @@ def test_does_not_treat_zero_as_wildcard() -> None:
 
 
 def test_strip_bot_mention_removes_own_mention() -> None:
-    assert _strip_bot_mention_from_command("/goal@balambot do it", "balambot") == "/goal do it"
-    assert _strip_bot_mention_from_command("/goal@BalamBot", "balambot") == "/goal"
+    assert strip_bot_mention_from_command("/goal@balambot do it", "balambot") == "/goal do it"
+    assert strip_bot_mention_from_command("/goal@BalamBot", "balambot") == "/goal"
 
 
 def test_strip_bot_mention_leaves_other_text_untouched() -> None:
     # Non-commands, other bots' mentions, and missing username are all passed through.
-    assert _strip_bot_mention_from_command("/goal do it", "balambot") == "/goal do it"
-    assert _strip_bot_mention_from_command("email me @ work", "balambot") == "email me @ work"
-    assert _strip_bot_mention_from_command("/goal@otherbot", "balambot") == "/goal@otherbot"
-    assert _strip_bot_mention_from_command("/goal@balambot", None) == "/goal@balambot"
+    assert strip_bot_mention_from_command("/goal do it", "balambot") == "/goal do it"
+    assert strip_bot_mention_from_command("email me @ work", "balambot") == "email me @ work"
+    assert strip_bot_mention_from_command("/goal@otherbot", "balambot") == "/goal@otherbot"
+    assert strip_bot_mention_from_command("/goal@balambot", None) == "/goal@balambot"
 
 
 def _cmd_entity(offset: int = 0, length: int = 5):
@@ -85,19 +87,19 @@ def _cmd_entity(offset: int = 0, length: int = 5):
 
 def test_forwarded_slash_command_detects_leading_command() -> None:
     msg = SimpleNamespace(text="/goal do it", entities=[_cmd_entity()])
-    assert _forwarded_slash_command(msg) is True
+    assert forwarded_slash_command(msg) is True
 
 
 def test_forwarded_slash_command_ignores_plain_text_and_mid_text_slash() -> None:
     # Plain text, no entities, and a slash that isn't a leading BOT_COMMAND entity.
-    assert _forwarded_slash_command(SimpleNamespace(text="hello", entities=[])) is False
-    assert _forwarded_slash_command(SimpleNamespace(text="use /goal here", entities=None)) is False
+    assert forwarded_slash_command(SimpleNamespace(text="hello", entities=[])) is False
+    assert forwarded_slash_command(SimpleNamespace(text="use /goal here", entities=None)) is False
     # A mention entity at offset 0 (e.g. "@someone") is not a command.
     mention = MessageEntity(type=MessageEntity.MENTION, offset=0, length=8)
-    assert _forwarded_slash_command(SimpleNamespace(text="@someone", entities=[mention])) is False
+    assert forwarded_slash_command(SimpleNamespace(text="@someone", entities=[mention])) is False
     # A command not at the start of the message doesn't route as a command.
     assert (
-        _forwarded_slash_command(SimpleNamespace(text="hi /goal", entities=[_cmd_entity(3)]))
+        forwarded_slash_command(SimpleNamespace(text="hi /goal", entities=[_cmd_entity(3)]))
         is False
     )
 
@@ -117,12 +119,12 @@ def _plain_msg(**overrides):
 
 
 def test_forward_reply_prefix_plain_message_is_empty() -> None:
-    assert _forward_reply_prefix(_plain_msg()) == ""
+    assert forward_reply_prefix(_plain_msg()) == ""
 
 
 def test_forward_reply_prefix_from_visible_user() -> None:
     origin = SimpleNamespace(sender_user=SimpleNamespace(full_name="Alice Tan", username="alice"))
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
         "[Forwarded from Alice Tan (@alice)]\n"
     )
 
@@ -130,7 +132,7 @@ def test_forward_reply_prefix_from_visible_user() -> None:
 def test_forward_reply_prefix_from_hidden_user_has_no_handle() -> None:
     # A sender who hides their account exposes only a name, never a @username.
     origin = SimpleNamespace(sender_user=None, sender_user_name="Bob (hidden)")
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
         "[Forwarded from Bob (hidden)]\n"
     )
 
@@ -143,7 +145,7 @@ def test_forward_reply_prefix_from_channel_uses_title_and_signature() -> None:
         chat=SimpleNamespace(title="Glints News", username="glintsnews"),
         author_signature="Editor",
     )
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
         "[Forwarded from Glints News (Editor)]\n"
     )
 
@@ -156,7 +158,7 @@ def test_forward_reply_prefix_reply_uses_who_and_snippet() -> None:
         caption=None,
         forum_topic_created=None,
     )
-    assert _forward_reply_prefix(_plain_msg(reply_to_message=reply)) == (
+    assert forward_reply_prefix(_plain_msg(reply_to_message=reply)) == (
         '[Replying to Bob Lee (@bob): "let\'s finish the deck tomorrow"]\n'
     )
 
@@ -170,7 +172,7 @@ def test_forward_reply_prefix_prefers_highlighted_quote_over_full_message() -> N
         forum_topic_created=None,
     )
     quote = SimpleNamespace(text="9pm tomorrow")
-    line = _forward_reply_prefix(_plain_msg(reply_to_message=reply, quote=quote))
+    line = forward_reply_prefix(_plain_msg(reply_to_message=reply, quote=quote))
     assert line == '[Replying to Bob Lee (@bob): "9pm tomorrow"]\n'
 
 
@@ -184,7 +186,7 @@ def test_forward_reply_prefix_skips_forum_topic_anchor_and_service_message() -> 
         caption=None,
         forum_topic_created=None,
     )
-    assert _forward_reply_prefix(_plain_msg(reply_to_message=anchor, message_thread_id=5)) == ""
+    assert forward_reply_prefix(_plain_msg(reply_to_message=anchor, message_thread_id=5)) == ""
     # A forum service message (topic created) is skipped regardless of its id.
     service = SimpleNamespace(
         from_user=None,
@@ -193,7 +195,7 @@ def test_forward_reply_prefix_skips_forum_topic_anchor_and_service_message() -> 
         caption=None,
         forum_topic_created=SimpleNamespace(name="scratch"),
     )
-    assert _forward_reply_prefix(_plain_msg(reply_to_message=service)) == ""
+    assert forward_reply_prefix(_plain_msg(reply_to_message=service)) == ""
 
 
 def test_forward_reply_prefix_combines_forward_and_reply() -> None:
@@ -205,7 +207,7 @@ def test_forward_reply_prefix_combines_forward_and_reply() -> None:
         caption=None,
         forum_topic_created=None,
     )
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin, reply_to_message=reply)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin, reply_to_message=reply)) == (
         '[Forwarded from Alice Tan (@alice)]\n[Replying to Bob Lee (@bob): "the deck"]\n'
     )
 
