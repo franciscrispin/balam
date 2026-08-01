@@ -30,8 +30,10 @@ from pydantic import BaseModel
 from balam.agent_tools import ToolScopes, create_send_file_tool, handle_rpc
 from balam.config import Config
 from balam.content_store import ContentStore
+from balam.contexts import ContextConfig, ContextsConfig
 from balam.git_diff import DiffHunk, NotAGitRepo, get_hunks
 from balam.router import Router
+from balam.store import SessionStore
 from balam.vnc import probe_vnc, vnc_websocket
 from balam.webapp_auth import RequireOwner
 
@@ -216,9 +218,6 @@ def openapi_schema() -> dict:
     and the root ``gen:api`` script). The placeholders never serve a request, so
     no real bot token or workspace is needed.
     """
-    from balam.contexts import ContextConfig, ContextsConfig
-    from balam.store import SessionStore
-
     config = Config.model_construct(telegram_bot_token="placeholder", allowed_telegram_user_id=0)
     contexts = ContextsConfig(
         default_context="default",

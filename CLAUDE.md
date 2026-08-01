@@ -80,23 +80,38 @@ Balam backend (apps/backend, Python: FastAPI + python-telegram-bot) — bot, ser
 OpenCode server (separate process, NOT in this repo) — the agent: model + local tools/files + browser-use skill
 ```
 
-Backend modules (`apps/backend/src/balam/`): `config.py` (env validation),
-`contexts.py` (`config.yaml` workspace contexts), `agent/` (the `AgentBackend`
-seam, ADR-0014: `events.py` normalized event types, `backend.py` protocol +
-`TurnRequest`, `opencode_backend.py`, `claude_sdk_backend.py`), `opencode.py`
-(httpx HTTP/SSE client wrapped by `OpenCodeBackend`), `store.py` (sqlite3
-topic→session map), `router.py` (topic→context→session, lazy create; registers
-Balam's per-topic MCP tool server),
-`markdown.py` (GFM→MarkdownV2), `streamer.py` (animated `send_message_draft`
-streaming), `schedules.py` (`/schedule` timers on PTB's `JobQueue` — parser,
-registration, fire path, boot catch-up; ADR-0016), `bot.py` (PTB: allowlist, chat
-scoping, message handler, `/context`,
-`setMyCommands`), `server.py` (FastAPI Mini App + `/api` + `/mcp` routes),
-`agent_tools.py` (agent-facing `send_file` tool served to OpenCode as a remote
-MCP server, per-topic scope tokens), `content_store.py` (ephemeral markdown
-snapshots for the Mini App viewer), `miniapp.py` (Mini App launch links/buttons),
-`vnc.py` (live browser view: `/api/vnc/ws` WebSocket↔TCP bridge to x11vnc,
-ADR-0006), `app.py` (boot).
+Backend modules (`apps/backend/src/balam/`) — `docs/codebase-guide.md` has the
+full map; the load-bearing ones:
+
+- **Entry / config:** `app.py` (boot), `config.py` (env validation), `contexts.py`
+  (`config.yaml` workspace contexts), `auth.py` (the ADR-0008 allowlist).
+- **Telegram surface:** `bot.py` is *only* the plain-message path plus the
+  registrar — it builds the PTB app, fills `bot_data`, and wires handlers.
+  Handlers live in `commands/` (`session.py`, `views.py`, `delete.py`,
+  `schedule.py`), `callbacks.py` (approval/question taps), `pickers.py` (the
+  paged multi-select shared by `/delete` and `/schedule cancel`), `topics.py`
+  (naming/opening/linking topics), `message_text.py` (forward/reply/quote
+  gestures → agent-visible text). **Nothing imports `bot.py`** — keep it that way.
+- **Running a turn:** `router.py` (topic→context→session, lazy create),
+  `store.py` (sqlite3 map + `schedules` table), `turns.py` (turn data *and*
+  running one), `streamer.py` (draft/live-edit transport + the answer-at-tail
+  check), `stream_render.py` (the pure rendering half), `markdown.py`
+  (GFM→MarkdownV2), `rich_messages.py`, `schedules.py` (`/schedule` timers on
+  PTB's `JobQueue`; ADR-0016).
+- **Permissions/tools:** `tools.py` is the canonical tool registry (wire name,
+  display label, permission category, SDK spellings) that `streamer`,
+  `claude_sdk_backend` and `permissions` all derive from; `permissions.py`
+  (native ruleset + in-process eval), `approvals.py` (directory boundary +
+  keyboard), `attachments.py`.
+- **Agent seam (ADR-0014):** `agent/backend.py` (protocol + `TurnRequest`),
+  `agent/events.py` (normalized events), `agent/opencode_backend.py` +
+  `opencode.py` (httpx HTTP/SSE), `agent/claude_sdk_backend.py` (query loop,
+  ADR-0015 background hold), `agent/sdk_tasks.py` (CLI task-list mirror),
+  `agent/sdk_translate.py` (SDK↔OpenCode vocabulary), `mcp_config.py`.
+- **Mini App:** `server.py` (FastAPI + `/api` + `/mcp`), `webapp_auth.py`
+  (`initData` HMAC), `miniapp.py` (launch links), `git_diff.py`,
+  `content_store.py` (ephemeral markdown snapshots), `vnc.py` (noVNC bridge,
+  ADR-0006), `agent_tools.py` (agent-facing `send_file`).
 
 Telegram specifics (ADR-0009): streaming uses native `send_message_draft`; forum
 topics are addressed by `message_thread_id`. Bot API ref:
