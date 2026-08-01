@@ -36,7 +36,7 @@ from __future__ import annotations
 import fnmatch
 
 from balam.contexts import ContextConfig
-from balam.opencode_tools import Permission, Tool
+from balam.tools import FILE_PATH_CATEGORIES, MUTATING_TOOLS, Permission
 
 #: Permissions that should never generate Balam approval noise. ``todowrite`` is
 #: internal bookkeeping; ``question`` is OpenCode's own interactive question flow
@@ -57,17 +57,6 @@ ALWAYS_ALLOWED_PERMS: tuple[Permission, ...] = (
     Permission.PLAN_ENTER,
     Permission.PLAN_EXIT,
     Permission.TASK,
-)
-
-#: ``allowed_tools`` names that mean "let the model edit files". OpenCode folds
-#: the edit/write/apply_patch *tools* into one ``edit`` *permission* category, so
-#: we normalize them all to that.
-MUTATING_INPUT_NAMES = frozenset({Tool.EDIT, Tool.WRITE, Tool.APPLY_PATCH})
-
-#: Categories whose pattern is a filesystem path (leading slash stripped, ``**``
-#: glob). A bare entry for one of these is scoped to the workspace directories.
-FILE_PATH_CATEGORIES = frozenset(
-    {Permission.READ, Permission.EDIT, Permission.GLOB, Permission.GREP, Permission.LIST}
 )
 
 
@@ -155,7 +144,7 @@ def build_ruleset(ctx: ContextConfig) -> list[dict[str, str]]:
         permission, pattern = parse_allowed_tool(entry)
         if permission is None:
             continue
-        if permission in MUTATING_INPUT_NAMES:
+        if permission in MUTATING_TOOLS:
             permission = Permission.EDIT
         if permission in FILE_PATH_CATEGORIES:
             if pattern is None:

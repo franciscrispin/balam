@@ -11,39 +11,48 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, JobQueue, Message
 from balam import schedules
 from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuestions
+from balam.auth import is_owner
 from balam.bot import (
     BOT_COMMANDS,
-    _forward_reply_prefix,
-    _forwarded_slash_command,
-    _handle_approval_callback,
-    _handle_artifacts,
-    _handle_cancel,
-    _handle_context,
-    _handle_delete_confirm_callback,
-    _handle_delete_page_callback,
-    _handle_effort,
     _handle_message,
-    _handle_model,
-    _handle_new,
-    _handle_question_callback,
-    _handle_question_custom_callback,
-    _handle_question_done_callback,
-    _handle_rename,
-    _handle_schedule,
-    _handle_schedule_confirm_callback,
-    _handle_schedule_dismiss_callback,
-    _handle_schedule_toggle_callback,
-    _handle_status,
-    _strip_bot_mention_from_command,
-    _topic_link,
-    _topic_name,
     build_application,
-    is_owner,
     register_commands,
 )
+from balam.callbacks import (
+    handle_approval_callback,
+    handle_question_callback,
+    handle_question_custom_callback,
+    handle_question_done_callback,
+)
+from balam.commands.delete import (
+    handle_delete_confirm_callback,
+    handle_delete_page_callback,
+)
+from balam.commands.schedule import (
+    handle_schedule,
+    handle_schedule_confirm_callback,
+    handle_schedule_dismiss_callback,
+    handle_schedule_toggle_callback,
+)
+from balam.commands.session import (
+    handle_cancel,
+    handle_context,
+    handle_effort,
+    handle_model,
+    handle_new,
+    handle_rename,
+    handle_status,
+)
+from balam.commands.views import handle_artifacts
 from balam.contexts import ContextConfig, ContextsConfig
+from balam.message_text import (
+    forward_reply_prefix,
+    forwarded_slash_command,
+    strip_bot_mention_from_command,
+)
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
+from balam.topics import topic_link, topic_name
 from balam.turns import TurnJob, TurnRegistry
 
 OWNER = 424242
@@ -67,16 +76,16 @@ def test_does_not_treat_zero_as_wildcard() -> None:
 
 
 def test_strip_bot_mention_removes_own_mention() -> None:
-    assert _strip_bot_mention_from_command("/goal@balambot do it", "balambot") == "/goal do it"
-    assert _strip_bot_mention_from_command("/goal@BalamBot", "balambot") == "/goal"
+    assert strip_bot_mention_from_command("/goal@balambot do it", "balambot") == "/goal do it"
+    assert strip_bot_mention_from_command("/goal@BalamBot", "balambot") == "/goal"
 
 
 def test_strip_bot_mention_leaves_other_text_untouched() -> None:
     # Non-commands, other bots' mentions, and missing username are all passed through.
-    assert _strip_bot_mention_from_command("/goal do it", "balambot") == "/goal do it"
-    assert _strip_bot_mention_from_command("email me @ work", "balambot") == "email me @ work"
-    assert _strip_bot_mention_from_command("/goal@otherbot", "balambot") == "/goal@otherbot"
-    assert _strip_bot_mention_from_command("/goal@balambot", None) == "/goal@balambot"
+    assert strip_bot_mention_from_command("/goal do it", "balambot") == "/goal do it"
+    assert strip_bot_mention_from_command("email me @ work", "balambot") == "email me @ work"
+    assert strip_bot_mention_from_command("/goal@otherbot", "balambot") == "/goal@otherbot"
+    assert strip_bot_mention_from_command("/goal@balambot", None) == "/goal@balambot"
 
 
 def _cmd_entity(offset: int = 0, length: int = 5):
@@ -85,19 +94,19 @@ def _cmd_entity(offset: int = 0, length: int = 5):
 
 def test_forwarded_slash_command_detects_leading_command() -> None:
     msg = SimpleNamespace(text="/goal do it", entities=[_cmd_entity()])
-    assert _forwarded_slash_command(msg) is True
+    assert forwarded_slash_command(msg) is True
 
 
 def test_forwarded_slash_command_ignores_plain_text_and_mid_text_slash() -> None:
     # Plain text, no entities, and a slash that isn't a leading BOT_COMMAND entity.
-    assert _forwarded_slash_command(SimpleNamespace(text="hello", entities=[])) is False
-    assert _forwarded_slash_command(SimpleNamespace(text="use /goal here", entities=None)) is False
+    assert forwarded_slash_command(SimpleNamespace(text="hello", entities=[])) is False
+    assert forwarded_slash_command(SimpleNamespace(text="use /goal here", entities=None)) is False
     # A mention entity at offset 0 (e.g. "@someone") is not a command.
     mention = MessageEntity(type=MessageEntity.MENTION, offset=0, length=8)
-    assert _forwarded_slash_command(SimpleNamespace(text="@someone", entities=[mention])) is False
+    assert forwarded_slash_command(SimpleNamespace(text="@someone", entities=[mention])) is False
     # A command not at the start of the message doesn't route as a command.
     assert (
-        _forwarded_slash_command(SimpleNamespace(text="hi /goal", entities=[_cmd_entity(3)]))
+        forwarded_slash_command(SimpleNamespace(text="hi /goal", entities=[_cmd_entity(3)]))
         is False
     )
 
@@ -117,12 +126,12 @@ def _plain_msg(**overrides):
 
 
 def test_forward_reply_prefix_plain_message_is_empty() -> None:
-    assert _forward_reply_prefix(_plain_msg()) == ""
+    assert forward_reply_prefix(_plain_msg()) == ""
 
 
 def test_forward_reply_prefix_from_visible_user() -> None:
     origin = SimpleNamespace(sender_user=SimpleNamespace(full_name="Alice Tan", username="alice"))
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
         "[Forwarded from Alice Tan (@alice)]\n"
     )
 
@@ -130,7 +139,7 @@ def test_forward_reply_prefix_from_visible_user() -> None:
 def test_forward_reply_prefix_from_hidden_user_has_no_handle() -> None:
     # A sender who hides their account exposes only a name, never a @username.
     origin = SimpleNamespace(sender_user=None, sender_user_name="Bob (hidden)")
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
         "[Forwarded from Bob (hidden)]\n"
     )
 
@@ -143,7 +152,7 @@ def test_forward_reply_prefix_from_channel_uses_title_and_signature() -> None:
         chat=SimpleNamespace(title="Glints News", username="glintsnews"),
         author_signature="Editor",
     )
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
         "[Forwarded from Glints News (Editor)]\n"
     )
 
@@ -156,7 +165,7 @@ def test_forward_reply_prefix_reply_uses_who_and_snippet() -> None:
         caption=None,
         forum_topic_created=None,
     )
-    assert _forward_reply_prefix(_plain_msg(reply_to_message=reply)) == (
+    assert forward_reply_prefix(_plain_msg(reply_to_message=reply)) == (
         '[Replying to Bob Lee (@bob): "let\'s finish the deck tomorrow"]\n'
     )
 
@@ -170,7 +179,7 @@ def test_forward_reply_prefix_prefers_highlighted_quote_over_full_message() -> N
         forum_topic_created=None,
     )
     quote = SimpleNamespace(text="9pm tomorrow")
-    line = _forward_reply_prefix(_plain_msg(reply_to_message=reply, quote=quote))
+    line = forward_reply_prefix(_plain_msg(reply_to_message=reply, quote=quote))
     assert line == '[Replying to Bob Lee (@bob): "9pm tomorrow"]\n'
 
 
@@ -184,7 +193,7 @@ def test_forward_reply_prefix_skips_forum_topic_anchor_and_service_message() -> 
         caption=None,
         forum_topic_created=None,
     )
-    assert _forward_reply_prefix(_plain_msg(reply_to_message=anchor, message_thread_id=5)) == ""
+    assert forward_reply_prefix(_plain_msg(reply_to_message=anchor, message_thread_id=5)) == ""
     # A forum service message (topic created) is skipped regardless of its id.
     service = SimpleNamespace(
         from_user=None,
@@ -193,7 +202,7 @@ def test_forward_reply_prefix_skips_forum_topic_anchor_and_service_message() -> 
         caption=None,
         forum_topic_created=SimpleNamespace(name="scratch"),
     )
-    assert _forward_reply_prefix(_plain_msg(reply_to_message=service)) == ""
+    assert forward_reply_prefix(_plain_msg(reply_to_message=service)) == ""
 
 
 def test_forward_reply_prefix_combines_forward_and_reply() -> None:
@@ -205,7 +214,7 @@ def test_forward_reply_prefix_combines_forward_and_reply() -> None:
         caption=None,
         forum_topic_created=None,
     )
-    assert _forward_reply_prefix(_plain_msg(forward_origin=origin, reply_to_message=reply)) == (
+    assert forward_reply_prefix(_plain_msg(forward_origin=origin, reply_to_message=reply)) == (
         '[Forwarded from Alice Tan (@alice)]\n[Replying to Bob Lee (@bob): "the deck"]\n'
     )
 
@@ -218,16 +227,16 @@ BOT_ID = 7000000042
 
 def test_topic_link_for_private_supergroup() -> None:
     # -100<internal> → t.me/c/<internal>/<thread> (official, all clients).
-    assert _topic_link(SUPERGROUP, 42) == "https://t.me/c/1234567890/42"
+    assert topic_link(SUPERGROUP, 42) == "https://t.me/c/1234567890/42"
 
 
 def test_topic_link_for_private_chat_uses_web_address() -> None:
     # Private chat with topics has no documented deep link → Telegram Web URL.
-    assert _topic_link(55555555, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
+    assert topic_link(55555555, 42, bot_id=BOT_ID) == f"https://web.telegram.org/a/#{BOT_ID}_42"
 
 
 def test_topic_link_none_for_private_chat_without_bot_id() -> None:
-    assert _topic_link(55555555, 42) is None
+    assert topic_link(55555555, 42) is None
 
 
 class _FakeOpenCode:
@@ -375,7 +384,7 @@ async def test_context_switch_opens_new_topic_and_links_to_it() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     # A new topic is created for the context (not a rebind of thread 5).
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
@@ -395,7 +404,7 @@ async def test_context_switch_in_private_chat_links_via_web() -> None:
     message = _FakeMessage(55555555, thread_id=723626)  # fake owner user id
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     assert bot.created_topics == [(55555555, "scratch")]
     assert f"https://web.telegram.org/a/#{BOT_ID}_723639" in _button_urls(message)
@@ -407,7 +416,7 @@ async def test_context_switch_from_general_also_opens_a_topic() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None)  # General
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
     assert router.current_context_name(TopicRef(SUPERGROUP, 900, "t")) == "scratch"
@@ -419,7 +428,7 @@ async def test_unknown_context_is_rejected_without_creating_a_topic() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["nope"])
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
 
     assert bot.created_topics == []
     assert any("Unknown context" in reply for reply in message.replies)
@@ -475,7 +484,7 @@ async def test_new_opens_a_new_topic_in_the_current_context() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, [])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     # A brand-new topic is created, bound to the same context as the current one.
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
@@ -493,7 +502,7 @@ async def test_first_message_auto_names_existing_topic(monkeypatch) -> None:
     async def fake_stream_reply(**_: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot()
@@ -524,7 +533,7 @@ async def test_first_message_does_not_auto_name_twice(monkeypatch) -> None:
     async def fake_stream_reply(**_: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot()
@@ -559,7 +568,7 @@ async def test_general_message_creates_named_topic_in_current_context(monkeypatc
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=901)
@@ -602,7 +611,7 @@ async def test_rename_changes_current_topic_and_blocks_auto_name() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["Build", "fix"])
 
-    await _handle_rename(update, context)
+    await handle_rename(update, context)
 
     assert bot.edited_topics == [(SUPERGROUP, 5, "Build fix")]
     assert router.topic_auto_named(TopicRef(SUPERGROUP, 5, "t")) is True
@@ -615,14 +624,14 @@ async def test_rename_requires_name() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, [])
 
-    await _handle_rename(update, context)
+    await handle_rename(update, context)
 
     assert bot.edited_topics == []
     assert "Usage" in message.replies[-1]
 
 
 def test_topic_name_truncates_to_telegram_limit() -> None:
-    name = _topic_name("balam", "x" * 200)
+    name = topic_name("balam", "x" * 200)
 
     assert len(name) == 128
     assert name.startswith("balam: ")
@@ -637,7 +646,7 @@ async def test_new_with_arg_opens_topic_in_named_context() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["scratch"])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
     assert router.current_context_name(TopicRef(SUPERGROUP, 902, "t")) == "scratch"
@@ -650,7 +659,7 @@ async def test_new_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=904)
@@ -660,7 +669,7 @@ async def test_new_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None:
         bot, router, message, ["scratch", "check", "last", "month"], turns=turns
     )
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
     turn = turns.get(SUPERGROUP, 904)
     assert turn is not None
     await turn.task
@@ -684,7 +693,7 @@ async def test_new_with_prompt_keeps_line_breaks(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=905)
@@ -694,7 +703,7 @@ async def test_new_with_prompt_keeps_line_breaks(monkeypatch) -> None:
         bot, router, message, ["scratch", "first", "line", "second", "line"], turns=turns
     )
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
     turn = turns.get(SUPERGROUP, 905)
     assert turn is not None
     await turn.task
@@ -708,7 +717,7 @@ async def test_context_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=906)
@@ -718,7 +727,7 @@ async def test_context_with_prompt_runs_it_in_the_new_topic(monkeypatch) -> None
         bot, router, message, ["scratch", "tidy", "the", "notes"], turns=turns
     )
 
-    await _handle_context(update, context)
+    await handle_context(update, context)
     turn = turns.get(SUPERGROUP, 906)
     assert turn is not None
     await turn.task
@@ -733,7 +742,7 @@ async def test_new_without_prompt_starts_no_turn(monkeypatch) -> None:
     async def fail_stream_reply(**_: object) -> None:
         raise AssertionError("no turn should run without a prompt")
 
-    monkeypatch.setattr("balam.bot.stream_reply", fail_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fail_stream_reply)
 
     router = _router()
     bot = _FakeBot(new_thread_id=907)
@@ -741,7 +750,7 @@ async def test_new_without_prompt_starts_no_turn(monkeypatch) -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5, text="/new scratch")
     update, context = _update_context(bot, router, message, ["scratch"], turns=turns)
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "scratch")]
     assert turns.get(SUPERGROUP, 907) is None
@@ -754,7 +763,7 @@ async def test_new_with_unknown_context_reports_error() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context = _update_context(bot, router, message, ["nope"])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == []
     assert "Unknown context" in message.replies[-1]
@@ -766,7 +775,7 @@ async def test_new_from_unbound_topic_uses_default_context() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None)  # General — unbound
     update, context = _update_context(bot, router, message, [])
 
-    await _handle_new(update, context)
+    await handle_new(update, context)
 
     assert bot.created_topics == [(SUPERGROUP, "balam")]  # default_context
     assert router.current_context_name(TopicRef(SUPERGROUP, 901, "t")) == "balam"
@@ -777,7 +786,7 @@ async def test_status_reports_context_session_and_idle() -> None:
     update, context, router, _opencode, _turns = _session_cmd_env(message)
     session_id = (await router.resolve(TopicRef(SUPERGROUP, 5, "t"))).session_id
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     reply = message.replies[-1]
     assert "balam" in reply
@@ -790,7 +799,7 @@ async def test_status_reports_running_turn() -> None:
     update, context, _router, _opencode, turns = _session_cmd_env(message)
     task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     assert "running" in message.replies[-1]
     task.cancel()
@@ -802,7 +811,7 @@ async def test_status_reports_effective_model_and_effort_overrides() -> None:
     router.set_model_override(SUPERGROUP, "anthropic", "claude-sonnet-4")
     router.set_effort_override(SUPERGROUP, "medium")
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     reply = message.replies[-1]
     assert "Model: anthropic/claude-sonnet-4" in reply
@@ -813,7 +822,7 @@ async def test_model_reports_current_effective_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, *_ = _session_cmd_env(message)
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     reply = message.replies[-1]
     assert "Model: anthropic/claude-opus-4-8" in reply
@@ -824,7 +833,7 @@ async def test_model_sets_global_override_from_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)  # General
     update, context, router, *_ = _session_cmd_env(message, ["anthropic/claude-sonnet-4"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     # Applies to an unrelated topic, not just where it was typed.
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
@@ -837,7 +846,7 @@ async def test_model_set_is_refused_outside_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, router, *_ = _session_cmd_env(message, ["anthropic/claude-sonnet-4"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     assert router.model_override(SUPERGROUP) == (None, None)
     assert "General" in message.replies[-1]
@@ -848,7 +857,7 @@ async def test_model_reset_clears_global_override() -> None:
     update, context, router, *_ = _session_cmd_env(message, ["reset"])
     router.set_model_override(SUPERGROUP, "anthropic", "claude-sonnet-4")
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
     assert resolved.model == "claude-opus-4-8"
@@ -859,7 +868,7 @@ async def test_model_rejects_unqualified_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["claude-sonnet-4"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     assert router.model_override(SUPERGROUP) == (None, None)
     assert "Usage: /model" in message.replies[-1]
@@ -869,7 +878,7 @@ async def test_model_rejects_empty_model_part() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["anthropic/"])
 
-    await _handle_model(update, context)
+    await handle_model(update, context)
 
     assert router.model_override(SUPERGROUP) == (None, None)
     assert "Usage: /model" in message.replies[-1]
@@ -879,7 +888,7 @@ async def test_effort_reports_current_effective_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, *_ = _session_cmd_env(message)
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     reply = message.replies[-1]
     assert "Effort: high" in reply
@@ -890,7 +899,7 @@ async def test_effort_sets_global_override_from_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["medium"])
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
     assert resolved.effort == "medium"
@@ -900,7 +909,7 @@ async def test_effort_set_is_refused_outside_general() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, router, *_ = _session_cmd_env(message, ["medium"])
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     assert router.effort_override(SUPERGROUP) is None
     assert "General" in message.replies[-1]
@@ -911,7 +920,7 @@ async def test_effort_reset_clears_global_override() -> None:
     update, context, router, *_ = _session_cmd_env(message, ["reset"])
     router.set_effort_override(SUPERGROUP, "medium")
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     resolved = await router.resolve(TopicRef(SUPERGROUP, 5, "t"))
     assert resolved.effort == "high"
@@ -922,7 +931,7 @@ async def test_effort_rejects_unknown_value() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=None, is_forum=True)
     update, context, router, *_ = _session_cmd_env(message, ["turbo"])
 
-    await _handle_effort(update, context)
+    await handle_effort(update, context)
 
     assert router.effort_override(SUPERGROUP) is None
     assert "Unknown effort" in message.replies[-1]
@@ -933,7 +942,7 @@ async def test_cancel_with_no_running_turn() -> None:
     message = _FakeMessage(SUPERGROUP, thread_id=5)
     update, context, *_ = _session_cmd_env(message)
 
-    await _handle_cancel(update, context)
+    await handle_cancel(update, context)
 
     assert any("No running turn" in r for r in message.replies)
 
@@ -943,7 +952,7 @@ async def test_cancel_aborts_running_turn() -> None:
     update, context, _router, opencode, turns = _session_cmd_env(message)
     task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
 
-    await _handle_cancel(update, context)
+    await handle_cancel(update, context)
     await asyncio.sleep(0)  # let the fire-and-forget abort task run
 
     with contextlib.suppress(asyncio.CancelledError):
@@ -1009,7 +1018,7 @@ async def test_message_during_running_turn_is_queued_then_drains(monkeypatch) ->
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -1047,7 +1056,7 @@ async def test_queued_messages_drain_in_fifo_order(monkeypatch) -> None:
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -1079,7 +1088,7 @@ async def test_cancel_drops_queued_messages(monkeypatch) -> None:
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -1093,7 +1102,7 @@ async def test_cancel_drops_queued_messages(monkeypatch) -> None:
     assert turns.queue_len(SUPERGROUP, 5) == 1
 
     # /cancel stops the running turn AND clears anything queued behind it.
-    await _handle_cancel(update, context)
+    await handle_cancel(update, context)
     await asyncio.sleep(0)  # let the cancellation propagate
     with contextlib.suppress(asyncio.CancelledError):
         await first_task
@@ -1110,7 +1119,7 @@ async def test_status_reports_queue_depth() -> None:
     turns.enqueue(SUPERGROUP, 5, _job("queued one"))
     turns.enqueue(SUPERGROUP, 5, _job("queued two"))
 
-    await _handle_status(update, context)
+    await handle_status(update, context)
 
     assert "Queued: 2" in message.replies[-1]
     task.cancel()
@@ -1239,13 +1248,13 @@ async def test_artifacts_submits_listing_prompt(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     message = _text_msg(SUPERGROUP, 5, "/artifacts")
     update, context, turns = _message_env(message, _FakeBot())
     context.args = []
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
     while (turn := turns.get(SUPERGROUP, 5)) is not None:
         await turn.task
 
@@ -1260,13 +1269,13 @@ async def test_artifacts_passes_scope_argument(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     message = _text_msg(SUPERGROUP, 5, "/artifacts Shared")
     update, context, turns = _message_env(message, _FakeBot())
     context.args = ["Shared"]  # scopes are case-insensitive
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
     while (turn := turns.get(SUPERGROUP, 5)) is not None:
         await turn.task
 
@@ -1278,7 +1287,7 @@ async def test_artifacts_rejects_unknown_scope() -> None:
     update, context, turns = _message_env(message, _FakeBot())
     context.args = ["bogus"]
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
 
     assert turns.get(SUPERGROUP, 5) is None
     assert "Usage: /artifacts" in message.replies[-1]
@@ -1291,7 +1300,7 @@ async def test_artifacts_refused_in_general() -> None:
     update, context, turns = _message_env(message, _FakeBot())
     context.args = []
 
-    await _handle_artifacts(update, context)
+    await handle_artifacts(update, context)
 
     assert turns.get(SUPERGROUP, None) is None
     assert "inside a topic" in message.replies[-1]
@@ -1367,7 +1376,7 @@ async def test_approval_callback_owner_allow_resolves_future() -> None:
     query = _FakeQuery(f"appr:allow:{token}", OWNER, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert future.done() and future.result() is Choice.ALLOW
     assert query.message.edited  # outcome annotated, keyboard removed
@@ -1381,7 +1390,7 @@ async def test_approval_callback_owner_allow_deletes_prompt_after_edit() -> None
     query = _FakeQuery(f"appr:allow:{token}", OWNER, message)
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
@@ -1396,7 +1405,7 @@ async def test_approval_callback_all_sets_accept_all_edits() -> None:
     query = _FakeQuery(f"appr:all:{token}", OWNER, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert future.result() is Choice.ALL
     assert pending.is_accept_all_edits("ses_y") is True
@@ -1411,7 +1420,7 @@ async def test_approval_callback_deny_does_not_delete_prompt() -> None:
     query = _FakeQuery(f"appr:deny:{token}", OWNER, message)
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
@@ -1426,7 +1435,7 @@ async def test_approval_callback_ignores_stranger() -> None:
     query = _FakeQuery(f"appr:allow:{token}", 999, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert not future.done()  # a stranger's tap never resolves the approval
 
@@ -1438,7 +1447,7 @@ async def test_approval_callback_rejects_owner_in_other_chat() -> None:
     query = _FakeQuery(f"appr:allow:{token}", OWNER, _FakeCBMessage(chat_id=111))
     update, context = _callback_env(query, pending, chat_id=SUPERGROUP)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert not future.done()
 
@@ -1448,7 +1457,7 @@ async def test_approval_callback_expired_token_is_acknowledged() -> None:
     query = _FakeQuery("appr:allow:gone", OWNER, _FakeCBMessage())
     update, context = _callback_env(query, pending)
 
-    await _handle_approval_callback(update, context)
+    await handle_approval_callback(update, context)
 
     assert any("expired" in (a or "").lower() for a in query.answers)
     # The stale keyboard is still stripped (edit with the original text, no buttons).
@@ -1479,7 +1488,7 @@ async def test_question_callback_single_select_resolves_and_clears_keyboard() ->
     query = _FakeQuery(f"qst:{token}:0:1", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_callback(update, context)
+    await handle_question_callback(update, context)
 
     assert futures[0].result() == ["Tea"]
     assert "✅ *Answered:* Tea" in query.message.edited[-1]
@@ -1494,7 +1503,7 @@ async def test_question_callback_multi_select_toggles_without_resolving() -> Non
     query = _FakeQuery(f"qst:{token}:0:1", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_callback(update, context)
+    await handle_question_callback(update, context)
 
     assert not futures[0].done()
     assert query.answers == ["Selected."]
@@ -1515,8 +1524,8 @@ async def test_question_callback_multi_select_can_unselect() -> None:
     query = _FakeQuery(f"qst:{token}:0:1", OWNER, message)
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_callback(update, context)
-    await _handle_question_callback(update, context)
+    await handle_question_callback(update, context)
+    await handle_question_callback(update, context)
 
     assert not futures[0].done()
     assert query.answers == ["Selected.", "Unselected."]
@@ -1536,7 +1545,7 @@ async def test_question_done_callback_requires_selection() -> None:
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert not futures[0].done()
     assert query.answers == ["Select at least one option."]
@@ -1556,7 +1565,7 @@ async def test_question_done_callback_resolves_multi_select() -> None:
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert futures[0].result() == ["Coffee", "Water"]
     assert "✅ *Answered:* Coffee, Water" in query.message.edited[-1]
@@ -1578,7 +1587,7 @@ async def test_question_done_callback_resolves_multi_select_with_custom_answer()
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert futures[0].result() == ["Tea", "kombucha"]
 
@@ -1593,7 +1602,7 @@ async def test_question_done_callback_allows_custom_only_multi_select() -> None:
     query = _FakeQuery(f"qstd:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_done_callback(update, context)
+    await handle_question_done_callback(update, context)
 
     assert futures[0].result() == ["sparkling water"]
 
@@ -1606,7 +1615,7 @@ async def test_question_custom_callback_arms_next_topic_message() -> None:
     query = _FakeQuery(f"qstc:{token}:0", OWNER, _FakeCBMessage(thread_id=7))
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_custom_callback(update, context)
+    await handle_question_custom_callback(update, context)
 
     assert not futures[0].done()
     assert query.message.edited
@@ -1624,7 +1633,7 @@ async def test_question_custom_callback_multi_select_keeps_keyboard_visible() ->
     query = _FakeQuery(f"qstc:{token}:0", OWNER, message)
     update, context = _question_callback_env(query, pending_questions)
 
-    await _handle_question_custom_callback(update, context)
+    await handle_question_custom_callback(update, context)
 
     assert not futures[0].done()
     assert not message.edited
@@ -1782,7 +1791,7 @@ async def test_message_with_photo_forwards_file_part_and_caption(monkeypatch) ->
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     bot = _AttachmentBot(b"\xff\xd8jpeg")
     message = SimpleNamespace(
@@ -1816,7 +1825,7 @@ async def test_message_prepends_forward_and_reply_header_to_prompt(monkeypatch) 
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     bot = _FakeBot()
     message = _text_msg(SUPERGROUP, 5, "please action this")
@@ -1855,7 +1864,7 @@ async def test_slash_command_posts_forwarding_marker(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         return None
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     bot = _FakeBot()
     message = SimpleNamespace(
@@ -1949,7 +1958,7 @@ async def test_delete_confirm_purges_topics_already_gone_from_telegram() -> None
     router._store.set(SUPERGROUP, 101, "ses_live", 1)
     router._store.set(SUPERGROUP, 202, "ses_stale", 2)
 
-    await _handle_delete_confirm_callback(update, context)
+    await handle_delete_confirm_callback(update, context)
 
     # The live topic was deleted via the API; the stale one was not re-attempted
     # past its rejection — but both local rows are gone.
@@ -2015,7 +2024,7 @@ async def test_delete_page_callback_flips_page_keeping_selection() -> None:
     query = _FakeQuery(f"delp:{token}:1", OWNER, message)
     update, context, _ = _delete_callback_env(query, pending, _FakeBot())
 
-    await _handle_delete_page_callback(update, context)
+    await handle_delete_page_callback(update, context)
 
     # The picker advanced and re-rendered; the selection survived the page flip.
     assert pending.page_info(token)[0] == 1
@@ -2029,7 +2038,7 @@ async def test_delete_page_callback_on_expired_token_clears_keyboard() -> None:
     query = _FakeQuery("delp:gone:1", OWNER, message)
     update, context, _ = _delete_callback_env(query, pending, _FakeBot())
 
-    await _handle_delete_page_callback(update, context)
+    await handle_delete_page_callback(update, context)
 
     assert query.answers and query.answers[-1] == "This picker has expired."
 
@@ -2047,7 +2056,7 @@ async def test_mid_turn_message_is_folded_into_live_turn_on_streaming_backend(
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -2083,7 +2092,7 @@ async def test_mid_turn_message_falls_back_to_queue_when_turn_is_closing(monkeyp
             first_started.set()
             await gate.wait()
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     router = _router()
     message = _text_msg(SUPERGROUP, 5, "first")
@@ -2159,7 +2168,7 @@ async def test_schedule_create_saves_and_arms_a_timer() -> None:
         message, ["daily", "07:30", "chaska", "plan", "my", "day"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     (row,) = store.list_schedules(SUPERGROUP)
     assert (row.context, row.prompt, row.kind) == ("chaska", "plan my day", "daily")
@@ -2176,7 +2185,7 @@ async def test_schedule_create_keeps_line_breaks_in_the_prompt() -> None:
         message, ["daily", "07:30", "chaska", "first", "line", "second"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP)[0].prompt == "first line\nsecond"
 
@@ -2187,7 +2196,7 @@ async def test_schedule_create_stores_weekdays_in_python_numbering() -> None:
         message, ["weekdays", "09:00", "balam", "standup"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP)[0].days == "0,1,2,3,4"
 
@@ -2198,7 +2207,7 @@ async def test_schedule_create_rejects_an_unknown_context_without_saving() -> No
         message, ["daily", "07:30", "nope", "do", "a", "thing"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP) == []
     assert "Unknown context" in message.replies[-1]
@@ -2208,7 +2217,7 @@ async def test_schedule_create_rejects_a_bad_time_without_saving() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 25:00 chaska x")
     update, context, store, _bot, _turns = _schedule_env(message, ["daily", "25:00", "chaska", "x"])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP) == []
     assert "/schedule daily 07:30" in message.replies[-1]
@@ -2218,7 +2227,7 @@ async def test_schedule_create_requires_a_prompt() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 chaska")
     update, context, store, _bot, _turns = _schedule_env(message, ["daily", "07:30", "chaska"])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP) == []
     assert "prompt" in message.replies[-1]
@@ -2238,7 +2247,7 @@ async def test_schedule_list_shows_saved_schedules() -> None:
         created_at=1,
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     reply = message.replies[-1]
     assert "#1" in reply and "every day at 07:30" in reply and "chaska" in reply
@@ -2250,7 +2259,7 @@ async def test_schedule_list_is_empty_with_usage() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule")
     update, context, _store, _bot, _turns = _schedule_env(message, [])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert "No schedules yet" in message.replies[-1]
 
@@ -2274,7 +2283,7 @@ async def test_schedule_off_pauses_and_drops_the_timer() -> None:
         ZoneInfo("Asia/Singapore"),
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.get_schedule(1).enabled == 0
     assert context.application.job_queue.get_jobs_by_name("schedule:1") == ()
@@ -2296,7 +2305,7 @@ async def test_schedule_on_resumes_and_rearms_the_timer() -> None:
     )
     store.set_schedule_enabled(1, False)
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.get_schedule(1).enabled == 1
     assert len(context.application.job_queue.get_jobs_by_name("schedule:1")) == 1
@@ -2316,7 +2325,7 @@ async def test_schedule_by_id_refuses_a_schedule_from_another_chat() -> None:
         created_at=1,
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.get_schedule(1).enabled == 1
     assert "No schedule #1 here" in message.replies[-1]
@@ -2329,7 +2338,7 @@ async def test_schedule_run_fires_it_now_unattended(monkeypatch) -> None:
     async def fake_stream_reply(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("balam.bot.stream_reply", fake_stream_reply)
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
 
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule run 1")
     update, context, store, bot, turns = _schedule_env(message, ["run", "1"])
@@ -2344,7 +2353,7 @@ async def test_schedule_run_fires_it_now_unattended(monkeypatch) -> None:
         created_at=1,
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
     turn = turns.get(SUPERGROUP, 555)
     assert turn is not None
     await turn.task
@@ -2369,7 +2378,7 @@ async def test_schedule_cancel_opens_a_picker() -> None:
             created_at=1,
         )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     labels = _button_texts(message.reply_markups[-1])
     assert any("#1" in label for label in labels)
@@ -2381,7 +2390,7 @@ async def test_schedule_cancel_with_nothing_to_cancel() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule cancel")
     update, context, _store, _bot, _turns = _schedule_env(message, ["cancel"])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert message.replies[-1] == "No schedules to cancel."
 
@@ -2429,7 +2438,7 @@ async def test_schedule_confirm_deletes_the_selected_rows_and_their_timers() -> 
         ZoneInfo("Asia/Singapore"),
     )
 
-    await _handle_schedule_confirm_callback(update, context)
+    await handle_schedule_confirm_callback(update, context)
 
     assert store.get_schedule(1) is None
     assert store.get_schedule(2) is not None  # unselected, untouched
@@ -2444,7 +2453,7 @@ async def test_schedule_confirm_requires_a_selection() -> None:
     query = _FakeQuery(f"schd:{token}", OWNER, _FakeCBMessage())
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_confirm_callback(update, context)
+    await handle_schedule_confirm_callback(update, context)
 
     assert query.answers[-1] == "Select at least one schedule."
 
@@ -2467,7 +2476,7 @@ async def test_schedule_confirm_ignores_a_stranger() -> None:
     query = _FakeQuery(f"schd:{token}", OWNER + 1, _FakeCBMessage())
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_confirm_callback(update, context)
+    await handle_schedule_confirm_callback(update, context)
 
     assert store.get_schedule(1) is not None
 
@@ -2479,7 +2488,7 @@ async def test_schedule_toggle_callback_checks_a_row() -> None:
     query = _FakeQuery(f"sch:{token}:2", OWNER, _FakeCBMessage())
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_toggle_callback(update, context)
+    await handle_schedule_toggle_callback(update, context)
 
     assert picks.selected_ids(token) == [2]
     assert query.answers[-1] == "Selected."
@@ -2504,7 +2513,7 @@ async def test_schedule_dismiss_callback_cancels_nothing() -> None:
     query = _FakeQuery(f"schx:{token}", OWNER, cb_message)
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_dismiss_callback(update, context)
+    await handle_schedule_dismiss_callback(update, context)
 
     assert store.get_schedule(1) is not None
     assert "Nothing cancelled" in cb_message.edited[-1]

@@ -33,7 +33,7 @@ import httpx
 
 from balam.attachments import PromptFile
 from balam.mcp_config import parse_mcp_config
-from balam.opencode_tools import Permission
+from balam.tools import Permission
 
 logger = logging.getLogger(__name__)
 

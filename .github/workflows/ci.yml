@@ -62,6 +62,9 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      - name: Tests
+        run: bun run test
+
   api-drift:
     name: Generated API types are in sync
     runs-on: ubuntu-latest

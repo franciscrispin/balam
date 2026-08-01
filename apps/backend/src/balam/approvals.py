@@ -37,12 +37,12 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
 
-from balam.opencode_tools import Permission
+from balam.tools import Permission
 
 #: We classify a permission request by OpenCode's own **permission category** (the
 #: ``permission`` field on the ``permission.asked`` event), *not* by tool name.
 #: This is the authoritative axis: OpenCode maps every tool to one of these
-#: categories (see :class:`balam.opencode_tools.Permission`), and crucially the
+#: categories (see :class:`balam.tools.Permission`), and crucially the
 #: ``edit`` category covers *all* file mutations — the ``edit`` and ``write``
 #: tools and the multi-file ``apply_patch`` — so we can't miss a mutating tool the
 #: way a hand-maintained tool-name set does (verified live; see

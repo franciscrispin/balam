@@ -1,4 +1,4 @@
-"""Shared fixtures for the Mini App server tests.
+"""Shared fixtures for the backend test suite.
 
 Forging a valid ``initData`` (we hold the test bot token) lets us exercise the
 *real* HMAC auth path, not a mock — the same check the trust boundary runs in
@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -42,12 +43,37 @@ def make_init_data(
     return urlencode(fields)
 
 
+@pytest.fixture(autouse=True)
+def hermetic_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Isolate :class:`Config` from whatever the machine happens to export.
+
+    ``Config`` is a pydantic-settings model, so it reads real environment
+    variables *ahead of* the repo-root ``.env``. Balam itself runs under systemd
+    with its whole deployment environment set, so an agent session started by the
+    bot inherits it — without this, the suite fails 5 tests there that pass in a
+    plain shell and in CI. That asymmetry is expensive to debug, so the isolation
+    lives here rather than in individual tests.
+
+    Note that ``_env_file=None`` alone does **not** achieve this: it only
+    disables the file, and real environment variables bind at higher precedence.
+    Both halves are needed, so this fixture does both for every test.
+
+    Names come from the model itself, so a newly added setting is covered without
+    touching this list.
+    """
+    for name in [key for key in os.environ if key.lower() in Config.model_fields]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setitem(Config.model_config, "env_file", None)
+    yield
+
+
 @pytest.fixture
 def make_config() -> Callable[..., Config]:
     """Factory for a Config with the test trust boundary and sane overrides.
 
-    Explicit init kwargs take precedence over the repo-root ``.env`` so tests are
-    hermetic regardless of the developer's local environment.
+    Ambient environment and the repo-root ``.env`` are already neutralised by the
+    autouse :func:`hermetic_settings` fixture, so the only values in play are the
+    defaults below and whatever a caller overrides.
     """
 
     def _make(**overrides: object) -> Config:

@@ -5,12 +5,14 @@ from balam.agent.opencode_backend import OpenCodeBackend, _plan_path_from_questi
 from balam.approvals import Choice, PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile
 from balam.markdown import EXPANDABLE_QUOTE_MARKER
-from balam.streamer import (
-    DraftSession,
+from balam.stream_render import (
     _format_approval_request,
-    _make_transport,
     _render_todos,
     _render_tool_group,
+)
+from balam.streamer import (
+    DraftSession,
+    _make_transport,
     stream_reply,
 )
 

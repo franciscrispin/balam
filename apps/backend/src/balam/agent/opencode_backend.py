@@ -39,7 +39,7 @@ from balam.agent.events import (
     TurnFinished,
 )
 from balam.opencode import OpenCode
-from balam.opencode_tools import Permission
+from balam.tools import Permission
 
 logger = logging.getLogger(__name__)
 
