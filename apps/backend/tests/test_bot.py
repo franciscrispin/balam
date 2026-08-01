@@ -24,10 +24,6 @@ from balam.bot import (
     _handle_model,
     _handle_new,
     _handle_rename,
-    _handle_schedule,
-    _handle_schedule_confirm_callback,
-    _handle_schedule_dismiss_callback,
-    _handle_schedule_toggle_callback,
     _handle_status,
     build_application,
     register_commands,
@@ -37,6 +33,12 @@ from balam.callbacks import (
     handle_question_callback,
     handle_question_custom_callback,
     handle_question_done_callback,
+)
+from balam.commands.schedule import (
+    handle_schedule,
+    handle_schedule_confirm_callback,
+    handle_schedule_dismiss_callback,
+    handle_schedule_toggle_callback,
 )
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.message_text import (
@@ -2162,7 +2164,7 @@ async def test_schedule_create_saves_and_arms_a_timer() -> None:
         message, ["daily", "07:30", "chaska", "plan", "my", "day"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     (row,) = store.list_schedules(SUPERGROUP)
     assert (row.context, row.prompt, row.kind) == ("chaska", "plan my day", "daily")
@@ -2179,7 +2181,7 @@ async def test_schedule_create_keeps_line_breaks_in_the_prompt() -> None:
         message, ["daily", "07:30", "chaska", "first", "line", "second"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP)[0].prompt == "first line\nsecond"
 
@@ -2190,7 +2192,7 @@ async def test_schedule_create_stores_weekdays_in_python_numbering() -> None:
         message, ["weekdays", "09:00", "balam", "standup"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP)[0].days == "0,1,2,3,4"
 
@@ -2201,7 +2203,7 @@ async def test_schedule_create_rejects_an_unknown_context_without_saving() -> No
         message, ["daily", "07:30", "nope", "do", "a", "thing"]
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP) == []
     assert "Unknown context" in message.replies[-1]
@@ -2211,7 +2213,7 @@ async def test_schedule_create_rejects_a_bad_time_without_saving() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 25:00 chaska x")
     update, context, store, _bot, _turns = _schedule_env(message, ["daily", "25:00", "chaska", "x"])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP) == []
     assert "/schedule daily 07:30" in message.replies[-1]
@@ -2221,7 +2223,7 @@ async def test_schedule_create_requires_a_prompt() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 chaska")
     update, context, store, _bot, _turns = _schedule_env(message, ["daily", "07:30", "chaska"])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.list_schedules(SUPERGROUP) == []
     assert "prompt" in message.replies[-1]
@@ -2241,7 +2243,7 @@ async def test_schedule_list_shows_saved_schedules() -> None:
         created_at=1,
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     reply = message.replies[-1]
     assert "#1" in reply and "every day at 07:30" in reply and "chaska" in reply
@@ -2253,7 +2255,7 @@ async def test_schedule_list_is_empty_with_usage() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule")
     update, context, _store, _bot, _turns = _schedule_env(message, [])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert "No schedules yet" in message.replies[-1]
 
@@ -2277,7 +2279,7 @@ async def test_schedule_off_pauses_and_drops_the_timer() -> None:
         ZoneInfo("Asia/Singapore"),
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.get_schedule(1).enabled == 0
     assert context.application.job_queue.get_jobs_by_name("schedule:1") == ()
@@ -2299,7 +2301,7 @@ async def test_schedule_on_resumes_and_rearms_the_timer() -> None:
     )
     store.set_schedule_enabled(1, False)
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.get_schedule(1).enabled == 1
     assert len(context.application.job_queue.get_jobs_by_name("schedule:1")) == 1
@@ -2319,7 +2321,7 @@ async def test_schedule_by_id_refuses_a_schedule_from_another_chat() -> None:
         created_at=1,
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert store.get_schedule(1).enabled == 1
     assert "No schedule #1 here" in message.replies[-1]
@@ -2347,7 +2349,7 @@ async def test_schedule_run_fires_it_now_unattended(monkeypatch) -> None:
         created_at=1,
     )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
     turn = turns.get(SUPERGROUP, 555)
     assert turn is not None
     await turn.task
@@ -2372,7 +2374,7 @@ async def test_schedule_cancel_opens_a_picker() -> None:
             created_at=1,
         )
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     labels = _button_texts(message.reply_markups[-1])
     assert any("#1" in label for label in labels)
@@ -2384,7 +2386,7 @@ async def test_schedule_cancel_with_nothing_to_cancel() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule cancel")
     update, context, _store, _bot, _turns = _schedule_env(message, ["cancel"])
 
-    await _handle_schedule(update, context)
+    await handle_schedule(update, context)
 
     assert message.replies[-1] == "No schedules to cancel."
 
@@ -2432,7 +2434,7 @@ async def test_schedule_confirm_deletes_the_selected_rows_and_their_timers() -> 
         ZoneInfo("Asia/Singapore"),
     )
 
-    await _handle_schedule_confirm_callback(update, context)
+    await handle_schedule_confirm_callback(update, context)
 
     assert store.get_schedule(1) is None
     assert store.get_schedule(2) is not None  # unselected, untouched
@@ -2447,7 +2449,7 @@ async def test_schedule_confirm_requires_a_selection() -> None:
     query = _FakeQuery(f"schd:{token}", OWNER, _FakeCBMessage())
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_confirm_callback(update, context)
+    await handle_schedule_confirm_callback(update, context)
 
     assert query.answers[-1] == "Select at least one schedule."
 
@@ -2470,7 +2472,7 @@ async def test_schedule_confirm_ignores_a_stranger() -> None:
     query = _FakeQuery(f"schd:{token}", OWNER + 1, _FakeCBMessage())
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_confirm_callback(update, context)
+    await handle_schedule_confirm_callback(update, context)
 
     assert store.get_schedule(1) is not None
 
@@ -2482,7 +2484,7 @@ async def test_schedule_toggle_callback_checks_a_row() -> None:
     query = _FakeQuery(f"sch:{token}:2", OWNER, _FakeCBMessage())
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_toggle_callback(update, context)
+    await handle_schedule_toggle_callback(update, context)
 
     assert picks.selected_ids(token) == [2]
     assert query.answers[-1] == "Selected."
@@ -2507,7 +2509,7 @@ async def test_schedule_dismiss_callback_cancels_nothing() -> None:
     query = _FakeQuery(f"schx:{token}", OWNER, cb_message)
     update, context = _schedule_callback_env(query, picks, store)
 
-    await _handle_schedule_dismiss_callback(update, context)
+    await handle_schedule_dismiss_callback(update, context)
 
     assert store.get_schedule(1) is not None
     assert "Nothing cancelled" in cb_message.edited[-1]

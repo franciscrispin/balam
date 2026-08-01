@@ -156,3 +156,18 @@ def forward_reply_prefix(message: Any) -> str:
     if reply_line:
         lines.append(reply_line)
     return "\n".join(lines) + "\n" if lines else ""
+
+
+def command_remainder(text: str, *, args_consumed: int = 0) -> str:
+    """Everything after the leading ``/command`` and ``args_consumed`` argument
+    tokens, as the owner typed it.
+
+    ``context.args`` is a whitespace split, so a multi-line prompt would come
+    back collapsed onto one line; commands that forward a prompt to the agent
+    take it from the raw text instead.
+    """
+    rest = text.lstrip()
+    for _ in range(1 + args_consumed):
+        parts = rest.split(maxsplit=1)
+        rest = parts[1] if len(parts) > 1 else ""
+    return rest.strip()
