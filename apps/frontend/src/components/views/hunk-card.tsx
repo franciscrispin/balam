@@ -67,22 +67,27 @@ export function HunkCard({ hunk }: { hunk: DiffHunk }) {
                         line.type === "delete" && "bg-diff-removed",
                       )}
                     >
-                      <td className="w-10 px-2 text-right tabular-nums text-muted-foreground select-none">
+                      <td className="w-10 px-2 text-right align-top tabular-nums text-muted-foreground select-none">
                         {line.old_no ?? ""}
                       </td>
-                      <td className="w-10 px-2 text-right tabular-nums text-muted-foreground select-none">
+                      <td className="w-10 px-2 text-right align-top tabular-nums text-muted-foreground select-none">
                         {line.new_no ?? ""}
                       </td>
                       <td
                         className={cn(
-                          "w-5 text-center select-none",
+                          "w-5 text-center align-top select-none",
                           line.type === "add" && "text-diff-added-fg",
                           line.type === "delete" && "text-diff-removed-fg",
                         )}
                       >
                         {line.type === "add" ? "+" : line.type === "delete" ? "−" : ""}
                       </td>
-                      <td className="pr-4 whitespace-pre">
+                      {/* Wraps instead of scrolling: `w-full` makes this column absorb the
+                          width left over by the gutters, `wrap-anywhere` lets even an
+                          unbroken token (a long URL, a path) fold, and the negative
+                          text-indent against a matching padding-left hangs continuation
+                          rows 2ch in so they read as one wrapped line, not a new one. */}
+                      <td className="w-full pr-3 align-top whitespace-pre-wrap wrap-anywhere [padding-left:2ch] [text-indent:-2ch]">
                         {line.tokens.length > 0
                           ? line.tokens.map((token) => (
                               <span
