@@ -164,6 +164,25 @@ async def notify_error(bot: Any, chat_id: int, thread_id: int | None, exc: Excep
         logger.debug("failed to deliver error notice", exc_info=True)
 
 
+#: Put on a mid-turn message that was folded into the running turn. A reaction
+#: rather than a reply on purpose: the fold is worth confirming — the agent
+#: doesn't consume the follow-up until its next step boundary, which can be
+#: minutes away on a long turn — but confirming it with a message would add a
+#: bubble to the topic for every follow-up.
+FOLLOW_UP_REACTION = "👀"
+
+
+async def _ack_follow_up(message: Message) -> None:
+    """React to a mid-turn message to show it was folded into the running turn.
+
+    Best-effort: the follow-up is already in the channel by the time we get here,
+    so a chat that refuses the reaction costs the receipt, not the message."""
+    try:
+        await message.set_reaction(FOLLOW_UP_REACTION)
+    except Exception:
+        logger.debug("could not react to folded-in follow-up", exc_info=True)
+
+
 async def submit_turn(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -178,10 +197,10 @@ async def submit_turn(
     turn is already streaming.
 
     The message-bound dispatch tail: it owns everything that needs a
-    :class:`~telegram.Message` — the topic title, the follow-up acknowledgement,
-    and the queued-turn reply. Resolving the session and building the job is
-    :func:`resolve_turn_job`; :func:`start_prompt` is the same path for a caller
-    with no message (the scheduled runs of ADR-0016).
+    :class:`~telegram.Message` — the topic title, the folded-in follow-up's
+    reaction, and the queued-turn reply. Resolving the session and building the
+    job is :func:`resolve_turn_job`; :func:`start_prompt` is the same path for a
+    caller with no message (the scheduled runs of ADR-0016).
 
     ``thread_id`` is explicit because a General message has already been rehomed
     into a freshly created topic by the time it gets here; ``queued_reply`` is
@@ -223,7 +242,7 @@ async def submit_turn(
             and running.follow_ups is not None
             and running.follow_ups.offer(FollowUp(prompt=text, files=files))
         ):
-            await message.reply_text("📨 Sent — I'll pick this up in the current turn.")
+            await _ack_follow_up(message)
             return
         position = turns.enqueue(chat_id, thread_id, job)
         await message.reply_text(queued_reply.format(position=position))

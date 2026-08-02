@@ -53,7 +53,7 @@ from balam.message_text import (
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
 from balam.topics import topic_link, topic_name
-from balam.turns import TurnJob, TurnRegistry
+from balam.turns import FOLLOW_UP_REACTION, TurnJob, TurnRegistry
 
 OWNER = 424242
 SUPERGROUP = -1001234567890
@@ -333,10 +333,14 @@ class _FakeMessage:
         self.reply_to_message = None
         self.replies: list[str] = []
         self.reply_markups: list[object] = []
+        self.reactions: list[object] = []
 
     async def reply_text(self, text: str, *, reply_markup: object = None, **_: object) -> None:
         self.replies.append(text)
         self.reply_markups.append(reply_markup)
+
+    async def set_reaction(self, reaction: object = None, **_: object) -> None:
+        self.reactions.append(reaction)
 
 
 def _button_urls(message: _FakeMessage) -> list[str]:
@@ -2071,9 +2075,11 @@ async def test_mid_turn_message_is_folded_into_live_turn_on_streaming_backend(
     message.text = "second"
     await _handle_message(update, context)
 
-    # Folded into the live turn, not queued, and acknowledged as such.
+    # Folded into the live turn, not queued. The receipt is a reaction on the
+    # follow-up itself — no extra bubble in the topic.
     assert turns.queue_len(SUPERGROUP, 5) == 0
-    assert any("Sent" in r for r in message.replies)
+    assert message.reactions == [FOLLOW_UP_REACTION]
+    assert not message.replies
     folded = running.follow_ups.take()
     assert folded is not None and folded.prompt == "second"
 
