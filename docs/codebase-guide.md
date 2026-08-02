@@ -108,7 +108,17 @@ alphabetically — the groups are the shape of the system.
 - **`approvals.py`** — the local half of the hybrid model: the symlink-safe
   directory boundary (`realpath`) and the human approval keyboard. Decisions key
   on the **permission category**, not tool names, so no mutating tool is missed.
-- **`attachments.py`** — image/document downloads attached to a prompt.
+- **`attachments.py`** — downloads **every** Telegram media kind (photo,
+  document, video, audio, voice, video note, animation, sticker) as raw bytes in
+  a `data:` URL, and saves each one under `<workspace>/.balam/attachments/` so
+  the agent's own tools can open the types it cannot be *shown*. The inbox lives
+  inside the workspace on purpose — outside it, every read would hit the ADR-0012
+  approval boundary — and carries a self-matching `.gitignore`, so it never
+  appears in `git status` or `/diff`. Deciding what gets inlined for the model is
+  a per-backend question, answered in `sdk_translate`.
+  Two limits are the platform's, not ours: the Bot API refuses `getFile` above
+  **20 MB** (carried as `PromptFile.error`, not raised, so the caption survives),
+  and an album arrives as one message per item, i.e. one turn each.
 
 ### The agent seam (ADR-0014)
 
@@ -121,7 +131,16 @@ alphabetically — the groups are the shape of the system.
 - **`agent/sdk_tasks.py`** — mirrors the CLI's `TaskCreate`/`TaskUpdate` pair into
   the todo vocabulary the streamer's checklist expects.
 - **`agent/sdk_translate.py`** — the SDK↔OpenCode vocabulary boundary: tool
-  names, input keys, MCP config shape, permission eval targets.
+  names, input keys, MCP config shape, permission eval targets. Also turns
+  attachments into Anthropic content blocks. Only three shapes can be inlined —
+  a JPEG/PNG/GIF/WebP image, a PDF, or text — and nothing else is ever emitted as
+  a block, because one unsupported source fails the *whole* turn at the API's
+  schema check. Two traps this encodes: the `base64` document source accepts
+  **only** `application/pdf` (so a CSV must be decoded into a `text` document),
+  and `image/*` is wider than what the API decodes (HEIC, what an iPhone sends
+  when a photo goes as a file, would 400 the turn). Every attachment — inlined or
+  not — is then listed in a closing manifest naming its path on disk, which is
+  how the agent reaches spreadsheets, archives, audio and video.
 - **`mcp_config.py`** — per-context MCP server parsing (`${VAR}` from `.env`).
 
 ### The Mini App

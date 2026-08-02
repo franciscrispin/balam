@@ -79,6 +79,7 @@ from balam.agent.sdk_translate import (
     coerce_sdk_mcp_config,
 )
 from balam.agent_tools import AgentTool
+from balam.attachments import save_attachments
 from balam.contexts import ContextConfig
 from balam.permissions import build_ruleset, evaluate
 
@@ -385,7 +386,7 @@ class ClaudeSdkBackend:
         # channel and the CLI denies tools with "Stream closed". The DRIVER is the
         # sole producer here so the "forward next follow-up vs end the turn"
         # decision stays atomic at the boundary (see the ResultMessage handling).
-        outbound: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        outbound: asyncio.Queue[tuple[str, list[Any]] | None] = asyncio.Queue()
         # Mid-turn follow-ups from the bot (Claude Code-style). ``None`` when the
         # topic's transport can't deliver mid-turn (the bot only wires it for the
         # streaming-input backend, which is us).
@@ -602,7 +603,15 @@ class ClaudeSdkBackend:
 
         mcp_servers, allowed_tools = self._mcp_setup(turn)
 
-        def _user_message(prompt: str, files: list[Any]) -> dict[str, Any]:
+        async def _user_message(prompt: str, files: list[Any]) -> dict[str, Any]:
+            # Attachments are written into the workspace before the message is
+            # built, so the manifest can name a path that already exists. Only a
+            # few types can be shown to the model directly; for the rest the file
+            # on disk *is* the delivery mechanism, so this runs before every turn
+            # and every mid-turn follow-up. Off-thread: a 20 MB write should not
+            # stall the event loop that is streaming the reply.
+            if files:
+                files = await asyncio.to_thread(save_attachments, files, turn.directory)
             return {
                 "type": "user",
                 "session_id": "",
@@ -617,9 +626,13 @@ class ClaudeSdkBackend:
             # ``None`` sentinel to close — holding the stream open in between so the
             # bidirectional control channel (permission/question requests) stays
             # alive.
-            yield _user_message(turn.prompt, turn.files or [])
-            while (msg := await outbound.get()) is not None:
-                yield msg
+            yield await _user_message(turn.prompt, turn.files or [])
+            # The driver forwards a follow-up's *ingredients*, not a built message,
+            # so that saving its attachments — which awaits — happens here rather
+            # than inside the driver's take()/close() boundary, whose atomicity is
+            # what stops a racing follow-up from being both taken and bounced.
+            while (follow := await outbound.get()) is not None:
+                yield await _user_message(*follow)
 
         async def driver() -> None:
             nonlocal cur_msg_id, model_called
@@ -758,7 +771,7 @@ class ClaudeSdkBackend:
                         # either taken here or bounced by offer() to the next turn.
                         follow = channel.take() if channel is not None else None
                         if follow is not None:
-                            outbound.put_nowait(_user_message(follow.prompt, follow.files))
+                            outbound.put_nowait((follow.prompt, follow.files))
                             await queue.put(TurnStepFinished())
                             continue
                         # The model has answered, but background work it started is

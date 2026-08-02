@@ -288,9 +288,14 @@ def build_application(
     app.add_handler(CommandHandler("artifacts", handle_artifacts, filters=allowed))
     app.add_handler(CommandHandler("delete", handle_delete, filters=allowed))
     app.add_handler(CommandHandler("schedule", handle_schedule, filters=allowed))
+    # ``ATTACHMENT`` is every kind Telegram models as an attachment, not just the
+    # photo/document pair Balam used to accept — voice notes, video, audio, video
+    # notes, animations and stickers reach the agent through the same path now.
+    # It also admits the non-file attachments (polls, contacts, locations, dice);
+    # those download to nothing and fall out at the empty-message check below.
     app.add_handler(
         MessageHandler(
-            (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & allowed,
+            (filters.TEXT | filters.ATTACHMENT) & ~filters.COMMAND & allowed,
             _handle_message,
         )
     )

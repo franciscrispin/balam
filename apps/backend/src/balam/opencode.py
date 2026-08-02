@@ -254,6 +254,14 @@ class OpenCode:
         if text:
             parts.append({"type": "text", "text": text})
         for file in files or []:
+            if file.error:
+                # Nothing was downloaded (e.g. over the Bot API's 20 MB ceiling), so
+                # there is no url to send. Name it in the text instead of shipping an
+                # empty file part.
+                parts.append(
+                    {"type": "text", "text": f"[Attachment {file.filename}: {file.error}]"}
+                )
+                continue
             part: dict[str, Any] = {"type": "file", "mime": file.mime, "url": file.url}
             if file.filename:
                 part["filename"] = file.filename

@@ -5,6 +5,8 @@ subprocess is spawned.
 """
 
 import asyncio
+import base64
+from dataclasses import replace
 from types import SimpleNamespace
 
 from claude_agent_sdk import (
@@ -24,7 +26,12 @@ from claude_agent_sdk import (
 )
 
 from balam.agent.backend import TurnRequest
-from balam.agent.claude_sdk_backend import ClaudeSdkBackend, _category, coerce_sdk_mcp_config
+from balam.agent.claude_sdk_backend import (
+    ClaudeSdkBackend,
+    _category,
+    _content_blocks,
+    coerce_sdk_mcp_config,
+)
 from balam.agent.events import (
     BackgroundTask,
     BackgroundTasksChanged,
@@ -37,7 +44,9 @@ from balam.agent.events import (
     TurnFinished,
     TurnStepFinished,
 )
+from balam.agent.sdk_translate import _MAX_TEXT_DOCUMENT_CHARS
 from balam.agent_tools import AgentTool
+from balam.attachments import PromptFile, to_data_url
 
 SID = "ses_sdk"
 
@@ -459,6 +468,142 @@ def test_coerce_mcp_disabled_returns_none() -> None:
     # not registering the server (OpenCode passes the flag through instead).
     assert coerce_sdk_mcp_config("x", {"command": "uvx", "enabled": False}) is None
     assert coerce_sdk_mcp_config("x", {"command": "uvx", "enabled": True}) is not None
+
+
+def _attachment(data: bytes, mime: str, name: str | None = None) -> PromptFile:
+    return PromptFile(mime=mime, url=to_data_url(data, mime), filename=name)
+
+
+def test_content_blocks_plain_string_without_attachments() -> None:
+    assert _content_blocks("hello", []) == "hello"
+
+
+def test_content_blocks_image_and_pdf_travel_as_base64() -> None:
+    blocks = _content_blocks(
+        "look",
+        [
+            _attachment(b"\xff\xd8jpeg", "image/jpeg"),
+            _attachment(b"%PDF-1.7", "application/pdf", "report.pdf"),
+        ],
+    )
+
+    assert blocks[0] == {"type": "text", "text": "look"}
+    assert blocks[1]["type"] == "image"
+    assert blocks[1]["source"]["media_type"] == "image/jpeg"
+    assert blocks[2] == {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.b64encode(b"%PDF-1.7").decode(),
+        },
+        "title": "report.pdf",
+    }
+
+
+def test_content_blocks_csv_becomes_a_text_document() -> None:
+    # The API's base64 document source accepts application/pdf and nothing else,
+    # so a CSV sent that way 400s the whole turn. It must be decoded instead.
+    csv = "name,qty\nwidget,3\n"
+    blocks = _content_blocks("summarise", [_attachment(csv.encode(), "text/csv", "stock.csv")])
+
+    assert blocks[1] == {
+        "type": "document",
+        "source": {"type": "text", "media_type": "text/plain", "data": csv},
+        "title": "stock.csv",
+    }
+
+
+def test_content_blocks_sniffs_text_regardless_of_reported_mime() -> None:
+    # Telegram reports whatever the sending client guessed: the same .csv arrives
+    # as text/csv from one client and as a spreadsheet or a generic blob from others.
+    for mime in (
+        "application/vnd.ms-excel",
+        "application/octet-stream",
+        "text/tab-separated-values",
+    ):
+        blocks = _content_blocks("", [_attachment(b"a,b\n1,2\n", mime, "data.csv")])
+        assert blocks[0]["type"] == "document", mime
+        assert blocks[0]["source"] == {
+            "type": "text",
+            "media_type": "text/plain",
+            "data": "a,b\n1,2\n",
+        }
+
+
+def test_content_blocks_binary_is_reachable_by_path_not_by_block() -> None:
+    # A document block whose source is neither a PDF nor text fails the API's
+    # schema check, killing the turn before the agent sees anything. A video or
+    # an archive therefore travels as a file on disk, named in the manifest.
+    for data, mime, name in (
+        (b"PK\x03\x04\x00stuff", "application/zip", "logs.zip"),
+        (b"\x00\x00\x00\x18ftypmp4", "video/mp4", "clip.mp4"),
+        (b"OggS\x00\x02\x00", "audio/ogg", "voice.ogg"),
+    ):
+        saved = replace(_attachment(data, mime, name), path=f"/ws/.balam/attachments/b1/{name}")
+        blocks = _content_blocks("open this", [saved])
+
+        assert [b["type"] for b in blocks] == ["text", "text"], mime
+        assert f"read it from /ws/.balam/attachments/b1/{name}" in blocks[-1]["text"]
+        assert not any(b.get("source", {}).get("media_type") == mime for b in blocks)
+
+
+def test_content_blocks_never_inlines_an_image_the_api_rejects() -> None:
+    # Matching image/* would 400 the whole turn on HEIC — which is precisely what
+    # an iPhone attaches when a photo is sent as a file rather than a photo.
+    saved = replace(
+        _attachment(b"\x00\x00\x00\x18ftypheic", "image/heic", "IMG_1.HEIC"),
+        path="/ws/.balam/attachments/b1/IMG_1.HEIC",
+    )
+    blocks = _content_blocks("what is this", [saved])
+
+    assert all(b["type"] == "text" for b in blocks)
+    assert "read it from /ws/.balam/attachments/b1/IMG_1.HEIC" in blocks[-1]["text"]
+
+
+def test_content_blocks_reports_an_undownloadable_attachment() -> None:
+    # Losing the caption because a 30 MB video exceeded the Bot API's ceiling is
+    # worse than telling the agent the file was unavailable.
+    huge = PromptFile(mime="video/mp4", url="", filename="big.mp4", error="larger than the 20 MB")
+    blocks = _content_blocks("summarise this", [huge])
+
+    assert [b["type"] for b in blocks] == ["text", "text"]
+    assert "NOT AVAILABLE" in blocks[-1]["text"]
+    assert "big.mp4" in blocks[-1]["text"]
+
+
+def test_content_blocks_manifest_names_the_path_of_inlined_files_too() -> None:
+    # A CSV is inlined *and* on disk: inlined so the model can read it without a
+    # tool call, on disk so it can be processed with pandas when it is large.
+    saved = replace(_attachment(b"a,b\n1,2\n", "text/csv", "s.csv"), path="/ws/x/s.csv")
+    blocks = _content_blocks("", [saved])
+
+    assert blocks[0]["type"] == "document"
+    assert "attached above in full" in blocks[-1]["text"]
+    assert "saved at /ws/x/s.csv" in blocks[-1]["text"]
+
+
+def test_content_blocks_does_not_inline_an_empty_file() -> None:
+    saved = replace(_attachment(b"", "text/csv", "empty.csv"), path="/ws/x/empty.csv")
+    blocks = _content_blocks("look", [saved])
+
+    assert [b["type"] for b in blocks] == ["text", "text"]
+    assert "read it from /ws/x/empty.csv" in blocks[-1]["text"]
+
+
+def test_content_blocks_truncates_oversized_text() -> None:
+    huge = "x" * (_MAX_TEXT_DOCUMENT_CHARS + 500)
+    blocks = _content_blocks("", [_attachment(huge.encode(), "text/csv", "big.csv")])
+
+    data = blocks[0]["source"]["data"]
+    assert data.startswith("x" * 100)
+    assert "[Truncated: 500 of " in data
+    assert f"first {_MAX_TEXT_DOCUMENT_CHARS} of" in blocks[-1]["text"]
+
+
+def test_content_blocks_omits_empty_prompt() -> None:
+    blocks = _content_blocks("", [_attachment(b"a,b\n", "text/csv", "x.csv")])
+    assert [b["type"] for b in blocks] == ["document", "text"]
 
 
 async def test_disabled_context_mcp_server_not_registered() -> None:
