@@ -45,6 +45,7 @@ from balam.commands.session import (
 )
 from balam.commands.views import handle_artifacts
 from balam.contexts import ContextConfig, ContextsConfig
+from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
 from balam.message_text import (
     forward_reply_prefix,
     forwarded_slash_command,
@@ -2544,3 +2545,142 @@ def test_schedule_and_delete_pickers_use_distinct_callback_prefixes() -> None:
     ):
         first = next(h for h in handlers if h.pattern.match(data))
         assert first.pattern.pattern == expected, data
+
+
+# --- albums / media groups ----------------------------------------------------
+
+
+class _FakeJobQueue:
+    """Records ``run_once`` scheduling instead of waiting out the debounce."""
+
+    def __init__(self) -> None:
+        self.scheduled: list[tuple[object, float, object]] = []
+
+    def run_once(self, callback, when, *, data=None, **_: object) -> None:
+        self.scheduled.append((callback, when, data))
+
+
+def _album_msg(group_id: str, file_id: str, caption: str | None = None):
+    """One photo of an album — same shape as a lone photo, plus a media_group_id."""
+    return SimpleNamespace(
+        chat_id=SUPERGROUP,
+        message_thread_id=5,
+        media_group_id=group_id,
+        photo=[SimpleNamespace(file_id=file_id)],
+        document=None,
+        text=None,
+        caption=caption,
+        reply_to_message=None,
+    )
+
+
+async def _feed_album(messages, bot):
+    """Hand each message to the handler, then fire the flush it scheduled.
+
+    Returns ``(context, turns, jobs)`` so a test can assert on the scheduling as
+    well as the turn it eventually produced.
+    """
+    update, context, turns = _message_env(messages[0], bot)
+    jobs = _FakeJobQueue()
+    context.application.job_queue = jobs
+    for message in messages:
+        update.message = message
+        await _handle_message(update, context)
+    return context, turns, jobs
+
+
+async def _fire(context, jobs, index: int = 0) -> None:
+    callback, _when, data = jobs.scheduled[index]
+    context.job = SimpleNamespace(data=data)
+    await callback(context)
+
+
+def test_media_group_buffer_opens_once_and_keeps_arrival_order() -> None:
+    buffer = MediaGroupBuffer()
+    # Only the first message of a group opens it — that's what limits the album
+    # to one scheduled flush instead of one per photo.
+    assert buffer.add("mg1", "a") is True
+    assert buffer.add("mg1", "b") is False
+    assert buffer.add("mg2", "x") is True  # a second album buffers independently
+
+    assert buffer.take("mg1") == ["a", "b"]
+    assert buffer.take("mg1") == []  # taking twice is harmless
+    assert buffer.take("mg2") == ["x"]
+
+
+async def test_album_becomes_one_turn_carrying_every_photo(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    bot = _AttachmentBot(b"\xff\xd8jpeg")
+    messages = [
+        _album_msg("mg1", "a", caption="which of these is cheapest?"),
+        _album_msg("mg1", "b"),
+        _album_msg("mg1", "c"),
+    ]
+
+    context, turns, jobs = await _feed_album(messages, bot)
+
+    # Buffered, not run: one flush for the whole album, and no turn started yet —
+    # the point of the exercise, since photo 1 used to start one immediately.
+    assert len(jobs.scheduled) == 1
+    assert jobs.scheduled[0][1] == DEBOUNCE_SECONDS
+    assert turns.get(SUPERGROUP, 5) is None
+
+    await _fire(context, jobs)
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task
+
+    # One turn, the caption once, and every photo of the album attached to it.
+    assert captured["prompt"] == "which of these is cheapest?"
+    files = captured["files"]
+    assert len(files) == 3
+    assert {f.mime for f in files} == {"image/jpeg"}
+
+
+async def test_album_caption_is_found_wherever_the_client_put_it(monkeypatch) -> None:
+    # Telegram lets the sending client attach the caption to any message of the
+    # group, so the prompt is the first message that has text — not messages[0].
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    bot = _AttachmentBot(b"\xff\xd8jpeg")
+    messages = [_album_msg("mg1", "a"), _album_msg("mg1", "b", caption="compare these")]
+
+    context, turns, jobs = await _feed_album(messages, bot)
+    await _fire(context, jobs)
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task
+
+    assert captured["prompt"] == "compare these"
+    assert len(captured["files"]) == 2
+
+
+async def test_lone_photo_is_not_debounced(monkeypatch) -> None:
+    # A message with no media_group_id must never pay the album delay: it starts
+    # its turn in the handler, even with a JobQueue available to defer it.
+    async def fake_stream_reply(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    bot = _AttachmentBot(b"\xff\xd8jpeg")
+    message = _album_msg("mg1", "a", caption="just one")
+    message.media_group_id = None
+
+    context, turns, jobs = await _feed_album([message], bot)
+
+    assert jobs.scheduled == []
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task

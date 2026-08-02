@@ -6,7 +6,8 @@ Two things live here, and only these two:
      commands maps to its topic's session (ADR-0009), picks up any image or
      document attachments, and becomes a turn. This is the round-trip the whole
      system exists for, so it stays in the entry point rather than hiding in a
-     command module.
+     command module. An album is several messages that have to become *one*
+     turn, so it is buffered first (:mod:`balam.media_groups`).
   2. **The registrar.** :func:`build_application` builds the PTB application,
      puts the shared state every handler reads into ``bot_data``, applies the
      trust boundary (ADR-0008) as a handler filter, and wires each handler to
@@ -31,6 +32,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeDefault,
+    Message,
     Update,
 )
 from telegram.ext import (
@@ -50,7 +52,7 @@ from balam.approvals import (
     PendingPicks,
     PendingQuestions,
 )
-from balam.attachments import collect_attachments
+from balam.attachments import PromptFile, collect_attachments
 from balam.callbacks import (
     handle_approval_callback,
     handle_question_callback,
@@ -83,6 +85,7 @@ from balam.commands.session import (
 )
 from balam.commands.views import handle_artifacts, handle_browser, handle_diff
 from balam.config import Config
+from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
 from balam.message_text import (
     forward_reply_prefix,
     forwarded_slash_command,
@@ -105,10 +108,48 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if message is None:
         return
 
+    # An album arrives as one message per photo sharing a ``media_group_id``, and
+    # nothing in the Bot API says which one is last (see :mod:`balam.media_groups`).
+    # Park the group and let a timer flush it, so the agent is handed every photo
+    # in one turn instead of the first starting a turn and the rest folding into
+    # it one at a time. Without a JobQueue there is nothing to flush with, so the
+    # message takes the ordinary path.
+    group_id = getattr(message, "media_group_id", None)
+    job_queue = getattr(context.application, "job_queue", None)
+    if group_id is not None and job_queue is not None:
+        buffer: MediaGroupBuffer = context.application.bot_data.setdefault(
+            "media_groups", MediaGroupBuffer()
+        )
+        if buffer.add(group_id, message):
+            job_queue.run_once(_flush_media_group, DEBOUNCE_SECONDS, data=group_id)
+        return
+
+    await _dispatch_messages([message], context)
+
+
+async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatch a buffered album as a single turn (the JobQueue callback)."""
+    buffer: MediaGroupBuffer = context.application.bot_data["media_groups"]
+    messages = buffer.take(context.job.data)
+    if messages:
+        await _dispatch_messages(messages, context)
+
+
+async def _dispatch_messages(messages: list[Message], context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run one or more messages as a single turn.
+
+    ``messages`` is one message in the ordinary case and a whole album in the
+    buffered one. The first message anchors everything the turn is addressed by —
+    chat, topic, forward/reply gestures, the title to auto-name from — while the
+    attachments are collected across all of them.
+    """
+    message = messages[0]
     chat_id = message.chat_id
     thread_id = message.message_thread_id
     is_slash_command = forwarded_slash_command(message)
-    text = message.text or message.caption or ""
+    # An album carries its caption on exactly one of its messages (whichever the
+    # sending client chose), so the prompt is the first message that has any text.
+    text = next((m.text or m.caption or "" for m in messages if m.text or m.caption), "")
     # An unregistered slash command (e.g. ``/goal``) reaches us via the catch-all
     # handler so it can pass through to the agent as a Claude slash command. Telegram
     # may address it as ``/goal@thisbot`` in groups; strip our own @-mention from the
@@ -131,7 +172,9 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Download any image/document attachments as native file parts (tier-1 plan §4);
     # the text is the message text or an attachment's caption.
     try:
-        files = await collect_attachments(message, context.bot)
+        files: list[PromptFile] = []
+        for item in messages:
+            files.extend(await collect_attachments(item, context.bot))
     except Exception as exc:
         logger.exception("failed to download attachment")
         await notify_error(context.bot, chat_id, thread_id, exc)
@@ -266,6 +309,8 @@ def build_application(
     # Anchors fire-and-forget background tasks (e.g. /cancel's server-side abort)
     # so the loop's weak task references can't let them be GC'd mid-flight.
     app.bot_data["background_tasks"] = set()
+    # Photos of an album, held until the group is complete enough to run as one turn.
+    app.bot_data["media_groups"] = MediaGroupBuffer()
 
     # Trust boundary (ADR-0008): filters.User gates by sender id, so only the
     # owner's messages reach the handlers; everyone else is dropped silently.
