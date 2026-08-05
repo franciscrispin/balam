@@ -2,10 +2,15 @@
 
 Telegram parses GitHub-Flavored Markdown natively via ``sendRichMessage`` and
 ``InputRichMessage.markdown`` (Bot API 10.1, 2026-06-11), so the agent's output
-goes over the wire as-is instead of through the escaping pass in
-:mod:`balam.markdown`. Rich messages also carry structure MarkdownV2 has no way
-to express — tables, headings, task lists, ``<details>`` collapsibles — and lift
-the length cap from 4096 to 32768 characters.
+skips the escaping pass in :mod:`balam.markdown`. Rich messages also carry
+structure MarkdownV2 has no way to express — tables, headings, task lists,
+``<details>`` collapsibles — and lift the length cap from 4096 to 32768
+characters.
+
+Near-as-is, though, not as-is: Telegram's dialect is a *superset* of the agent's,
+so one construct still has to be escaped on the way out. See
+:func:`escape_math_delimiters` — ``$…$`` is LaTeX to Telegram and a pair of
+prices to everyone else.
 
 python-telegram-bot does not wrap these methods: upstream paused Bot API 10.1
 work on 2026-06-18 pending an internal refactor and closed the community PRs, so
@@ -21,6 +26,7 @@ than dropping the message.
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 from typing import Any
 
@@ -55,10 +61,118 @@ def chunk_rich(text: str) -> list[str]:
     return split_message(text, RICH_MAX_LENGTH)
 
 
+#: An opening or closing code fence: up to three spaces of indent, then three or
+#: more backticks/tildes. Group 2 is the rest of the line — an *info string* on an
+#: opening fence (```` ```python ````), empty on a closing one.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _find_closing_backticks(text: str, start: int, run: int) -> int:
+    """Index of the next run of *exactly* ``run`` backticks at or after ``start``,
+    or ``-1``. A longer run does not close a shorter one (CommonMark)."""
+    i, n = start, len(text)
+    while i < n:
+        if text[i] == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            if j - i == run:
+                return i
+            i = j
+        else:
+            i += 1
+    return -1
+
+
+def _escape_dollars_outside_codespans(text: str) -> str:
+    """Backslash-escape every ``$`` in ``text`` that is not inside a code span.
+
+    Walks the text so a stray backtick cannot run away: an unclosed span is
+    treated as literal backticks and its ``$`` still get escaped.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        char = text[i]
+        if char == "\\" and i + 1 < n:
+            # An existing escape (``\$``, ``\\``) is already correct — copy the
+            # pair through so it never becomes ``\\$``.
+            out.append(text[i : i + 2])
+            i += 2
+        elif char == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            close = _find_closing_backticks(text, j, j - i)
+            if close == -1:
+                out.append(text[i:j])
+                i = j
+            else:
+                out.append(text[i : close + (j - i)])
+                i = close + (j - i)
+        elif char == "$":
+            out.append("\\$")
+            i += 1
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def escape_math_delimiters(markdown: str) -> str:
+    """Escape ``$`` so Telegram does not read agent prose as LaTeX.
+
+    Telegram's rich-message parser implements the GFM **math extension**: a
+    ``$…$`` pair becomes a ``mathematical_expression``, rendered in serif italics
+    with whitespace collapsed, ``-`` turned into ``−``, and any markdown inside it
+    left as literal text. Two prices in one paragraph are enough to trigger it —
+    ``S$3 back per in-store bill of **S$10+**`` renders as
+    ``S`` + math(``3 back per in-store bill of **S``) + ``10+**``.
+
+    Escaping is deliberately unconditional rather than only for ``$`` that would
+    pair up: a lone ``\\$`` renders as a plain ``$``, so there is no cost, and the
+    pairing rules are Telegram's to change. The trade is that genuine LaTeX from
+    the agent stops rendering as math — the right call for a bot whose replies
+    quote far more prices than integrals.
+
+    Code is skipped, and that exclusion is load-bearing in both directions:
+    ``$`` inside a code span or fenced block is already immune to the math
+    extension, and a backslash there is **kept literally** — escaping ``echo
+    $PATH`` would show the user ``echo \\$PATH``.
+    """
+    segments: list[tuple[bool, list[str]]] = []  # (is_fenced_code, lines)
+    fence: str | None = None
+
+    for line in markdown.split("\n"):
+        match = _FENCE_RE.match(line)
+        if fence is None:
+            if match:
+                fence = match.group(1)
+                segments.append((True, [line]))
+            elif segments and not segments[-1][0]:
+                segments[-1][1].append(line)
+            else:
+                segments.append((False, [line]))
+            continue
+        segments[-1][1].append(line)
+        # A closing fence is the same character, at least as long, and alone on
+        # its line — otherwise ```` ```python ```` would close ```` ``` ````.
+        if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+            if not match.group(2).strip():
+                fence = None
+
+    return "\n".join(
+        "\n".join(lines) if is_code else _escape_dollars_outside_codespans("\n".join(lines))
+        for is_code, lines in segments
+    )
+
+
 def _rich_payload(markdown: str) -> dict[str, Any]:
     # skip_entity_detection stops Telegram from auto-linkifying bare URLs, @names
     # and #tags inside agent output (code identifiers turn into stray links).
-    return {"markdown": markdown, "skip_entity_detection": True}
+    # Every rich send/edit/draft funnels through here, so escaping the math
+    # delimiters here is what makes it impossible for one path to miss it.
+    return {"markdown": escape_math_delimiters(markdown), "skip_entity_detection": True}
 
 
 async def send_rich_message(
