@@ -1757,11 +1757,11 @@ class _AttachmentBot:
     def __init__(self, data: bytes) -> None:
         self._data = data
 
-    async def get_file(self, file_id: str):
+    async def get_file(self, file_id: str, **timeouts):
         data = self._data
 
         class _F:
-            async def download_as_bytearray(self) -> bytearray:
+            async def download_as_bytearray(self, **timeouts) -> bytearray:
                 return bytearray(data)
 
         return _F()

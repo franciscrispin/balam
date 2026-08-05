@@ -27,6 +27,7 @@ agent spending a tool call on a file it was just handed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import logging
@@ -39,6 +40,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from telegram.error import BadRequest, NetworkError
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,19 @@ _MAX_NAME_LEN = 96
 #: Telegram media that carry no MIME type of their own, and what to assume.
 #: Photos are always JPEG; video notes are always MP4.
 _ASSUMED_MIME = {"photo": "image/jpeg", "video_note": "video/mp4"}
+
+#: Timeouts for fetching an attachment, in seconds. python-telegram-bot defaults
+#: every request to a 5-second read timeout, which is sized for JSON API calls,
+#: not for pulling bytes off Telegram's file CDN — at 20 MB (the Bot API ceiling)
+#: 5 seconds needs a sustained 4 MB/s just to break even, so large files failed
+#: essentially always and small ones failed whenever the CDN hiccuped.
+_DOWNLOAD_READ_TIMEOUT = 120.0
+_DOWNLOAD_CONNECT_TIMEOUT = 20.0
+
+#: How many times to fetch before giving up, and the delay before each retry
+#: (doubling). Only transport failures are retried — see :func:`_fetch_bytes`.
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_BACKOFF = 1.0
 
 _EXTENSION_BY_MIME = {
     "image/jpeg": ".jpg",
@@ -178,13 +194,51 @@ async def collect_attachments(message: Any, bot: Any) -> list[PromptFile]:
     name = filename or _default_name(kind, mime)
 
     try:
-        handle = await bot.get_file(file_id)
-        data = bytes(await handle.download_as_bytearray())
+        data = await _fetch_bytes(bot, file_id, kind=kind, name=name)
     except Exception as exc:
         logger.warning("could not download %s attachment %r: %s", kind, name, exc)
         return [PromptFile(mime=mime, url="", filename=name, error=_download_error(exc))]
 
     return [PromptFile(mime=mime, url=to_data_url(data, mime), filename=name)]
+
+
+async def _fetch_bytes(bot: Any, file_id: str, *, kind: str, name: str) -> bytes:
+    """Fetch one file, retrying transport failures.
+
+    A timeout or a dropped connection says nothing about the file — retrying it
+    is free and usually works, and losing the user's screenshot to a one-second
+    CDN stall is a bad trade. A :class:`~telegram.error.BadRequest` does say
+    something ("file is too big", an expired ``file_id``), so it is re-raised on
+    the first attempt: no amount of retrying makes a 30 MB video fetchable.
+
+    ``BadRequest`` subclasses ``NetworkError`` in python-telegram-bot, so it must
+    be caught **first** — the order of these two handlers is the whole point.
+    """
+    timeouts: dict[str, float] = {
+        "read_timeout": _DOWNLOAD_READ_TIMEOUT,
+        "connect_timeout": _DOWNLOAD_CONNECT_TIMEOUT,
+    }
+    delay = _DOWNLOAD_BACKOFF
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        try:
+            handle = await bot.get_file(file_id, **timeouts)
+            return bytes(await handle.download_as_bytearray(**timeouts))
+        except BadRequest:
+            raise
+        except NetworkError as exc:
+            if attempt == _DOWNLOAD_ATTEMPTS:
+                raise
+            logger.info(
+                "retrying %s attachment %r after %s (attempt %d/%d)",
+                kind,
+                name,
+                exc,
+                attempt,
+                _DOWNLOAD_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _download_error(exc: Exception) -> str:

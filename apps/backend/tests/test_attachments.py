@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from telegram.error import BadRequest, TimedOut
 
 from balam.attachments import (
     INBOX_DIRNAME,
@@ -18,21 +19,33 @@ class _FakeFile:
     def __init__(self, data: bytes) -> None:
         self._data = data
 
-    async def download_as_bytearray(self) -> bytearray:
+    async def download_as_bytearray(self, **timeouts) -> bytearray:
         return bytearray(self._data)
 
 
 class _FakeBot:
-    """Returns a fixed payload for every get_file; records requested file ids."""
+    """Returns a fixed payload for every get_file; records requested file ids.
+
+    ``error`` may be a single exception (raised on every attempt) or a list of
+    per-attempt outcomes, so a test can make the first fetch fail and the second
+    succeed.
+    """
 
     def __init__(self, data: bytes = b"payload", error: Exception | None = None) -> None:
         self._data = data
-        self._error = error
+        self._errors = list(error) if isinstance(error, list) else None
+        self._error = None if isinstance(error, list) else error
         self.requested: list[str] = []
+        self.timeouts: list[dict] = []
 
-    async def get_file(self, file_id: str) -> _FakeFile:
+    async def get_file(self, file_id: str, **timeouts) -> _FakeFile:
         self.requested.append(file_id)
-        if self._error is not None:
+        self.timeouts.append(timeouts)
+        if self._errors is not None:
+            outcome = self._errors.pop(0) if self._errors else None
+            if outcome is not None:
+                raise outcome
+        elif self._error is not None:
             raise self._error
         return _FakeFile(self._data)
 
@@ -166,6 +179,60 @@ async def test_collect_attachments_reports_a_failed_download() -> None:
     assert len(files) == 1
     assert files[0].url == ""
     assert "20 MB" in files[0].error
+
+
+async def test_collect_attachments_retries_a_transient_timeout(monkeypatch) -> None:
+    # The failure that lost a screenshot in practice: getFile timed out once and
+    # the attachment was reported unavailable instead of being fetched again.
+    monkeypatch.setattr("balam.attachments._DOWNLOAD_BACKOFF", 0.0)
+    bot = _FakeBot(b"\xff\xd8jpeg", error=[TimedOut(), None])
+    message = _message(photo=[SimpleNamespace(file_id="p")])
+
+    files = await collect_attachments(message, bot)
+
+    assert len(bot.requested) == 2  # failed, then succeeded
+    assert files[0].error is None
+    assert files[0].data == b"\xff\xd8jpeg"
+
+
+async def test_collect_attachments_gives_up_after_the_attempt_limit(monkeypatch) -> None:
+    monkeypatch.setattr("balam.attachments._DOWNLOAD_BACKOFF", 0.0)
+    bot = _FakeBot(error=[TimedOut(), TimedOut(), TimedOut()])
+    message = _message(photo=[SimpleNamespace(file_id="p")])
+
+    files = await collect_attachments(message, bot)
+
+    assert len(bot.requested) == 3
+    assert files[0].url == ""
+    assert "Timed out" in files[0].error
+
+
+async def test_collect_attachments_does_not_retry_a_bad_request(monkeypatch) -> None:
+    # BadRequest subclasses NetworkError in PTB, so the "too big" case would be
+    # retried three times over a doubling backoff if the handlers were ordered
+    # the other way round. It can never succeed, so it must fail fast.
+    monkeypatch.setattr("balam.attachments._DOWNLOAD_BACKOFF", 0.0)
+    bot = _FakeBot(error=BadRequest("File is too big"))
+    message = _message(
+        video=SimpleNamespace(file_id="v", mime_type="video/mp4", file_name="movie.mp4")
+    )
+
+    files = await collect_attachments(message, bot)
+
+    assert len(bot.requested) == 1
+    assert "20 MB" in files[0].error
+
+
+async def test_collect_attachments_overrides_the_five_second_default_timeout() -> None:
+    # PTB defaults every request to a 5s read timeout, which is sized for JSON
+    # calls; a 20 MB file needs 4 MB/s sustained just to make that.
+    bot = _FakeBot(b"data")
+    message = _message(photo=[SimpleNamespace(file_id="p")])
+
+    await collect_attachments(message, bot)
+
+    assert bot.timeouts[0]["read_timeout"] >= 60.0
+    assert bot.timeouts[0]["connect_timeout"] > 5.0
 
 
 async def test_collect_attachments_ignores_non_file_attachments() -> None:
