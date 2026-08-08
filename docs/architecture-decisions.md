@@ -408,7 +408,7 @@ Stream agent output with `sendMessageDraft`, falling back to throttled
   the disambiguated `/cmd@<bot>` form), so an unregistered `/context` is never
   surfaced. Balam publishes its commands on startup (`post_init`) for the default,
   all-group-chats, and the specific group scopes; PTB's `CommandHandler` matches
-  both `/context` and `/context@heybalambot`.
+  both `/context` and the `/context@<bot>` form.
 - Re-evaluate if the project ever goes multi-user or if Discord ships a
   first-party streaming primitive and iframe-capable embeds.
 

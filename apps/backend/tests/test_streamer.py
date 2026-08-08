@@ -644,7 +644,7 @@ async def test_stream_reply_in_group_chat_never_attempts_a_native_draft() -> Non
             )
         ),
         session_id=SID,
-        chat_id=-1003953430909,
+        chat_id=-1001234567890,
         thread_id=99,
         prompt="hello",
         draft_interval=0.01,
@@ -870,7 +870,7 @@ async def test_stream_reply_answer_ends_the_turn_after_progress_overflow() -> No
             )
         ),
         session_id=SID,
-        chat_id=-1003953430909,  # supergroup → live-edit streaming
+        chat_id=-1001234567890,  # supergroup → live-edit streaming
         thread_id=99,
         prompt="hello",
         draft_interval=0.01,
@@ -908,7 +908,7 @@ async def test_stream_reply_answer_bubble_is_reused_when_nothing_landed_below() 
             )
         ),
         session_id=SID,
-        chat_id=-1003953430909,
+        chat_id=-1001234567890,
         thread_id=99,
         prompt="hello",
         draft_interval=0.01,
@@ -1054,7 +1054,7 @@ async def test_stream_reply_todowrite_posts_then_edits_checklist_in_place() -> N
             )
         ),
         session_id=SID,
-        chat_id=-1003953430909,
+        chat_id=-1001234567890,
         thread_id=99,
         prompt="hello",
         draft_interval=0.01,
@@ -1307,7 +1307,7 @@ async def test_stream_reply_streams_live_group_summary_before_sealing() -> None:
             )
         ),
         session_id=SID,
-        chat_id=-1003953430909,  # supergroup → live-edit streaming
+        chat_id=-1001234567890,  # supergroup → live-edit streaming
         thread_id=99,
         prompt="hello",
         directory="/w",
@@ -1849,7 +1849,7 @@ async def test_stream_reply_answer_streamed_before_a_question_re_anchors_below_i
             bot=bot,
             backend=OpenCodeBackend(oc),
             session_id=SID,
-            chat_id=-1003953430909,  # supergroup → live-edit streaming
+            chat_id=-1001234567890,  # supergroup → live-edit streaming
             thread_id=99,
             prompt="x",
             directory="/work/proj",

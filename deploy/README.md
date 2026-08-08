@@ -30,9 +30,10 @@ the BotFather Web App URL is fixed).
 1. **Named tunnel + DNS** (stable hostname):
    ```sh
    cloudflared tunnel create balam
-   cloudflared tunnel route dns balam <your-host>      # e.g. francis-balam.glintsintern.com
+   cloudflared tunnel route dns balam <your-host>      # e.g. balam.example.com
    ```
-   Put the tunnel id + hostname in `cloudflared-balam.yml` (ingress → `127.0.0.1:3000`).
+   Copy `cloudflared-balam.example.yml` to `cloudflared-balam.yml` (git-ignored) and
+   fill in the tunnel id + hostname (ingress → `127.0.0.1:3000`).
 2. **BotFather Mini App** (`/newapp` on your bot): Web App URL = `https://<your-host>/`,
    pick a short name (e.g. `diff`).
 3. **`deploy/balam.env`** (git-ignored — public-mode overlay):

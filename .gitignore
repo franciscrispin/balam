@@ -47,5 +47,8 @@ __pycache__/
 # Generated public-mode overlay (holds the current tunnel URL; ADR-0013 deploy)
 deploy/balam.env
 
+# Personal tunnel ingress (tunnel id + hostname; cloudflared-balam.example.yml is tracked)
+deploy/cloudflared-balam.yml
+
 # Google Calendar OAuth client + token files
 .secrets/

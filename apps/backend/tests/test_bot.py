@@ -150,11 +150,11 @@ def test_forward_reply_prefix_from_channel_uses_title_and_signature() -> None:
         sender_user=None,
         sender_user_name=None,
         sender_chat=None,
-        chat=SimpleNamespace(title="Glints News", username="glintsnews"),
+        chat=SimpleNamespace(title="Daily News", username="dailynews"),
         author_signature="Editor",
     )
     assert forward_reply_prefix(_plain_msg(forward_origin=origin)) == (
-        "[Forwarded from Glints News (Editor)]\n"
+        "[Forwarded from Daily News (Editor)]\n"
     )
 
 
@@ -1166,7 +1166,7 @@ def _text_update(chat_id: int, user_id: int, text: str = "hello") -> Update:
         entities=entities,
     )
     # CommandHandler resolves /cmd@<bot> against the bot's username.
-    message.set_bot(SimpleNamespace(username="heybalambot"))
+    message.set_bot(SimpleNamespace(username="balambot"))
     return Update(update_id=1, message=message)
 
 

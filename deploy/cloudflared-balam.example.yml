@@ -1,0 +1,15 @@
+# Cloudflare named-tunnel ingress for the Balam Mini App (ADR-0013).
+# Copy to deploy/cloudflared-balam.yml (git-ignored — it holds your tunnel id and
+# hostname) and fill in the placeholders; install.sh copies it to
+# /etc/cloudflared/balam.yml. The tunnel id is not secret; the credentials JSON
+# it points at IS — keep it out of git (it lives in ~/.cloudflared).
+#
+# Exposes ONLY the FastAPI server on 127.0.0.1:3000. OpenCode (:4096) and VNC are
+# never tunneled. Stable hostname → BotFather Web App URL never churns.
+tunnel: <tunnel-id>
+credentials-file: /home/ubuntu/.cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: <your-host> # e.g. balam.example.com
+    service: http://127.0.0.1:3000
+  - service: http_status:404

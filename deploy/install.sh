@@ -7,8 +7,9 @@
 # Prerequisites (one-time, not done here — they create public/account state):
 #   - A named tunnel + DNS hostname:
 #       cloudflared tunnel create balam
-#       cloudflared tunnel route dns balam <your-host>     # e.g. francis-balam.glintsintern.com
-#     then set that hostname in deploy/cloudflared-balam.yml (ingress) and tunnel id.
+#       cloudflared tunnel route dns balam <your-host>     # e.g. balam.example.com
+#     then copy deploy/cloudflared-balam.example.yml to deploy/cloudflared-balam.yml
+#     (git-ignored) and fill in the tunnel id + hostname.
 #   - A BotFather Mini App (/newapp) whose Web App URL is https://<your-host>/.
 #   - deploy/balam.env (git-ignored) with the public-mode overlay:
 #       BALAM_PUBLIC_URL=https://<your-host>
@@ -21,6 +22,11 @@ UNITS=(balam-opencode.service balam.service cloudflared-balam.service)
 
 if [ ! -f "$DEPLOY/balam.env" ]; then
   echo "ERROR: $DEPLOY/balam.env is missing — create it (see the header of this script)." >&2
+  exit 1
+fi
+
+if [ ! -f "$DEPLOY/cloudflared-balam.yml" ]; then
+  echo "ERROR: $DEPLOY/cloudflared-balam.yml is missing — copy cloudflared-balam.example.yml and fill it in." >&2
   exit 1
 fi
 
