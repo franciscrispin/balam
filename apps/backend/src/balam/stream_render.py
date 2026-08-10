@@ -23,7 +23,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from balam.agent.events import BackgroundTask
 from balam.approvals import Choice, is_edit
-from balam.markdown import EXPANDABLE_QUOTE_MARKER
 from balam.tools import DISPLAY_BY_WIRE, Tool
 
 logger = logging.getLogger(__name__)
@@ -198,29 +197,19 @@ def _render_tool_part(
     return line
 
 
-#: A todowrite item's ``status`` → its checklist icon in the live progress
-#: view (ported from iu's todo checklist).
-_TODO_ICONS: dict[str, str] = {
-    "completed": "✅",
-    "in_progress": "🔄",
-    "pending": "⬜",
-    "cancelled": "❌",
-}
-
-
-def _render_todos(todos: list[Any], *, rich: bool = False) -> str:
+def _render_todos(todos: list[Any]) -> str:
     """Render a todowrite ``todos`` list as the GFM checklist for the live
     progress message. Both backends put the list in the tool input with
     ``content`` per item (``text`` kept as a defensive fallback); items without
-    text are skipped, an unknown status gets the pending icon, and a cancelled
+    text are skipped, an unknown status gets an unchecked box, and a cancelled
     item is struck through. Returns ``""`` when nothing is renderable.
 
-    ``rich`` emits a **native task list** under a heading — Telegram draws real
+    Emits a **native task list** under a heading — Telegram draws real
     checkboxes (Bot API 10.1), so only the states a checkbox can't express keep
     an icon: in-progress stays 🔄 and cancelled stays struck through, both
     unchecked since neither is done.
     """
-    lines = ["### 📋 Progress", ""] if rich else ["📋 **Progress**"]
+    lines = ["### 📋 Progress", ""]
     for todo in todos:
         if not isinstance(todo, dict):
             continue
@@ -230,13 +219,10 @@ def _render_todos(todos: list[Any], *, rich: bool = False) -> str:
         status = str(todo.get("status") or "")
         if status == "cancelled":
             label = f"~~{label}~~"
-        if rich:
-            box = "- [x] " if status == "completed" else "- [ ] "
-            lines.append(f"{box}🔄 {label}" if status == "in_progress" else f"{box}{label}")
-        else:
-            lines.append(f"{_TODO_ICONS.get(status, '⬜')} {label}")
-    # In rich mode the header costs two entries (heading + blank line).
-    return "\n".join(lines) if len(lines) > (2 if rich else 1) else ""
+        box = "- [x] " if status == "completed" else "- [ ] "
+        lines.append(f"{box}🔄 {label}" if status == "in_progress" else f"{box}{label}")
+    # The header costs two entries (heading + blank line).
+    return "\n".join(lines) if len(lines) > 2 else ""
 
 
 def _render_background_notice(tasks: Sequence[BackgroundTask]) -> str:
@@ -345,22 +331,16 @@ def _group_detail_line(tool: str, tool_input: dict[str, Any], directory: str | N
 
 
 def _render_tool_group(
-    entries: list[GroupEntry], *, active: bool, directory: str | None, rich: bool = False
+    entries: list[GroupEntry], *, active: bool, directory: str | None
 ) -> tuple[str, str]:
     """Render a group of consecutive tool calls; returns ``(kind, text)``.
 
     An *active* group (still absorbing calls) is a plain summary line that ticks
-    up in place — Telegram re-collapses an expandable quote on every edit, so
-    the quote form only appears once the group closes. A closed group renders
-    its finished calls: one call keeps the legacy single-line form (Bash with
-    its fenced command); several fold into the summary line plus one compact
-    line per call inside a tap-to-expand blockquote.
-
-    ``rich`` swaps that blockquote for a native ``<details>`` block (Bot API
-    10.1), which is what the quote was imitating. This is not cosmetic: rich
-    mode sends raw GFM, so :data:`~balam.markdown.EXPANDABLE_QUOTE_MARKER` —
-    which only :mod:`balam.markdown` knows how to translate — would otherwise
-    reach the user as the literal text ``[!expandable]``.
+    up in place — Telegram re-collapses a ``<details>`` block on every edit, so
+    the collapsed form only appears once the group closes. A closed group
+    renders its finished calls: one call keeps the legacy single-line form
+    (Bash with its fenced command); several fold into the summary line plus one
+    compact line per call inside a native ``<details>`` block (Bot API 10.1).
     """
     if active:
         running = any(status not in ("completed", "error") for _t, _i, status, _o, _e in entries)
@@ -374,14 +354,11 @@ def _render_tool_group(
         return ("tool", _render_tool_part(tool, tool_input, status, output, error, directory))
     summary = f"🔧 {_group_phrase(finished, running=False)}"
     details = [_group_detail_line(t, i, directory) for t, i, _s, _o, _e in finished]
-    if rich:
-        # Each call needs a list marker: consecutive plain lines inside <details>
-        # collapse into one run-on paragraph. Codespans keep shell metacharacters
-        # (`<`, `>`, `&`) out of the HTML parser — verified against the live API.
-        body = "\n".join(f"- {line}" for line in details)
-        return ("toolgroup", f"<details><summary>{summary}</summary>\n\n{body}\n\n</details>")
-    lines = [EXPANDABLE_QUOTE_MARKER, summary, *details]
-    return ("toolgroup", "\n".join("> " + line for line in lines))
+    # Each call needs a list marker: consecutive plain lines inside <details>
+    # collapse into one run-on paragraph. Codespans keep shell metacharacters
+    # (`<`, `>`, `&`) out of the HTML parser — verified against the live API.
+    body = "\n".join(f"- {line}" for line in details)
+    return ("toolgroup", f"<details><summary>{summary}</summary>\n\n{body}\n\n</details>")
 
 
 def _format_approval_request(

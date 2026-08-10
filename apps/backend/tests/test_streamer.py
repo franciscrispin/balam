@@ -345,26 +345,16 @@ class _RecordBot:
         self.calls.append(("edit", message_id, text, kwargs.get("parse_mode")))
 
 
-async def test_transport_send_returns_id_and_edit_wires_through() -> None:
-    bot = _RecordBot()
-    transport = _make_transport(bot, chat_id=1, thread_id=7)
-
-    mid = await transport.send_message("hello")
-    assert mid == 501  # the live-edit fallback needs the real message id back
-
-    await transport.edit_message(mid, "hello world")
-    assert ("edit", 501, "hello world", "MarkdownV2") in bot.calls
-
-
-async def test_transport_edit_falls_back_to_plain_text_on_markdown_error() -> None:
-    bot = _RecordBot(fail_markdown=True)
+async def test_transport_falls_back_to_plain_text_on_markdown_error() -> None:
+    # The last-resort path: rich rejected AND the escaped fallback fails too.
+    bot = _RecordBot(fail_rich=True, fail_markdown=True)
     transport = _make_transport(bot, chat_id=1, thread_id=None)
 
-    # send: MarkdownV2 raises → retried as plain text (parse_mode None).
+    # send: rich rejected → MarkdownV2 raises → retried as plain text.
     await transport.send_message("x")
     assert any(c[0] == "send" and c[2] is None for c in bot.calls)
 
-    # edit: MarkdownV2 raises → retried as plain text rather than dropping.
+    # edit: rich rejected → MarkdownV2 raises → retried as plain text.
     await transport.edit_message(777, "y")
     assert any(c[0] == "edit" and c[1] == 777 and c[3] is None for c in bot.calls)
 
@@ -377,7 +367,7 @@ RICH_GFM = "# Report\n\n| Metric | Value |\n|:---|---:|\n| Speed | 42 |\n\n- [x]
 
 async def test_transport_rich_send_passes_gfm_through_unescaped() -> None:
     bot = _RecordBot()
-    transport = _make_transport(bot, chat_id=-100123, thread_id=7, rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=7)
 
     mid = await transport.send_message(RICH_GFM)
 
@@ -392,7 +382,7 @@ async def test_transport_rich_send_passes_gfm_through_unescaped() -> None:
 
 async def test_transport_rich_edit_uses_rich_message_field() -> None:
     bot = _RecordBot()
-    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None)
 
     await transport.edit_message(777, RICH_GFM)
 
@@ -405,7 +395,7 @@ async def test_transport_rich_edit_uses_rich_message_field() -> None:
 
 async def test_transport_rich_draft_uses_rich_draft_endpoint() -> None:
     bot = _RecordBot()
-    transport = _make_transport(bot, chat_id=42, thread_id=3, rich=True)
+    transport = _make_transport(bot, chat_id=42, thread_id=3)
 
     await transport.send_draft(9, RICH_GFM)
 
@@ -417,7 +407,7 @@ async def test_transport_rich_draft_uses_rich_draft_endpoint() -> None:
 
 async def test_rich_send_falls_back_to_markdown_v2_when_rejected() -> None:
     bot = _RecordBot(fail_rich=True)
-    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None)
 
     mid = await transport.send_message(RICH_GFM)
 
@@ -430,7 +420,7 @@ async def test_rich_send_falls_back_to_markdown_v2_when_rejected() -> None:
 
 async def test_rich_edit_falls_back_to_markdown_v2_when_rejected() -> None:
     bot = _RecordBot(fail_rich=True)
-    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None)
 
     await transport.edit_message(777, RICH_GFM)
 
@@ -440,7 +430,7 @@ async def test_rich_edit_falls_back_to_markdown_v2_when_rejected() -> None:
 
 async def test_rich_rejection_does_not_disable_rich_for_later_messages() -> None:
     bot = _RecordBot(fail_rich=True)
-    transport = _make_transport(bot, chat_id=-100123, thread_id=None, rich=True)
+    transport = _make_transport(bot, chat_id=-100123, thread_id=None)
 
     await transport.send_message(RICH_GFM)  # rejected → MarkdownV2 fallback
     bot.fail_rich = False
@@ -457,8 +447,8 @@ GROUP = [
 ]
 
 
-def test_tool_group_rich_uses_native_details_block() -> None:
-    kind, text = _render_tool_group(GROUP, active=False, directory="/w", rich=True)
+def test_tool_group_uses_native_details_block() -> None:
+    kind, text = _render_tool_group(GROUP, active=False, directory="/w")
 
     assert kind == "toolgroup"
     assert text.startswith("<details><summary>🔧 ")
@@ -470,22 +460,11 @@ def test_tool_group_rich_uses_native_details_block() -> None:
     assert len([ln for ln in text.splitlines() if ln.startswith("- ")]) == 3
 
 
-def test_tool_group_without_rich_keeps_the_expandable_quote() -> None:
-    kind, text = _render_tool_group(GROUP, active=False, directory="/w", rich=False)
-
-    assert kind == "toolgroup"
-    assert text.splitlines()[0] == f"> {EXPANDABLE_QUOTE_MARKER}"
-    assert all(line.startswith("> ") for line in text.splitlines())
-    assert "<details>" not in text
-
-
-def test_tool_group_active_summary_is_the_same_in_both_modes() -> None:
-    # An open group ticks up in place, so it stays a plain line either way —
-    # a <details> block would re-collapse on every edit, like the quote does.
-    plain = _render_tool_group(GROUP, active=True, directory="/w", rich=False)
-    rich = _render_tool_group(GROUP, active=True, directory="/w", rich=True)
-    assert plain == rich
-    assert plain[0] == "tool" and "<details>" not in plain[1]
+def test_tool_group_active_summary_stays_a_plain_line() -> None:
+    # An open group ticks up in place, so it stays a plain line — a <details>
+    # block would re-collapse on every edit.
+    kind, text = _render_tool_group(GROUP, active=True, directory="/w")
+    assert kind == "tool" and "<details>" not in text
 
 
 def test_chunk_rich_keeps_one_message_well_past_the_4096_cap() -> None:
@@ -566,15 +545,27 @@ def _tool_part(
 
 
 class FakeBot:
+    """Accepts both the plain PTB surface (keyboard prompts, MarkdownV2
+    fallback) and the Bot API 10.1 rich endpoints every reply now takes;
+    ``messages`` records the raw GFM (or fallback text) in send order."""
+
     def __init__(self) -> None:
         self.messages: list[str] = []
         self.keyboards: list[object] = []
+        self._mid = 100
 
     async def send_chat_action(self, **kwargs: object) -> None:
         pass
 
-    async def send_message_draft(self, **kwargs: object) -> None:
-        pass
+    async def do_api_request(self, endpoint: str, api_kwargs: dict | None = None):
+        kwargs = api_kwargs or {}
+        if endpoint == "sendRichMessage":
+            self.messages.append(kwargs["rich_message"]["markdown"])
+            if kwargs.get("reply_markup") is not None:
+                self.keyboards.append(kwargs["reply_markup"])
+            self._mid += 1
+            return {"message_id": self._mid}
+        return {}  # rich drafts/edits stay invisible, like send_message_draft was
 
     async def send_message(
         self, *, text: str, reply_markup: object = None, **kwargs: object
@@ -628,8 +619,10 @@ async def test_stream_reply_in_group_chat_never_attempts_a_native_draft() -> Non
             super().__init__()
             self.draft_calls = 0
 
-        async def send_message_draft(self, **kwargs: object) -> None:
-            self.draft_calls += 1
+        async def do_api_request(self, endpoint: str, api_kwargs: dict | None = None):
+            if endpoint == "sendRichMessageDraft":
+                self.draft_calls += 1
+            return await super().do_api_request(endpoint, api_kwargs)
 
     bot = DraftRecordingBot()
     await stream_reply(
@@ -715,7 +708,7 @@ async def test_stream_reply_sends_reasoning_separately_from_answer() -> None:
             _ev("session.idle", sessionID=SID),
         ]
     )
-    assert bot.messages == [r"I should be sent as reasoning\.", "the answer"]
+    assert bot.messages == ["I should be sent as reasoning.", "the answer"]
 
 
 async def test_stream_reply_sends_metadata_reasoning_separately_from_answer() -> None:
@@ -727,7 +720,7 @@ async def test_stream_reply_sends_metadata_reasoning_separately_from_answer() ->
             _ev("session.idle", sessionID=SID),
         ]
     )
-    assert bot.messages == [r"I should be sent as reasoning\.", "the answer"]
+    assert bot.messages == ["I should be sent as reasoning.", "the answer"]
 
 
 async def test_stream_reply_renders_tool_line_separately_from_answer() -> None:
@@ -755,7 +748,7 @@ async def test_stream_reply_renders_tool_line_separately_from_answer() -> None:
     assert "🔧 Read" in reasoning
     assert "src/foo.py" in reasoning
     assert "/work/proj" not in reasoning
-    assert answer == r"Let me look\.Done\."
+    assert answer == "Let me look.Done."
 
 
 async def test_stream_reply_demotes_prior_step_text_to_progress() -> None:
@@ -824,12 +817,30 @@ class PacedOpenCode(FakeOpenCode):
 
 class TimelineBot(FakeBot):
     """A bot whose sends return real message ids and which records the full
-    send/edit/delete timeline — enough for the live-edit + delete paths."""
+    send/edit/delete timeline — enough for the live-edit + delete paths.
+
+    ``do_api_request`` accepts the rich-message endpoints the transport uses,
+    recording them as plain send/edit entries so the timeline reads the same
+    regardless of endpoint; the recorded text is the raw GFM Telegram parses.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self._id = 100
         self.timeline: list[tuple[str, int, str]] = []
+
+    async def do_api_request(self, endpoint: str, api_kwargs: dict | None = None):
+        kwargs = api_kwargs or {}
+        markdown = kwargs.get("rich_message", {}).get("markdown", "")
+        if endpoint == "sendRichMessage":
+            self._id += 1
+            self.messages.append(markdown)
+            self.timeline.append(("send", self._id, markdown))
+            return {"message_id": self._id}
+        if endpoint == "editMessageText":
+            self.timeline.append(("edit", kwargs["message_id"], markdown))
+            return {}
+        return {}  # sendRichMessageDraft: drafts stay invisible, like FakeBot's
 
     async def send_message(self, *, text: str, reply_markup: object = None, **kwargs: object):
         await super().send_message(text=text, reply_markup=reply_markup, **kwargs)
@@ -851,7 +862,7 @@ async def test_stream_reply_answer_ends_the_turn_after_progress_overflow() -> No
     # overflows one chunk, finalize sends the overflow as new messages — which
     # land below the already-created answer bubble. The answer must end the
     # turn, so its stale bubble is deleted and the answer re-sent at the bottom.
-    long_reasoning = "thinking very hard about it " * 200  # > 4096 rendered
+    long_reasoning = "thinking very hard about it " * 1200  # > the 32768 rich cap
     bot = TimelineBot()
     await stream_reply(
         bot=bot,
@@ -962,7 +973,7 @@ async def test_stream_reply_keeps_failed_bash_output_tail() -> None:
     assert "line 0" not in final  # the head is dropped
 
 
-def test_render_todos_icons_and_fallbacks() -> None:
+def test_render_todos_uses_native_task_list() -> None:
     gfm = _render_todos(
         [
             {"content": "Write tests", "status": "completed"},
@@ -975,31 +986,6 @@ def test_render_todos_icons_and_fallbacks() -> None:
         ]
     )
     assert gfm.splitlines() == [
-        "📋 **Progress**",
-        "✅ Write tests",
-        "🔄 Run them",
-        "⬜ Ship it",
-        "❌ ~~Old idea~~",
-        "⬜ fallback field",
-    ]
-
-
-def test_render_todos_nothing_renderable_returns_empty() -> None:
-    assert _render_todos([]) == ""
-    assert _render_todos([{"content": "  ", "status": "pending"}]) == ""
-
-
-def test_render_todos_rich_uses_native_task_list() -> None:
-    gfm = _render_todos(
-        [
-            {"content": "Write tests", "status": "completed"},
-            {"content": "Run them", "status": "in_progress"},
-            {"content": "Ship it", "status": "pending"},
-            {"content": "Old idea", "status": "cancelled"},
-        ],
-        rich=True,
-    )
-    assert gfm.splitlines() == [
         "### 📋 Progress",
         "",
         "- [x] Write tests",
@@ -1008,13 +994,15 @@ def test_render_todos_rich_uses_native_task_list() -> None:
         "- [ ] 🔄 Run them",
         "- [ ] Ship it",
         "- [ ] ~~Old idea~~",
+        "- [ ] fallback field",
     ]
 
 
-def test_render_todos_rich_header_alone_is_not_a_checklist() -> None:
-    # The rich header spans two lines; an empty list must still render as "".
-    assert _render_todos([], rich=True) == ""
-    assert _render_todos([{"content": " ", "status": "pending"}], rich=True) == ""
+def test_render_todos_nothing_renderable_returns_empty() -> None:
+    # The header spans two lines; an empty list must still render as "".
+    assert _render_todos([]) == ""
+    assert _render_todos([{"content": "  ", "status": "pending"}]) == ""
+    assert _render_todos(["junk"]) == ""
 
 
 def _todowrite_part(call_id: str, status: str, todos: list[dict[str, str]]) -> dict[str, object]:
@@ -1063,10 +1051,10 @@ async def test_stream_reply_todowrite_posts_then_edits_checklist_in_place() -> N
     assert len(checklist_sends) == 1
     _kind, checklist_id, first = checklist_sends[0]
     assert "🔄 Write tests" in first
-    assert "⬜ Run them" in first
+    assert "- [ ] Run them" in first
     edits = [op for op in bot.timeline if op[0] == "edit" and op[1] == checklist_id]
     assert len(edits) == 1  # the duplicate update was debounced
-    assert "✅ Write tests" in edits[0][2]
+    assert "- [x] Write tests" in edits[0][2]
     assert "🔄 Run them" in edits[0][2]
 
 
@@ -1094,7 +1082,7 @@ async def test_stream_reply_todowrite_excluded_from_tool_stream() -> None:
     )
     checklist = [m for m in bot.messages if "Progress" in m]
     assert len(checklist) == 1
-    assert "⬜ Plan" in checklist[0]
+    assert "- [ ] Plan" in checklist[0]
     for message in bot.messages:
         assert "to-do" not in message
         assert "TodoWrite" not in message
@@ -1102,7 +1090,7 @@ async def test_stream_reply_todowrite_excluded_from_tool_stream() -> None:
 
 async def test_stream_reply_collapses_consecutive_tool_calls() -> None:
     # A burst of consecutive calls folds into one summary line with the
-    # per-call detail inside an expandable blockquote (TOOL_STREAM=collapsed,
+    # per-call detail inside a <details> block (TOOL_STREAM=collapsed,
     # the default) instead of one line per call.
     bot = await _run(
         [
@@ -1130,11 +1118,11 @@ async def test_stream_reply_collapses_consecutive_tool_calls() -> None:
         directory="/work/proj",
     )
     (progress,) = bot.messages
-    # Telegram's expandable-quote form: empty bold opener, "||" terminator.
-    assert progress.startswith("**>")
-    assert progress.endswith("||")
+    # Native <details> block: summary line up front, detail lines inside.
+    assert progress.startswith("<details><summary>")
+    assert progress.endswith("</details>")
     assert "Ran a command, read 2 files" in progress
-    # The per-call detail lines ride inside the quote, paths workspace-relative.
+    # The per-call detail lines ride inside the block, paths workspace-relative.
     assert "`src/a.py`" in progress
     assert "`src/b.py`" in progress
     assert "`uv run pytest`" in progress
@@ -1176,8 +1164,8 @@ async def test_stream_reply_answer_text_breaks_tool_groups() -> None:
         directory="/w",
     )
     progress, answer = bot.messages
-    assert progress.count("**>") == 2  # two separate expandable quotes
-    assert answer == r"Found it\."
+    assert progress.count("<details>") == 2  # two separate collapsed groups
+    assert answer == "Found it."
 
 
 async def test_stream_reply_collapsed_single_call_keeps_plain_line() -> None:
@@ -1274,8 +1262,8 @@ async def test_stream_reply_full_mode_keeps_per_call_lines() -> None:
 
 async def test_stream_reply_streams_live_group_summary_before_sealing() -> None:
     # While the burst is active the group is a plain, ticking summary line
-    # (present tense + ellipsis); the expandable quote only appears once the
-    # group seals — re-editing a quote would visibly re-collapse it.
+    # (present tense + ellipsis); the <details> block only appears once the
+    # group seals — re-editing it would visibly re-collapse it.
     bot = TimelineBot()
     await stream_reply(
         bot=bot,
@@ -1314,8 +1302,8 @@ async def test_stream_reply_streams_live_group_summary_before_sealing() -> None:
         draft_interval=0.01,
     )
     texts = [op[2] for op in bot.timeline if op[0] in ("send", "edit")]
-    assert any("Reading a file…" in t and "**>" not in t for t in texts)  # live form
-    assert texts[-1].startswith("**>") and "Read 2 files" in texts[-1]  # sealed form
+    assert any("Reading a file…" in t and "<details>" not in t for t in texts)  # live form
+    assert texts[-1].startswith("<details>") and "Read 2 files" in texts[-1]  # sealed form
 
 
 def test_format_approval_request_bash_shows_description_reason() -> None:
@@ -1874,7 +1862,7 @@ async def test_stream_reply_answer_streamed_before_a_question_re_anchors_below_i
     assert not any(op[0] == "edit" and op[1] == answer_bubble_id for op in bot.timeline)
     # …and the final answer is re-sent below the questions (a larger, later id).
     last_send = [op for op in bot.timeline if op[0] == "send"][-1]
-    assert last_send[2] == "Here is some context\\. And the answer\\."
+    assert last_send[2] == "Here is some context. And the answer."
     assert last_send[1] > max(question_ids)
 
 

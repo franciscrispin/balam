@@ -1,7 +1,6 @@
 """Bot API 10.1 Rich Messages — send GFM to Telegram without MarkdownV2 escaping.
 
-This is the default rendering path (``Config.rich_messages``; whole-turn
-MarkdownV2 survives only behind the deprecated ``RICH_MESSAGES=false``).
+Every reply goes out through here.
 Telegram parses GitHub-Flavored Markdown natively via ``sendRichMessage`` and
 ``InputRichMessage.markdown`` (Bot API 10.1, 2026-06-11), so the agent's output
 skips the escaping pass in :mod:`balam.markdown`. Rich messages also carry

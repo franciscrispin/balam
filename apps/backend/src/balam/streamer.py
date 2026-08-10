@@ -135,7 +135,7 @@ class DraftSession:
         transport: DraftTransport,
         *,
         draft_id: int | None = None,
-        render: Renderer = gfm_to_telegram,
+        render: Renderer = chunk_rich,
         native_drafts: bool = True,
     ) -> None:
         self._transport = transport
@@ -300,34 +300,23 @@ def _make_transport(
     chat_id: int,
     thread_id: int | None,
     on_sent: Callable[[int | None], None] | None = None,
-    *,
-    rich: bool = False,
 ) -> DraftTransport:
     # message_thread_id routes both the draft and the final message to the topic.
     topic_kwargs = thread_kwargs(thread_id)
 
     class _Transport:
-        # In rich mode ``text`` arrives as raw GFM (the renderer only chunks it);
-        # in MarkdownV2 mode it is already escaped. Each rich call falls back to
-        # the MarkdownV2 path for *this message only*, so one payload Telegram
-        # dislikes never disables rich mode for the rest of the turn.
+        # ``text`` arrives as raw GFM (the renderer only chunks it); Telegram
+        # parses it natively. Each call falls back to the MarkdownV2 rendering
+        # for *this message only*, so one payload Telegram dislikes never
+        # affects the rest of the turn.
 
         async def send_draft(self, draft_id: int, text: str) -> None:
-            if rich:
-                await send_rich_draft(
-                    bot,
-                    chat_id=chat_id,
-                    draft_id=draft_id,
-                    markdown=text,
-                    thread_kwargs=topic_kwargs,
-                )
-                return
-            await bot.send_message_draft(
+            await send_rich_draft(
+                bot,
                 chat_id=chat_id,
                 draft_id=draft_id,
-                text=text,
-                parse_mode="MarkdownV2",
-                **topic_kwargs,
+                markdown=text,
+                thread_kwargs=topic_kwargs,
             )
 
         async def _send_markdown_v2(self, text: str) -> int | None:
@@ -349,30 +338,28 @@ def _make_transport(
             return message_id
 
         async def send_message(self, text: str) -> int | None:
-            if rich:
-                try:
-                    message_id = await send_rich_message(
-                        bot,
-                        chat_id=chat_id,
-                        markdown=text,
-                        thread_kwargs=topic_kwargs,
-                    )
-                except RetryAfter:
-                    raise
-                except Exception:
-                    logger.info("rich send rejected; falling back to MarkdownV2", exc_info=True)
-                else:
-                    if on_sent is not None:
-                        on_sent(message_id)
-                    return message_id
-                # Escaping the same GFM can exceed the 4096 cap that rich mode
-                # let through, so the fallback may span several messages. The
-                # last one is the live-edit anchor and the topic tail.
-                message_id = None
-                for chunk in markdown_v2_fallback(text):
-                    message_id = await self._send_markdown_v2(chunk)
+            try:
+                message_id = await send_rich_message(
+                    bot,
+                    chat_id=chat_id,
+                    markdown=text,
+                    thread_kwargs=topic_kwargs,
+                )
+            except RetryAfter:
+                raise
+            except Exception:
+                logger.info("rich send rejected; falling back to MarkdownV2", exc_info=True)
+            else:
+                if on_sent is not None:
+                    on_sent(message_id)
                 return message_id
-            return await self._send_markdown_v2(text)
+            # Escaping the same GFM can exceed the 4096 cap that rich mode
+            # let through, so the fallback may span several messages. The
+            # last one is the live-edit anchor and the topic tail.
+            message_id = None
+            for chunk in markdown_v2_fallback(text):
+                message_id = await self._send_markdown_v2(chunk)
+            return message_id
 
         async def delete_message(self, message_id: int) -> None:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -380,23 +367,20 @@ def _make_transport(
         async def edit_message(self, message_id: int, text: str) -> None:
             # edit_message_text addresses the message by id within the chat, so no
             # thread kwargs. "message is not modified" is benign (identical render).
-            if rich:
-                try:
-                    await edit_rich_message(
-                        bot, chat_id=chat_id, message_id=message_id, markdown=text
-                    )
-                except RetryAfter:
-                    raise
-                except Exception:
-                    logger.info("rich edit rejected; falling back to MarkdownV2", exc_info=True)
-                else:
-                    return
-                # Only the first chunk can be edited in place; overflow is left to
-                # finalize, which re-sends the whole text as fresh messages.
-                chunks = markdown_v2_fallback(text)
-                if not chunks:
-                    return
-                text = chunks[0]
+            try:
+                await edit_rich_message(bot, chat_id=chat_id, message_id=message_id, markdown=text)
+            except RetryAfter:
+                raise
+            except Exception:
+                logger.info("rich edit rejected; falling back to MarkdownV2", exc_info=True)
+            else:
+                return
+            # Only the first chunk can be edited in place; overflow is left to
+            # finalize, which re-sends the whole text as fresh messages.
+            chunks = markdown_v2_fallback(text)
+            if not chunks:
+                return
+            text = chunks[0]
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -444,7 +428,6 @@ async def stream_reply(
     follow_ups: FollowUpChannel | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
     tool_stream: str = "collapsed",
-    rich_messages: bool = False,
     unattended: bool = False,
 ) -> None:
     """Run one turn through ``backend`` and stream its reply into the topic.
@@ -471,15 +454,10 @@ async def stream_reply(
     with a :class:`~balam.agent.events.TurnStepFinished`, on which we finalize the
     current answer/reasoning bubbles and reset so the next step streams fresh.
 
-    ``rich_messages`` (``Config.rich_messages``, on by default) sends the
-    agent's GFM as Bot API 10.1 rich messages, which Telegram parses natively —
-    tables, headings, task lists, collapsibles, and a 32768-char cap; any
-    message Telegram rejects falls back to the MarkdownV2 rendering on its own
-    (see :mod:`balam.rich_messages`). ``False`` — the deprecated
-    ``RICH_MESSAGES=false`` escape hatch — escapes every message to MarkdownV2
-    up front. The parameter default stays ``False`` so the transport-level
-    tests keep exercising that fallback renderer explicitly; the production
-    caller (:mod:`balam.turns`) always passes the config value.
+    Replies go out as Bot API 10.1 rich messages, which Telegram parses
+    natively — tables, headings, task lists, collapsibles, and a 32768-char
+    cap; any message Telegram rejects falls back to the MarkdownV2 rendering
+    on its own (see :mod:`balam.rich_messages`).
 
     ``tool_stream`` (``TOOL_STREAM``) picks how tool calls render in the
     progress stream: ``"collapsed"`` (default) folds a burst of consecutive
@@ -517,16 +495,15 @@ async def stream_reply(
         if message_id is not None:
             last_sent_id = message_id
 
-    transport = _make_transport(bot, chat_id, thread_id, on_sent=note_sent, rich=rich_messages)
+    transport = _make_transport(bot, chat_id, thread_id, on_sent=note_sent)
     # sendMessageDraft is private-chat only; in the Bot API private chats have
     # positive ids and groups/supergroups negative ones, so the chat id alone
     # picks the streaming approach — no wasted draft call per group turn.
     native_drafts = chat_id > 0
-    # Rich mode hands the transport raw GFM (Telegram parses it), so the renderer
-    # only enforces the 32768-char cap instead of escaping to MarkdownV2.
-    render: Renderer = chunk_rich if rich_messages else gfm_to_telegram
-    reasoning_draft = DraftSession(transport, native_drafts=native_drafts, render=render)
-    answer_draft = DraftSession(transport, native_drafts=native_drafts, render=render)
+    # The transport takes raw GFM (Telegram parses it), so the renderer only
+    # enforces the 32768-char cap instead of escaping to MarkdownV2.
+    reasoning_draft = DraftSession(transport, native_drafts=native_drafts, render=chunk_rich)
+    answer_draft = DraftSession(transport, native_drafts=native_drafts, render=chunk_rich)
     topic_kwargs = thread_kwargs(thread_id)
 
     streaming = True
@@ -587,7 +564,6 @@ async def stream_reply(
             entries,
             active=group_key == open_group_key,
             directory=directory,
-            rich=rich_messages,
         )
         prior = reasoning_parts.get(group_key)
         if prior is None:
@@ -816,11 +792,11 @@ async def stream_reply(
         purely cosmetic — a failed send/edit is logged and must never abort the
         turn."""
         nonlocal todo_message_id, todo_last_rendered
-        gfm = _render_todos(todos, rich=rich_messages)
+        gfm = _render_todos(todos)
         if not gfm or gfm == todo_last_rendered:
             return
-        # Same renderer as the streams: raw GFM in rich mode, escaped otherwise.
-        chunks = render(gfm)
+        # Same renderer as the streams: raw GFM, chunked at the rich cap.
+        chunks = chunk_rich(gfm)
         if not chunks:
             return
         todo_last_rendered = gfm
