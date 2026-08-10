@@ -2317,6 +2317,130 @@ async def test_schedule_on_resumes_and_rearms_the_timer() -> None:
     assert len(context.application.job_queue.get_jobs_by_name("schedule:1")) == 1
 
 
+async def test_schedule_retime_updates_the_row_and_rearms_the_timer() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule retime 1 08:15")
+    update, context, store, _bot, _turns = _schedule_env(message, ["retime", "1", "08:15"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+    schedules.register_one(
+        context.application.job_queue,
+        schedules.Schedule.from_row(store.get_schedule(1)),
+        ZoneInfo("Asia/Singapore"),
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.get_schedule(1)
+    assert (row.hour, row.minute) == (8, 15)
+    # Replaced, not duplicated — the one job carries the new time.
+    assert len(context.application.job_queue.get_jobs_by_name("schedule:1")) == 1
+    assert "every day at 08:15" in message.replies[-1]
+
+
+async def test_schedule_retime_keeps_the_recurrence_days() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule retime 1 10:00")
+    update, context, store, _bot, _turns = _schedule_env(message, ["retime", "1", "10:00"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="weekdays",
+        hour=9,
+        minute=0,
+        days="0,1,2,3,4",
+        created_at=1,
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.get_schedule(1)
+    assert (row.kind, row.days, row.hour, row.minute) == ("weekdays", "0,1,2,3,4", 10, 0)
+    assert "Mon–Fri at 10:00" in message.replies[-1]
+
+
+async def test_schedule_retime_rejects_a_bad_time_without_saving() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule retime 1 25:99")
+    update, context, store, _bot, _turns = _schedule_env(message, ["retime", "1", "25:99"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.get_schedule(1)
+    assert (row.hour, row.minute) == (7, 30)
+    assert "isn't a real time" in message.replies[-1]
+
+
+async def test_schedule_retime_leaves_a_paused_schedule_paused() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule retime 1 08:15")
+    update, context, store, _bot, _turns = _schedule_env(message, ["retime", "1", "08:15"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+    store.set_schedule_enabled(1, False)
+
+    await handle_schedule(update, context)
+
+    row = store.get_schedule(1)
+    assert (row.hour, row.minute, row.enabled) == (8, 15, 0)
+    # No timer armed — the new time applies when it is resumed.
+    assert context.application.job_queue.get_jobs_by_name("schedule:1") == ()
+    assert "paused" in message.replies[-1]
+
+
+async def test_schedule_retime_requires_an_id_and_a_time() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule retime 1")
+    update, context, _store, _bot, _turns = _schedule_env(message, ["retime", "1"])
+
+    await handle_schedule(update, context)
+
+    assert "Usage: /schedule retime" in message.replies[-1]
+
+
+async def test_schedule_retime_refuses_a_schedule_from_another_chat() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule retime 1 08:15")
+    update, context, store, _bot, _turns = _schedule_env(message, ["retime", "1", "08:15"])
+    store.add_schedule(
+        chat_id=999,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.get_schedule(1)
+    assert (row.hour, row.minute) == (7, 30)
+    assert "No schedule #1 here" in message.replies[-1]
+
+
 async def test_schedule_by_id_refuses_a_schedule_from_another_chat() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule off 1")
     update, context, store, _bot, _turns = _schedule_env(message, ["off", "1"])

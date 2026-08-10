@@ -167,7 +167,7 @@ def parse_when(tokens: Sequence[str]) -> When:
         raise ScheduleError(_when_help("I need a time, like " + WHEN_EXAMPLES[0] + "."))
 
     kind_token = tokens[0].strip().lower()
-    hour, minute = _parse_time(tokens[1])
+    hour, minute = parse_time(tokens[1])
 
     if kind_token == KIND_DAILY:
         return When(kind=KIND_DAILY, hour=hour, minute=minute)
@@ -179,8 +179,11 @@ def parse_when(tokens: Sequence[str]) -> When:
     raise ScheduleError(_when_help(f"I don't understand {tokens[0]!r}."))
 
 
-def _parse_time(token: str) -> tuple[int, int]:
-    """``HH:MM`` in 24-hour time, as the owner's wall clock in ``BALAM_TIMEZONE``."""
+def parse_time(token: str) -> tuple[int, int]:
+    """``HH:MM`` in 24-hour time, as the owner's wall clock in ``BALAM_TIMEZONE``.
+
+    Public because ``/schedule retime`` parses a time on its own, without the
+    leading recurrence token :func:`parse_when` requires."""
     hour_text, _, minute_text = token.strip().partition(":")
     if not minute_text:
         raise ScheduleError(_when_help(f"{token!r} isn't a time — use 24-hour HH:MM."))

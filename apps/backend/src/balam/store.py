@@ -446,6 +446,16 @@ class SessionStore:
         self._db.commit()
         return cursor.rowcount > 0
 
+    def set_schedule_time(self, schedule_id: int, hour: int, minute: int) -> bool:
+        """Move a schedule to a new time of day, keeping its recurrence;
+        ``False`` if unknown."""
+        cursor = self._db.execute(
+            "UPDATE schedules SET hour = ?, minute = ? WHERE id = ?",
+            (hour, minute, schedule_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
     def mark_schedule_run(self, schedule_id: int, when_ms: int) -> None:
         """Stamp a run. Written when the run *starts*, not when its turn ends, so
         a crash mid-turn can't make the missed-run catch-up re-fire the whole

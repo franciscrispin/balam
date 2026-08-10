@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 #: Words that lead a ``/schedule`` sub-command rather than a recurrence. A create
 #: always starts with a when-token (``daily`` / ``weekdays`` / a weekday), so the
 #: two can never be confused.
-_SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off")
+_SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off", "retime")
 
 _SCHEDULE_USAGE = (
     "Usage:\n"
@@ -51,6 +51,7 @@ _SCHEDULE_USAGE = (
     "/schedule daily 07:30 <context> <prompt> — create\n"
     "/schedule cancel — pick schedules to remove\n"
     "/schedule run <id> — fire one now\n"
+    "/schedule retime <id> <HH:MM> — change the time\n"
     "/schedule off <id> · /schedule on <id> — pause / resume"
 )
 
@@ -85,8 +86,8 @@ async def handle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """``/schedule`` — run a prompt on a timer (ADR-0016).
 
     Bare, it lists this chat's schedules. ``/schedule <when> <context> <prompt>``
-    saves a new one; ``cancel`` / ``run`` / ``on`` / ``off`` manage the existing
-    ones. See :data:`_SCHEDULE_USAGE` for the full surface and
+    saves a new one; ``cancel`` / ``run`` / ``on`` / ``off`` / ``retime`` manage
+    the existing ones. See :data:`_SCHEDULE_USAGE` for the full surface and
     :func:`balam.schedules.parse_when` for the ``<when>`` grammar.
     """
     message = update.message
@@ -103,6 +104,9 @@ async def handle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if head in ("run", "on", "off"):
         await _schedule_by_id(message, context, head, args[1:])
+        return
+    if head == "retime":
+        await _schedule_retime(message, context, args[1:])
         return
     await _schedule_create(message, context, args)
 
@@ -217,6 +221,60 @@ async def _schedule_by_id(
     await message.reply_text(
         f"{'▶️ Resumed' if enable else '⏸ Paused'} schedule #{schedule_id} — "
         f"{describe(schedule.when)}."
+    )
+
+
+async def _schedule_retime(
+    message: Any, context: ContextTypes.DEFAULT_TYPE, rest: list[str]
+) -> None:
+    """``/schedule retime <id> <HH:MM>`` — move a schedule to a new time.
+
+    One step instead of the off/on dance: the row is updated *and* the live
+    timer re-registered, keeping the recurrence, prompt, context and id. Editing
+    the row alone would leave the old timer firing until the next boot —
+    :func:`balam.schedules.register_all` only runs at startup.
+    """
+    store: SessionStore = context.application.bot_data["store"]
+    if len(rest) < 2:
+        await message.reply_text("Usage: /schedule retime <id> <HH:MM>")
+        return
+    try:
+        schedule_id = int(rest[0].lstrip("#"))
+    except ValueError:
+        await message.reply_text(f"{rest[0]!r} isn't a schedule id. /schedule retime <id> <HH:MM>")
+        return
+    row = store.get_schedule(schedule_id)
+    if row is None or row.chat_id != message.chat_id:
+        await message.reply_text(f"No schedule #{schedule_id} here.")
+        return
+    try:
+        hour, minute = schedules.parse_time(rest[1])
+    except schedules.ScheduleError as exc:
+        await message.reply_text(str(exc))
+        return
+
+    store.set_schedule_time(schedule_id, hour, minute)
+    row = store.get_schedule(schedule_id)
+    assert row is not None  # just updated
+    schedule = schedules.Schedule.from_row(row)
+    tz = _schedule_timezone(context)
+
+    job_queue = getattr(context.application, "job_queue", None)
+    if job_queue is None:
+        if schedule.enabled:
+            await message.reply_text(
+                f"⚠️ Saved the new time for #{schedule_id}, but the job queue is unavailable, "
+                "so the running timer is unchanged until Balam restarts with "
+                "python-telegram-bot[job-queue]."
+            )
+            return
+    else:
+        # register_one replaces the old timer, and is a no-op arm for a paused
+        # schedule — the new time then applies on /schedule on.
+        schedules.register_one(job_queue, schedule, tz)
+    paused = "" if schedule.enabled else " (still ⏸ paused)"
+    await message.reply_text(
+        f"🗓 Schedule #{schedule_id} retimed — {describe(schedule.when)} ({tz.key}){paused}."
     )
 
 
