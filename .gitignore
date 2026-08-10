@@ -50,5 +50,8 @@ deploy/balam.env
 # Personal tunnel ingress (tunnel id + hostname; cloudflared-balam.example.yml is tracked)
 deploy/cloudflared-balam.yml
 
+# Machine-local systemd units + installer (personal user/paths)
+deploy/local/
+
 # Google Calendar OAuth client + token files
 .secrets/
