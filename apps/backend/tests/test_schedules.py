@@ -337,7 +337,7 @@ def _fire_env(bot: _FakeBot | None = None, store: SessionStore | None = None):
             "turns": turns,
             "backend": OpenCodeBackend(_FakeOpenCode()),
             "pending": PendingApprovals(),
-            "config": SimpleNamespace(timezone=SGT, tool_stream="collapsed", rich_messages=False),
+            "config": SimpleNamespace(timezone=SGT, tool_stream="collapsed", rich_messages=True),
         },
         job_queue=queue,
     )

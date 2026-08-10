@@ -471,11 +471,15 @@ async def stream_reply(
     with a :class:`~balam.agent.events.TurnStepFinished`, on which we finalize the
     current answer/reasoning bubbles and reset so the next step streams fresh.
 
-    ``rich_messages`` (``RICH_MESSAGES``) sends the agent's GFM as Bot API 10.1
-    rich messages, which Telegram parses natively — tables, headings, task
-    lists, collapsibles, and a 32768-char cap — instead of escaping it to
-    MarkdownV2 (see :mod:`balam.rich_messages`). Any message Telegram rejects
-    falls back to the MarkdownV2 rendering on its own.
+    ``rich_messages`` (``Config.rich_messages``, on by default) sends the
+    agent's GFM as Bot API 10.1 rich messages, which Telegram parses natively —
+    tables, headings, task lists, collapsibles, and a 32768-char cap; any
+    message Telegram rejects falls back to the MarkdownV2 rendering on its own
+    (see :mod:`balam.rich_messages`). ``False`` — the deprecated
+    ``RICH_MESSAGES=false`` escape hatch — escapes every message to MarkdownV2
+    up front. The parameter default stays ``False`` so the transport-level
+    tests keep exercising that fallback renderer explicitly; the production
+    caller (:mod:`balam.turns`) always passes the config value.
 
     ``tool_stream`` (``TOOL_STREAM``) picks how tool calls render in the
     progress stream: ``"collapsed"`` (default) folds a burst of consecutive

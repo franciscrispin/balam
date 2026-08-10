@@ -2154,7 +2154,7 @@ def _schedule_env(message: _FakeMessage, args: list[str], *, bot: _FakeBot | Non
                     allowed_telegram_user_id=OWNER,
                     allowed_telegram_chat_id=None,
                     tool_stream="collapsed",
-                    rich_messages=False,
+                    rich_messages=True,
                 ),
             },
             job_queue=JobQueue(),

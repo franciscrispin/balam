@@ -1,9 +1,11 @@
 """Backend-selection + SDK auth settings (ADR-0013)."""
 
+import logging
+
 import pytest
 from pydantic import ValidationError
 
-from balam.config import Config
+from balam.config import Config, load_config
 
 # _env_file=None keeps these hermetic — the real repo-root .env (which may set
 # AGENT_BACKEND for a live run) must not leak into the defaults under test.
@@ -67,3 +69,42 @@ def test_timezone_rejects_a_typo_at_load() -> None:
     # other trust-boundary checks — not at 07:30 when the schedule doesn't fire.
     with pytest.raises(ValidationError):
         Config(**_BASE, balam_timezone="Asia/Singapura")  # type: ignore[arg-type]
+
+
+# --- RICH_MESSAGES: deprecated — rich replies are the default -----------------
+
+
+def test_rich_messages_defaults_to_true_and_blank_means_default() -> None:
+    assert Config(**_BASE).rich_messages is True  # type: ignore[arg-type]
+    # A stale "RICH_MESSAGES=" line in an old .env must mean "unset", not a
+    # boot failure — the flag is deprecated, so old files still carry it.
+    assert Config(**_BASE, rich_messages=" ").rich_messages is True  # type: ignore[arg-type]
+
+
+def _load_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # load_config() reads the (hermetic_settings-stripped) environment, so the
+    # required trust-boundary fields must come back as env vars.
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_ID", "1")
+
+
+def test_rich_messages_env_var_warns_deprecated(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _load_config_env(monkeypatch)
+    monkeypatch.setenv("RICH_MESSAGES", "false")
+    with caplog.at_level(logging.WARNING, logger="balam.config"):
+        config = load_config()
+    # The escape hatch still works, but boot says it is going away.
+    assert config.rich_messages is False
+    assert any("RICH_MESSAGES is deprecated" in r.message for r in caplog.records)
+
+
+def test_rich_messages_unset_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _load_config_env(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="balam.config"):
+        config = load_config()
+    assert config.rich_messages is True
+    assert not any("RICH_MESSAGES" in r.message for r in caplog.records)

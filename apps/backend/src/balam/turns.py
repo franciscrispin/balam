@@ -385,7 +385,7 @@ def start_turn(
                 on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
                 follow_ups=follow_ups,
                 tool_stream=config.tool_stream if config is not None else "collapsed",
-                rich_messages=config.rich_messages if config is not None else False,
+                rich_messages=config.rich_messages if config is not None else True,
                 unattended=job.unattended,
             )
         except asyncio.CancelledError:

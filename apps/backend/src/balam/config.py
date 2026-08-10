@@ -8,12 +8,15 @@ systemd unit) take precedence over the repo-root ``.env`` used in local dev.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 #: Fallback when ``BALAM_TIMEZONE`` is unset or blank. The VM runs UTC but the
 #: owner does not, and a schedule is written in the owner's wall clock.
@@ -103,10 +106,12 @@ class Config(BaseSettings):
 
     # Send replies as Bot API 10.1 rich messages: Telegram parses the agent's GFM
     # natively (tables, headings, task lists, collapsibles, 32768-char cap)
-    # instead of our MarkdownV2 escaping pass. Falls back to MarkdownV2 per
-    # message if Telegram rejects the payload. Mirrors RICH_MESSAGES in
-    # .env.example; see balam.rich_messages.
-    rich_messages: bool = False
+    # instead of our MarkdownV2 escaping pass, which survives as the per-message
+    # fallback when Telegram rejects a payload. The default since 2026-08, so it
+    # needs no configuration; RICH_MESSAGES is DEPRECATED (load_config warns
+    # when it is set) — =false restores the whole-turn MarkdownV2 mode until the
+    # flag and that mode are removed. See balam.rich_messages.
+    rich_messages: bool = True
 
     # --- noVNC live browser view (ADR-0006) ---
     # The x11vnc server exposing the agent's headed Chrome (started on demand by
@@ -141,6 +146,17 @@ class Config(BaseSettings):
         # generic blank→None validator above would fail its Literal check.
         if isinstance(value, str) and value.strip() == "":
             return "collapsed"
+        return value
+
+    @field_validator("rich_messages", mode="before")
+    @classmethod
+    def _blank_rich_messages_to_default(cls, value: object) -> object:
+        # Same reason as TOOL_STREAM: the field is a plain ``bool``, so a blank
+        # env value must fall back to the default. Matters here because the flag
+        # is deprecated — a stale "RICH_MESSAGES=" line in an old .env must mean
+        # "unset", not a boot failure.
+        if isinstance(value, str) and value.strip() == "":
+            return True
         return value
 
     @field_validator("balam_timezone", mode="before")
@@ -193,10 +209,21 @@ def load_config() -> Config:
     """Build a validated :class:`Config`, or raise :class:`ConfigError` listing
     every problem at once so the operator fixes them in a single pass."""
     try:
-        return Config()  # type: ignore[call-arg]  # values come from env/.env
+        config = Config()  # type: ignore[call-arg]  # values come from env/.env
     except ValidationError as exc:
         problems: list[str] = []
         for err in exc.errors():
             field = ".".join(str(part) for part in err["loc"]) or "(root)"
             problems.append(f"{field.upper()}: {err['msg']}")
         raise ConfigError(problems) from exc
+    if "rich_messages" in config.model_fields_set:
+        # Rich replies became the default in 2026-08; the env var survives only
+        # as the =false escape hatch back to whole-turn MarkdownV2 rendering,
+        # and that mode goes away with the flag.
+        logger.warning(
+            "RICH_MESSAGES is deprecated: rich replies are the default, so the "
+            "setting can be removed from the environment/.env. RICH_MESSAGES=false "
+            "(the old whole-turn MarkdownV2 rendering) still works for now but "
+            "will be removed."
+        )
+    return config

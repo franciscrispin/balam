@@ -91,8 +91,10 @@ alphabetically — the groups are the shape of the system.
   todo checklist, approval/question formatting and keyboards. Takes data, returns
   strings — no message is ever sent from here.
 - **`markdown.py`** — GFM (what the agent emits) → Telegram MarkdownV2, chunked
-  to ≤4096 chars at code-block-aware boundaries.
-- **`rich_messages.py`** — the Bot API 10.1 native-GFM path, where available.
+  to ≤4096 chars at code-block-aware boundaries. As a whole-turn mode this is
+  deprecated (the `RICH_MESSAGES=false` escape hatch); it survives as the
+  per-message fallback when Telegram rejects a rich payload.
+- **`rich_messages.py`** — the Bot API 10.1 native-GFM path, the default.
 - **`schedules.py`** — `/schedule`'s timers (ADR-0016): the `<when>` parser,
   `JobQueue` registration, the fire path, and boot catch-up. `commands/schedule.py`
   holds only the command surface.
