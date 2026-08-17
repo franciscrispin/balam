@@ -25,7 +25,8 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from balam.agent.backend import TurnRequest
+from balam.agent import claude_sdk_backend
+from balam.agent.backend import FollowUp, FollowUpChannel, TurnRequest
 from balam.agent.claude_sdk_backend import (
     ClaudeSdkBackend,
     _category,
@@ -1092,3 +1093,269 @@ async def test_background_report_streams_as_its_own_step() -> None:
     )
     order = [type(e).__name__ for e in events]
     assert order.index("TurnStepFinished") < order.index("TurnFinished")
+
+
+# --- ADR-0017: a held turn stays responsive, and holds are bounded by count ---
+
+
+async def _wait_until(predicate, *, timeout: float = 3.0) -> bool:
+    """Poll ``predicate`` until it holds. The turn under test runs as its own
+    task, so the assertions have to wait for it rather than step it."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.005)
+    return False
+
+
+def _held_turn_query(messages, *, forwarded: asyncio.Queue, extra_after: list | None = None):
+    """A query that reads the input stream, so a test can see what reaches the CLI.
+
+    It yields ``messages`` (ending in a result that leaves work running, so the
+    turn is held), then blocks on the input stream. Nothing else arrives from the
+    CLI while held, so anything that shows up here got there without a step
+    boundary.
+    """
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            stream = prompt.__aiter__()
+            await stream.__anext__()  # the turn's own prompt
+            for message in messages:
+                yield message
+            follow = await stream.__anext__()
+            await forwarded.put(follow)
+            for message in extra_after or [_result()]:
+                yield message
+
+        return gen()
+
+    return query_fn
+
+
+def _prompt_text(message: dict) -> str:
+    """The text of a user message on the input stream. ``_content_blocks``
+    returns a bare string when there are no attachments, blocks when there are."""
+    content = message["message"]["content"]
+    if isinstance(content, str):
+        return content
+    return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+
+
+def _stalled_query(messages):
+    """A CLI that goes quiet after ``messages`` without closing its stream — the
+    shape a stuck background task produces, where only the cap can end the turn."""
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            for message in messages:
+                yield message
+            await asyncio.Event().wait()
+            yield _result()  # pragma: no cover - never reached
+
+        return gen()
+
+    return query_fn
+
+
+async def test_message_sent_during_a_hold_reaches_the_agent_without_a_step_boundary() -> None:
+    # The bug this closes: take() only ran at a ResultMessage, and while held no
+    # ResultMessage is coming — so a message sat in the channel until a task
+    # happened to finish (measured at 14m04s in one live session).
+    channel = FollowUpChannel()
+    forwarded: asyncio.Queue = asyncio.Queue()
+    backend = ClaudeSdkBackend(
+        query_fn=_held_turn_query(
+            [_init(), _started("b1", "Watch CI on both PRs"), _result()], forwarded=forwarded
+        )
+    )
+    events: list = []
+
+    async def drive() -> None:
+        async for event in backend.run_turn(_turn(follow_ups=channel, chat_id=7, thread_id=11)):
+            events.append(event)
+
+    task = asyncio.create_task(drive())
+    try:
+        assert await _wait_until(lambda: any(isinstance(e, TurnStepFinished) for e in events))
+        assert channel.offer(FollowUp(prompt="also check PR 36"))
+        delivered = await asyncio.wait_for(forwarded.get(), timeout=3.0)
+        assert _prompt_text(delivered) == "also check PR 36"
+    finally:
+        await asyncio.wait_for(task, timeout=3.0)
+
+
+async def test_the_hold_clock_stops_while_the_model_works() -> None:
+    # The clock must measure waiting, not the turn. A deadline armed at the first
+    # hold and left running through foreground work is what cut a live turn short:
+    # armed at 14:37:59 while the model was working, it fired at 15:07:59 and
+    # killed the CI watcher started at 14:53:40 with 16 of its 30 minutes spent.
+    channel = FollowUpChannel()
+    forwarded: asyncio.Queue = asyncio.Queue()
+
+    def query_fn(*, prompt, options):
+        async def gen():
+            stream = prompt.__aiter__()
+            await stream.__anext__()
+            yield _init()
+            yield _started("b1", "Watch CI")
+            yield _result()  # held: the watcher is still running
+            await forwarded.put(await stream.__anext__())
+            # The model answers the follow-up. No result follows, so nothing can
+            # re-arm the hold and the observation below is unambiguous.
+            yield AssistantMessage(
+                content=[TextBlock(text="on it")], model="claude", session_id=SID
+            )
+            await asyncio.Event().wait()
+
+        return gen()
+
+    backend = ClaudeSdkBackend(query_fn=query_fn)
+    events: list = []
+
+    async def drive() -> None:
+        async for event in backend.run_turn(_turn(follow_ups=channel, chat_id=7, thread_id=11)):
+            events.append(event)
+
+    task = asyncio.create_task(drive())
+    try:
+        # run_turn is an async generator: nothing runs until the drive task is
+        # actually scheduled, so wait for the topic to be published first.
+        assert await _wait_until(lambda: (7, 11) in backend._active)
+        active = backend._active[(7, 11)]
+        assert await _wait_until(lambda: active.held_since is not None)
+        channel.offer(FollowUp(prompt="carry on"))
+        await asyncio.wait_for(forwarded.get(), timeout=3.0)
+        # The model is producing again, so the turn is working, not waiting —
+        # and none of this stretch is charged to the wait.
+        assert await _wait_until(lambda: active.held_since is None)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_the_hold_ends_the_turn_when_the_wait_runs_out(monkeypatch) -> None:
+    monkeypatch.setattr(claude_sdk_backend, "_BACKGROUND_HOLD_S", 0.05)
+    # Held forever from the CLI's side: only the cap can end this turn.
+    events = await asyncio.wait_for(
+        _collect(
+            ClaudeSdkBackend(
+                query_fn=_stalled_query([_init(), _started("b1", "Wait for CI"), _result()])
+            ),
+            _turn(chat_id=7, thread_id=11),
+        ),
+        timeout=3.0,
+    )
+    assert any(isinstance(e, TurnFinished) for e in events)
+
+
+async def test_a_new_hold_evicts_the_longest_idle_one(monkeypatch) -> None:
+    # Memory is bounded by how many CLI processes wait at once, not by how long
+    # any one of them waits — which is what lets the wait be hours.
+    monkeypatch.setattr(claude_sdk_backend, "_MAX_HELD_TURNS", 1)
+    backend = ClaudeSdkBackend(
+        query_fn=_stalled_query([_init(), _started("b1", "Watch CI"), _result()])
+    )
+    first: list = []
+    second: list = []
+
+    async def drive(events: list, thread_id: int) -> None:
+        async for event in backend.run_turn(_turn(chat_id=7, thread_id=thread_id)):
+            events.append(event)
+
+    first_task = asyncio.create_task(drive(first, 11))
+    second_task: asyncio.Task | None = None
+    try:
+        assert await _wait_until(lambda: backend._active.get((7, 11)) is not None)
+        assert await _wait_until(lambda: backend._active[(7, 11)].held_since is not None)
+        # A second topic starts waiting; the cap is 1, so the first one ends and
+        # says so through the ordinary turn-end path.
+        second_task = asyncio.create_task(drive(second, 12))
+        await asyncio.wait_for(first_task, timeout=3.0)
+        assert any(isinstance(e, TurnFinished) for e in first)
+    finally:
+        for pending in (first_task, second_task):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(
+            *(t for t in (first_task, second_task) if t is not None), return_exceptions=True
+        )
+
+
+async def test_background_tasks_are_published_for_the_tasks_command() -> None:
+    channel = FollowUpChannel()
+    forwarded: asyncio.Queue = asyncio.Queue()
+    backend = ClaudeSdkBackend(
+        query_fn=_held_turn_query(
+            [_init(), _started("b1", "Watch CI"), _started("b2", "Run the suite"), _result()],
+            forwarded=forwarded,
+        )
+    )
+    events: list = []
+
+    async def drive() -> None:
+        async for event in backend.run_turn(_turn(follow_ups=channel, chat_id=7, thread_id=11)):
+            events.append(event)
+
+    task = asyncio.create_task(drive())
+    try:
+        assert await _wait_until(lambda: len(backend.background_tasks(7, 11)) == 2)
+        assert [t.description for t in backend.background_tasks(7, 11)] == [
+            "Watch CI",
+            "Run the suite",
+        ]
+        # An unrelated topic sees nothing.
+        assert backend.background_tasks(7, 99) == ()
+        channel.offer(FollowUp(prompt="done"))
+        await asyncio.wait_for(forwarded.get(), timeout=3.0)
+    finally:
+        await asyncio.wait_for(task, timeout=3.0)
+    # The turn is over, so nothing is running and the topic stops being published.
+    assert backend.background_tasks(7, 11) == ()
+
+
+async def test_channel_drain_hands_back_what_was_never_delivered() -> None:
+    channel = FollowUpChannel()
+    channel.offer(FollowUp(prompt="one"))
+    channel.offer(FollowUp(prompt="two"))
+
+    assert [f.prompt for f in channel.drain()] == ["one", "two"]
+    assert channel.drain() == []
+    assert channel.take() is None
+
+
+async def test_channel_wait_wakes_on_an_offer() -> None:
+    channel = FollowUpChannel()
+    waiter = asyncio.create_task(channel.wait())
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    channel.offer(FollowUp(prompt="hello"))
+    await asyncio.wait_for(waiter, timeout=1.0)
+    assert channel.take().prompt == "hello"
+
+
+async def test_channel_wait_wakes_on_close_so_a_held_turn_can_unwind() -> None:
+    channel = FollowUpChannel()
+    waiter = asyncio.create_task(channel.wait())
+    await asyncio.sleep(0)
+
+    channel.close()
+    await asyncio.wait_for(waiter, timeout=1.0)
+    assert channel.closed
+    # Waking does not mean a message arrived, so callers must re-check.
+    assert channel.take() is None
+
+
+async def test_channel_wait_does_not_wake_again_once_everything_is_taken() -> None:
+    channel = FollowUpChannel()
+    channel.offer(FollowUp(prompt="only"))
+    assert channel.take().prompt == "only"
+
+    waiter = asyncio.create_task(channel.wait())
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)

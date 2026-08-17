@@ -61,7 +61,7 @@ alphabetically — the groups are the shape of the system.
   dependency arrow points out of this file only.
 - **`commands/`** — one module per command group: `session.py` (`/context`
   `/new` `/status` `/model` `/effort` `/rename` `/cancel`), `views.py` (`/diff`
-  `/browser` `/artifacts`), `delete.py`, `schedule.py`.
+  `/browser` `/artifacts`), `delete.py`, `schedule.py`, `tasks.py` (`/tasks`).
 - **`callbacks.py`** — the other end of the agent's questions: approval and
   question keyboard taps, resolving the future the turn is parked on.
 - **`pickers.py`** — the paged multi-select shared by `/delete` and
@@ -128,7 +128,10 @@ alphabetically — the groups are the shape of the system.
 - **`agent/opencode_backend.py`** + **`opencode.py`** — the OpenCode runtime and
   the hand-written `httpx` HTTP/SSE client under it.
 - **`agent/claude_sdk_backend.py`** — the Claude Agent SDK runtime: the query
-  loop, foreign-result detection, and the ADR-0015 background-work turn policy.
+  loop, foreign-result detection, and the background-work turn policy —
+  ADR-0015's hold, plus ADR-0017's interruptible hold, idle-only clock and
+  `_MAX_HELD_TURNS` cap. It also publishes each topic's live task set, which is
+  what `/tasks` and the hold cap both read.
 - **`agent/sdk_tasks.py`** — mirrors the CLI's `TaskCreate`/`TaskUpdate` pair into
   the todo vocabulary the streamer's checklist expects.
 - **`agent/sdk_translate.py`** — the SDK↔OpenCode vocabulary boundary: tool
@@ -172,6 +175,7 @@ alphabetically — the groups are the shape of the system.
 | Trust boundary / allowlist | `auth.py` + `bot.py:build_application` |
 | Choosing the agent runtime | `app.py` + `agent/` |
 | Scheduled tasks (ADR-0016) | `schedules.py` + `commands/schedule.py` + `store.py` |
+| Background work while a turn waits (ADR-0015/0017) | `agent/claude_sdk_backend.py` + `agent/sdk_tasks.py` + `commands/tasks.py` |
 | Live browser view (ADR-0006) | `vnc.py` + `server.py` + `browser-view.tsx` |
 
 ## Running it

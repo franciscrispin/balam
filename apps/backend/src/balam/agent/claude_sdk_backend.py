@@ -27,6 +27,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from claude_agent_sdk import (
@@ -52,6 +53,7 @@ from claude_agent_sdk import (
 from balam.agent.backend import TurnRequest
 from balam.agent.events import (
     AgentEvent,
+    BackgroundTask,
     BackgroundTasksChanged,
     PermissionRequested,
     QuestionAsked,
@@ -95,36 +97,55 @@ _SENTINEL = None
 #: topic. Comfortably longer than the CLI's own gap between queued prompts.
 _FOREIGN_RESULT_GRACE_S = 45.0
 
-#: Absolute cap on holding a turn open for background work it left running. The
-#: CLI kills its background tasks as the process winds down, and the process
-#: winds down when we close stdin — so the turn stays open while work is live
-#: (see ``run_turn``). One CLI process is ~200-500 MB here, so this bounds what a
-#: task that never finishes can pin: at the deadline the turn ends and its
-#: background work stops with it.
-_BACKGROUND_HOLD_S = 30 * 60.0
+#: How long a turn may sit *held* — the model idle, waiting on background work it
+#: left running (ADR-0015). Counted only while actually waiting: the clock is
+#: disarmed the moment the model produces again, so ordinary foreground work is
+#: never charged against it. Before ADR-0017 it was a deadline armed at the first
+#: hold and never reset, which once ended a live turn after running through 16
+#: minutes of foreground work and killed the CI watcher it was really waiting on.
+#:
+#: Hours, not minutes, because memory is bounded by ``_MAX_HELD_TURNS`` instead.
+#: A CI watch or a long build is exactly the work worth waiting on; anything
+#: meant to outlive the conversation should be detached with ``setsid``.
+_BACKGROUND_HOLD_S = 4 * 60 * 60.0
+
+#: How many topics may hold a turn open for background work at once. This is the
+#: real memory bound — one CLI process is ~200-500 MB and the VM has 23 GB — and
+#: it is what lets ``_BACKGROUND_HOLD_S`` be hours. Arming a hold past the cap
+#: ends the *longest-idle* hold instead (its tasks stop, and its topic is told by
+#: the usual turn-end notice), so a forgotten watcher cannot starve the topic
+#: being used right now.
+_MAX_HELD_TURNS = 3
 
 #: Appended to the ``claude_code`` system prompt. Background tasks are children
-#: of the CLI process, which the turn now keeps alive while any of them are
-#: running (see ``run_turn``) — so backgrounding is safe, and promising to report
-#: later is a promise the runtime can keep. The remaining limit is the
-#: ``_BACKGROUND_HOLD_S`` cap, which a genuinely long-lived service should escape
-#: with ``setsid`` (verified on this VM: a detached process gets its own session
-#: and survives).
+#: of the CLI process, which the turn keeps alive while any of them are running
+#: (see ``run_turn``) — so backgrounding is safe, and promising to report later is
+#: a promise the runtime can keep. It must describe the limits the runtime
+#: actually implements (``_BACKGROUND_HOLD_S`` while idle, ``_MAX_HELD_TURNS``
+#: across topics): the previous text promised a flat 30 minutes that was never
+#: what happened, and the agent budgeted against it. A genuinely long-lived
+#: service escapes both with ``setsid`` (verified on this VM: a detached process
+#: gets its own session and survives).
 _SYSTEM_PROMPT_APPEND = """
 ## Background work in this environment
 
 Work you start in the background — a `run_in_background` shell command, or a
-subagent you do not wait on — keeps running after you reply. The turn stays open
-while it runs, and when it finishes you are woken to report it, so telling the
-user "I'll report back when this lands" is a promise that will be kept. You do
-not need to hold the turn open yourself by waiting.
+subagent you do not wait on — keeps running after you reply, and the user can
+keep talking to you while it runs. The turn stays open, a message they send
+reaches you straight away, and when the work finishes you are woken to report it.
+So "I'll report back when this lands" is a promise the runtime keeps, and you do
+not need to hold the turn open by polling or sleeping yourself.
 
-Two limits are worth knowing:
+Three limits are worth knowing:
 
-- Background work is capped at 30 minutes. Past that the turn ends and anything
-  still running stops.
-- A service meant to outlive the conversation entirely (a dev server, a tunnel,
-  a watcher) should be detached instead, so nothing can reap it:
+- The wait is capped at 4 hours, counted only while you are idle. Past that the
+  turn ends and anything still running stops; the user is told which tasks were
+  stopped, so say up front what you are waiting for.
+- Only a few topics can wait like this at once. Starting a wait here may end the
+  longest-idle wait in another topic.
+- A service meant to outlive the conversation entirely (a dev server, a tunnel, a
+  watcher you want to survive the turn) should be detached instead, so nothing
+  can reap it:
 
       setsid nohup <command> > /tmp/<name>.log 2>&1 &
 
@@ -155,6 +176,26 @@ SendFileFactory = Callable[[int, int | None], "AgentTool | None"]
 QueryFn = Callable[..., AsyncIterator[Any]]
 
 
+@dataclass
+class _ActiveTurn:
+    """A topic's running turn, as much of it as anything *outside* the turn needs.
+
+    Two such readers, both on the bot's task rather than the turn's: ``/tasks``
+    reads ``tasks`` to answer "what is running right now", and a turn arming a
+    hold reads ``held_since`` across topics to pick which hold to evict.
+
+    ``end_now`` is the turn's own teardown, so an eviction takes exactly the same
+    path as a hold timeout — including the turn-end notice that names whatever
+    was still running.
+    """
+
+    tasks: tuple[BackgroundTask, ...] = ()
+    #: Loop time this hold started; ``None`` whenever the model is working, which
+    #: is what keeps foreground time off the hold clock.
+    held_since: float | None = None
+    end_now: Callable[[str], None] | None = None
+
+
 class ClaudeSdkBackend:
     """Drive the Claude Agent SDK as an :class:`~balam.agent.backend.AgentBackend`.
 
@@ -182,6 +223,19 @@ class ClaudeSdkBackend:
         # request_id -> future resolved by reply_permission / reply_question.
         self._pending_perms: dict[str, asyncio.Future[tuple[bool, str | None]]] = {}
         self._pending_questions: dict[str, asyncio.Future[list[list[str]] | None]] = {}
+        # Topic -> its running turn. Spans turns because the readers do: /tasks
+        # is answered on the bot's task, and the hold cap has to see every topic.
+        self._active: dict[tuple[int, int], _ActiveTurn] = {}
+
+    @staticmethod
+    def _topic_key(chat_id: int, thread_id: int | None) -> tuple[int, int]:
+        """Normalize a topic to a concrete pair, mirroring ``SessionStore`` — the
+        General topic has no ``message_thread_id`` and keys as thread 0."""
+        return (chat_id, 0 if thread_id is None else thread_id)
+
+    def background_tasks(self, chat_id: int, thread_id: int | None) -> tuple[BackgroundTask, ...]:
+        active = self._active.get(self._topic_key(chat_id, thread_id))
+        return active.tasks if active is not None else ()
 
     def set_send_file_factory(self, factory: SendFileFactory) -> None:
         """Wire the per-topic send_file tool factory once the bot is available
@@ -369,6 +423,15 @@ class ClaudeSdkBackend:
         # What the CLI has running right now, from its task lifecycle messages.
         # Read at the turn boundary to decide what would outlive the turn.
         live_tasks = LiveTasks()
+        # The same set, published on the backend so ``/tasks`` and the hold cap
+        # can see it without interrupting the turn. ``None`` when the caller gave
+        # no topic (unit tests), which simply opts out of both.
+        active: _ActiveTurn | None = None
+        active_key: tuple[int, int] | None = None
+        if turn.chat_id is not None:
+            active_key = self._topic_key(turn.chat_id, turn.thread_id)
+            active = _ActiveTurn()
+            self._active[active_key] = active
         # Per-streaming-message block accumulators (StreamEvent partials).
         cur_msg_id: str | None = None
         block_text: dict[int, str] = {}
@@ -443,39 +506,119 @@ class ClaudeSdkBackend:
             disarm_idle_guard()
             idle_guard = asyncio.create_task(expire())
 
-        # Absolute cap on how long the turn is held open for background work
-        # (below). Unlike the idle guard this is a deadline, not an
-        # inactivity timer: a task that never finishes must not pin the topic
-        # (and its CLI process) forever.
-        hold_watchdog: asyncio.Task[None] | None = None
-        held_for_background = False
+        def end_turn_now(reason: str) -> None:
+            """End the turn from outside the driver's message loop.
 
-        def disarm_hold_watchdog() -> None:
-            nonlocal hold_watchdog
+            Shared by the hold timeout and by eviction so both take one path:
+            refuse further follow-ups, release the input stream, and push the
+            turn-end events. ``run_turn``'s consumer breaks on the sentinel and
+            its ``finally`` tears the query down, which is what stops the
+            background work. Fully synchronous, so a caller mid-decision (the
+            evictor) cannot be interleaved with.
+            """
+            logger.warning("ending the held turn: %s", reason)
+            if active is not None:
+                active.held_since = None  # already ending; not an eviction target
+            if channel is not None:
+                channel.close()
+            outbound.put_nowait(None)
+            queue.put_nowait(TurnFinished())
+            queue.put_nowait(_SENTINEL)
+
+        if active is not None:
+            active.end_now = end_turn_now
+
+        # A turn is *held* when the model has answered but background work it
+        # started is still running (ADR-0015). Two things run for the duration:
+        # a watchdog capping the wait, and a pump that keeps the topic
+        # answerable while it waits (ADR-0017).
+        hold_watchdog: asyncio.Task[None] | None = None
+        hold_pump: asyncio.Task[None] | None = None
+
+        def disarm_hold() -> None:
+            """Leave the held state: the model is producing again, or the turn is
+            over. Stops the clock, so only idle time is ever charged to it."""
+            nonlocal hold_watchdog, hold_pump
             if hold_watchdog is not None:
                 hold_watchdog.cancel()
                 hold_watchdog = None
+            if hold_pump is not None:
+                hold_pump.cancel()
+                hold_pump = None
+            if active is not None:
+                active.held_since = None
 
-        def arm_hold_watchdog() -> None:
-            nonlocal hold_watchdog, held_for_background
+        def note_model_active() -> None:
+            """The model is producing, so the turn is working rather than waiting.
+
+            Also what makes a ``ResultMessage`` ours rather than the CLI's own
+            (see :func:`_is_foreign_result`), which is why the two moves belong
+            together — every message that proves the model ran ends the hold.
+            """
+            nonlocal model_called
+            model_called = True
+            disarm_hold()
+
+        def evict_oldest_hold() -> None:
+            """Keep at most ``_MAX_HELD_TURNS`` topics waiting at once.
+
+            The memory bound is the number of held CLI processes, not how long
+            any one of them waits — which is what lets the wait be hours. The
+            longest-idle hold goes first: it is the one least likely to still be
+            wanted, and ending it tells its topic exactly what stopped.
+            """
+            held = [
+                entry
+                for entry in self._active.values()
+                if entry.held_since is not None and entry.end_now is not None
+            ]
+            if len(held) <= _MAX_HELD_TURNS:
+                return
+            for entry in sorted(held, key=lambda e: e.held_since or 0.0)[
+                : len(held) - _MAX_HELD_TURNS
+            ]:
+                if entry is active or entry.end_now is None:
+                    continue
+                entry.end_now(f"another topic needs to wait and {_MAX_HELD_TURNS} already are")
+
+        def arm_hold() -> None:
+            nonlocal hold_watchdog, hold_pump
             if hold_watchdog is not None:
-                return  # already counting down; the cap is from the first hold
-            held_for_background = True
+                return  # already waiting; the clock keeps running
+            if active is not None:
+                active.held_since = loop.time()
 
             async def expire() -> None:
                 await asyncio.sleep(_BACKGROUND_HOLD_S)
-                logger.warning(
-                    "background work still running after %ss; ending the turn "
-                    "(its tasks stop with the agent process)",
-                    _BACKGROUND_HOLD_S,
+                end_turn_now(
+                    f"background work still running after {_BACKGROUND_HOLD_S}s "
+                    "(its tasks stop with the agent process)"
                 )
-                if channel is not None:
-                    channel.close()
-                outbound.put_nowait(None)
-                await queue.put(TurnFinished())
-                await queue.put(_SENTINEL)
+
+            async def pump() -> None:
+                """Forward follow-ups for as long as the turn is held.
+
+                No step boundary is coming — the model already answered — so the
+                ResultMessage branch's ``take`` would not run until a background
+                task happened to finish, leaving the topic mute for as long as
+                the wait lasts. ``take`` → ``put_nowait`` is one synchronous
+                block, so cancelling this pump when the model wakes can never
+                strand a follow-up it had already taken.
+                """
+                if channel is None:
+                    return
+                while True:
+                    await channel.wait()
+                    if channel.closed:
+                        return
+                    follow = channel.take()
+                    if follow is None:
+                        continue
+                    outbound.put_nowait((follow.prompt, follow.files))
 
             hold_watchdog = asyncio.create_task(expire())
+            hold_pump = asyncio.create_task(pump())
+            evict_oldest_hold()
 
         async def ask_user_question(
             input_data: dict[str, Any],
@@ -655,6 +798,8 @@ class ClaudeSdkBackend:
                         else:
                             changed = live_tasks.notified(message)
                         if changed:
+                            if active is not None:
+                                active.tasks = live_tasks.tasks
                             await queue.put(BackgroundTasksChanged(tasks=live_tasks.tasks))
 
                     elif isinstance(message, SystemMessage):
@@ -666,7 +811,7 @@ class ClaudeSdkBackend:
                         ev = message.event
                         etype = ev.get("type")
                         if etype == "message_start":
-                            model_called = True
+                            note_model_active()
                             cur_msg_id = (ev.get("message") or {}).get("id")
                             block_text.clear()
                         elif etype == "content_block_delta":
@@ -696,7 +841,7 @@ class ClaudeSdkBackend:
 
                     elif isinstance(message, AssistantMessage):
                         maybe_session(message.session_id)
-                        model_called = True
+                        note_model_active()
                         for block in message.content:
                             if isinstance(block, ToolUseBlock):
                                 wire = _wire_tool(block.name)
@@ -771,6 +916,12 @@ class ClaudeSdkBackend:
                         # either taken here or bounced by offer() to the next turn.
                         follow = channel.take() if channel is not None else None
                         if follow is not None:
+                            # Work is resuming on the user's message, so this turn
+                            # is no longer merely waiting. Without this the hold
+                            # clock armed by an earlier step would keep running
+                            # through the whole follow-up — and could end the turn
+                            # in the gap before the model's first token.
+                            disarm_hold()
                             outbound.put_nowait((follow.prompt, follow.files))
                             await queue.put(TurnStepFinished())
                             continue
@@ -783,7 +934,7 @@ class ClaudeSdkBackend:
                         # TurnStepFinished commits the answer so far, so the report
                         # lands in the topic as its own message.
                         if live_tasks.tasks:
-                            arm_hold_watchdog()
+                            arm_hold()
                             await queue.put(TurnStepFinished())
                             continue
                         if channel is not None:
@@ -796,7 +947,7 @@ class ClaudeSdkBackend:
                 await queue.put(TurnFailed(message=str(exc) or exc.__class__.__name__))
             finally:
                 disarm_idle_guard()
-                disarm_hold_watchdog()
+                disarm_hold()
                 # Refuse further mid-turn offers (they fall back to the bot's turn
                 # queue) and release the input stream so it can close stdin cleanly.
                 if channel is not None:
@@ -817,7 +968,13 @@ class ClaudeSdkBackend:
                 yield event
         finally:
             disarm_idle_guard()
-            disarm_hold_watchdog()
+            disarm_hold()
+            # Stop publishing this topic's tasks: the turn is over, so nothing is
+            # running any more and it must not stay an eviction candidate. Guarded
+            # on identity so a turn that already started in this topic isn't
+            # unpublished by a late ``finally`` from the previous one.
+            if active_key is not None and self._active.get(active_key) is active:
+                del self._active[active_key]
             if not driver_task.done():
                 driver_task.cancel()
             # Unblock any can_use_tool still awaiting a decision so the cancelled
