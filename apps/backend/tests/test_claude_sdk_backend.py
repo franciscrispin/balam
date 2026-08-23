@@ -990,6 +990,41 @@ async def test_task_without_description_falls_back_to_its_id() -> None:
     assert reported[-1].tasks == (BackgroundTask(task_id="b2", description="b2", task_type=None),)
 
 
+async def test_artifact_watch_task_is_never_reported() -> None:
+    # The Artifact tool's live-updates watch never goes terminal; treating it
+    # like a real background task would pin every turn that publishes an
+    # artifact for the full ADR-0015 hold cap.
+    reported = await _task_events(
+        [
+            _init(),
+            _started(
+                "b1",
+                "live updates for artifact https://claude.ai/code/artifact/x "
+                "(auto-armed on publish)",
+            ),
+            _result(),
+        ]
+    )
+    assert reported == []
+
+
+async def test_turn_ends_normally_with_only_an_artifact_watch_running() -> None:
+    events = await _collect(
+        ClaudeSdkBackend(
+            query_fn=_fake_query(
+                [
+                    _init(),
+                    _started("b1", "live updates for artifact https://claude.ai/code/artifact/x"),
+                    _result(),
+                ]
+            )
+        ),
+        _turn(),
+    )
+    assert any(isinstance(e, TurnFinished) for e in events)
+    assert not any(isinstance(e, TurnStepFinished) for e in events)
+
+
 async def test_terminal_task_update_clears_the_task() -> None:
     reported = await _task_events(
         [_init(), _started("b1", "Build"), _updated("b1", status="completed"), _result()]
