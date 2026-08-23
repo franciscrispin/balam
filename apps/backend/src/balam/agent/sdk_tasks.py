@@ -35,6 +35,19 @@ _TASK_TOOLS = frozenset({"TaskCreate", "TaskUpdate"})
 #: The task id a TaskCreate result announces ("Task #12 created successfully…").
 _TASK_ID_RE = re.compile(r"#(\d+)")
 
+#: The Artifact tool's live-updates watch (armed on every publish) surfaces as a
+#: task through this same lifecycle, but unlike a real background job it is
+#: meant to run for the rest of the session and never reaches a terminal state.
+#: Counting it toward ADR-0015's turn-hold decision pins the topic for the full
+#: 30-minute cap after the real work is already done, then reports it as cut
+#: short — which is misleading (there is nothing to `setsid` here). It must
+#: never enter ``LiveTasks``.
+_ARTIFACT_WATCH_RE = re.compile(r"^live updates for artifact\b", re.IGNORECASE)
+
+
+def _is_artifact_watch(description: str) -> bool:
+    return bool(_ARTIFACT_WATCH_RE.match(description.strip()))
+
 
 class LiveTasks:
     """The tasks the CLI currently has running, tracked from its task messages.
@@ -50,6 +63,10 @@ class LiveTasks:
     Foreground work (a subagent the model waits on) shows up here too and simply
     goes terminal before the turn ends, which is why callers only need to read
     this at a turn boundary to learn what would outlive the turn.
+
+    The Artifact tool's live-updates watch is deliberately excluded (see
+    ``_is_artifact_watch``): it never goes terminal, so it would otherwise pin
+    every turn that publishes an artifact for the full hold cap.
     """
 
     def __init__(self) -> None:
@@ -64,6 +81,8 @@ class LiveTasks:
         if not task_id:
             return False
         description = (message.description or "").strip() or task_id
+        if _is_artifact_watch(description):
+            return False
         self._tasks[task_id] = BackgroundTask(
             task_id=task_id,
             description=description,
