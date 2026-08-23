@@ -40,10 +40,20 @@ if [ -n "${DIMS:-}" ] && [[ "$DIMS" == *x* ]]; then
   H="${DIMS#*x}"
   CFG_DIR="$PROJECT_ROOT/.playwright"
   mkdir -p "$CFG_DIR"
+  # Playwright publishes no Chromium build for linux/arm64, so on such a host
+  # (the Raspberry Pi) it has to be pointed at the distro's chromium — without
+  # this, `open` fails with "Chromium distribution 'chrome' is not found".
+  # Omitted when no system chromium is installed, leaving Playwright's own
+  # download in charge. Override with CHROMIUM_PATH.
+  CHROMIUM_PATH="${CHROMIUM_PATH:-$(command -v chromium || command -v chromium-browser || true)}"
+  EXEC_PATH_JSON=""
+  if [ -n "$CHROMIUM_PATH" ]; then
+    EXEC_PATH_JSON=", \"executablePath\": \"$CHROMIUM_PATH\""
+  fi
   cat > "$CFG_DIR/cli.config.json" <<EOF
 {
   "browser": {
-    "launchOptions": { "args": ["--window-position=0,0", "--window-size=${W},${H}"] },
+    "launchOptions": { "args": ["--window-position=0,0", "--window-size=${W},${H}"]${EXEC_PATH_JSON} },
     "contextOptions": { "viewport": null }
   }
 }
