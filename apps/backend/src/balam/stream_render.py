@@ -229,9 +229,11 @@ def _render_background_notice(tasks: Sequence[BackgroundTask]) -> str:
     """The turn-end notice naming background work that was cut short.
 
     The turn is held open while background work runs, so reaching turn end with
-    tasks still live means the backend's hold cap expired and the CLI process —
-    and with it these tasks — is being torn down. That is worth saying: the user
-    was likely told a report was coming, and it is not.
+    tasks still live means the wait is over before the work was: the hold ran out
+    of time, or the topic was evicted to let another one wait (ADR-0017), or the
+    turn failed. Either way the CLI process — and with it these tasks — is being
+    torn down. That is worth saying: the user was likely told a report was coming,
+    and it is not.
     """
     if not tasks:
         return ""

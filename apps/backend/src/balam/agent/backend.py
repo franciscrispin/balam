@@ -17,12 +17,13 @@ implementations satisfy this contract:
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from balam.agent.events import AgentEvent
+from balam.agent.events import AgentEvent, BackgroundTask
 from balam.attachments import PromptFile
 
 
@@ -39,23 +40,40 @@ class FollowUpChannel:
     """Race-free hand-off of mid-turn messages from the bot into a running turn
     (Claude Code-style follow-ups, ADR-0013).
 
-    The bot ``offer``s a message; the backend ``take``s pending messages one per
-    step boundary and ``close``s the channel when the turn goes idle. All three
-    are synchronous, single-block operations, so under the event loop's
-    cooperative scheduling (no ``await`` inside) they never interleave: a message
-    is either accepted into the live turn or bounced (``offer`` → ``False``) once
-    the backend has closed, never both and never lost. A bounced message falls
-    back to the bot's normal turn queue and runs as the next turn.
+    The bot ``offer``s a message; the backend ``take``s pending messages and
+    ``close``s the channel when the turn goes idle. All three are synchronous,
+    single-block operations, so under the event loop's cooperative scheduling (no
+    ``await`` inside) they never interleave: a message is either accepted into the
+    live turn or bounced (``offer`` → ``False``) once the backend has closed,
+    never both. A bounced message falls back to the bot's normal turn queue and
+    runs as the next turn.
 
-    Deliberately not an ``asyncio.Queue``: the backend must be the *only* consumer
-    and must decide "forward next vs close" atomically at a step boundary. A queue
-    whose items are ``get()``-en by a separate input-stream task would drain
-    behind the backend's back and reopen the very race this closes.
+    The backend takes from two places (ADR-0017). At a step boundary it takes
+    one, atomically deciding "forward next vs close". While the turn is *held*
+    open for background work no step boundary is coming — the model has already
+    answered — so it also waits on :meth:`wait` and forwards as soon as a message
+    lands. Without that second path a message offered during a hold sits here
+    until a background task happens to finish.
+
+    Accepted is not delivered: a turn can end (hold timeout, error) with messages
+    still pending. :meth:`drain` hands those back so the bot can re-queue them
+    rather than lose what it already acknowledged.
+
+    Deliberately not an ``asyncio.Queue``: the backend must be the *only*
+    consumer, and both of its take paths must be able to decide "forward vs
+    close" without an ``await`` in the middle. A queue whose items are
+    ``get()``-en by a separate input-stream task would drain behind the backend's
+    back and reopen the very race this closes.
     """
 
     def __init__(self) -> None:
         self._pending: deque[FollowUp] = deque()
         self._closed = False
+        # Set whenever something is waiting (or the channel closed), so a held
+        # turn can await an arrival instead of polling. Constructed without a
+        # running loop on purpose — asyncio.Event has had no loop affinity since
+        # 3.10, and the channel is built by the bot before the turn task starts.
+        self._arrival = asyncio.Event()
 
     def offer(self, follow_up: FollowUp) -> bool:
         """Bot side: hand a mid-turn message to the running turn. Returns
@@ -64,17 +82,42 @@ class FollowUpChannel:
         if self._closed:
             return False
         self._pending.append(follow_up)
+        self._arrival.set()
         return True
 
     def take(self) -> FollowUp | None:
         """Backend side: pop the next pending follow-up, or ``None`` if none is
         waiting. Never awaits."""
-        return self._pending.popleft() if self._pending else None
+        if not self._pending:
+            self._arrival.clear()
+            return None
+        follow_up = self._pending.popleft()
+        if not self._pending:
+            self._arrival.clear()
+        return follow_up
+
+    async def wait(self) -> None:
+        """Backend side: block until a follow-up is pending or the channel closes.
+
+        Returning does not guarantee a message — :meth:`take` may still find the
+        queue empty (the closing wake-up carries none), so callers must re-check.
+        """
+        await self._arrival.wait()
+
+    def drain(self) -> list[FollowUp]:
+        """Take every still-pending follow-up at once, for a caller that is
+        giving up on delivering them into this turn."""
+        pending = list(self._pending)
+        self._pending.clear()
+        self._arrival.clear()
+        return pending
 
     def close(self) -> None:
         """Backend side: refuse further offers (the turn is ending). Never
-        awaits, so the ``take``-empty → ``close`` decision is one atomic block."""
+        awaits, so the ``take``-empty → ``close`` decision is one atomic block.
+        Wakes any :meth:`wait` so a held turn's waiter can unwind."""
         self._closed = True
+        self._arrival.set()
 
     @property
     def closed(self) -> bool:
@@ -174,4 +217,13 @@ class AgentBackend(Protocol):
 
     async def abort(self, session_id: str, *, directory: str) -> None:
         """Cancel the turn running in ``session_id`` (best-effort)."""
+        ...
+
+    def background_tasks(self, chat_id: int, thread_id: int | None) -> tuple[BackgroundTask, ...]:
+        """What the topic's turn currently has running in the background.
+
+        Empty when the topic has no turn, or on a backend with no background-task
+        concept (OpenCode). Synchronous and read-only: ``/tasks`` reads the live
+        set the running turn keeps updated, so it must not have to interrupt it.
+        """
         ...

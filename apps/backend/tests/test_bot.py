@@ -9,6 +9,7 @@ from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, JobQueue, MessageHandler
 
 from balam import schedules
+from balam.agent.events import BackgroundTask
 from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuestions
 from balam.auth import is_owner
@@ -43,6 +44,7 @@ from balam.commands.session import (
     handle_rename,
     handle_status,
 )
+from balam.commands.tasks import handle_tasks
 from balam.commands.views import handle_artifacts
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
@@ -2807,3 +2809,121 @@ async def test_lone_photo_is_not_debounced(monkeypatch) -> None:
     turn = turns.get(SUPERGROUP, 5)
     assert turn is not None
     await turn.task
+
+
+# --- ADR-0017: /tasks, and follow-ups a turn accepted but never delivered ---
+
+
+async def test_tasks_reports_nothing_running_in_an_idle_topic() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, *_ = _session_cmd_env(message)
+
+    await handle_tasks(update, context)
+
+    reply = message.replies[-1]
+    assert "No background tasks running" in reply
+    assert "still working" not in reply
+
+
+async def test_tasks_separates_a_working_turn_from_backgrounded_work() -> None:
+    # "Nothing in the background" and "nothing happening" are different answers,
+    # and the second is the one that would worry the owner.
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, _router, _opencode, turns = _session_cmd_env(message)
+    task = _sleeping_turn(turns, SUPERGROUP, 5, "ses_running")
+
+    await handle_tasks(update, context)
+
+    assert "The turn is still working." in message.replies[-1]
+    task.cancel()
+
+
+async def test_tasks_lists_what_is_running_right_now() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, *_ = _session_cmd_env(message)
+    context.application.bot_data["backend"] = SimpleNamespace(
+        background_tasks=lambda chat_id, thread_id: (
+            BackgroundTask(task_id="b1", description="Watch CI on both PRs"),
+            BackgroundTask(task_id="b2", description="Wait for PR 36 CI to settle"),
+        )
+    )
+
+    await handle_tasks(update, context)
+
+    reply = message.replies[-1]
+    assert "2 background tasks running" in reply
+    assert "• Watch CI on both PRs" in reply
+    assert "• Wait for PR 36 CI to settle" in reply
+
+
+async def test_follow_up_the_turn_never_delivered_runs_as_the_next_turn(monkeypatch) -> None:
+    # offer() returning True is a promise: the bot reacts and does NOT queue the
+    # message. A turn that ends before delivering it (hold timeout, eviction,
+    # agent error) used to drop it silently — nothing drained the channel.
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+    prompts: list[str] = []
+
+    async def fake_stream_reply(*, prompt: str, follow_ups=None, **_: object) -> None:
+        prompts.append(prompt)
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+            # Ends here without ever taking the follow-up, exactly as the hold
+            # timeout does: the channel still holds an accepted message.
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    router = _router()
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+    context.application.bot_data["backend"] = SimpleNamespace(supports_streaming_input=True)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    running = turns.get(SUPERGROUP, 5)
+
+    message.text = "second"
+    await _handle_message(update, context)
+    assert turns.queue_len(SUPERGROUP, 5) == 0  # accepted into the live turn
+
+    gate.set()
+    await running.task
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task
+
+    assert prompts == ["first", "second"]
+
+
+async def test_undelivered_follow_ups_keep_the_order_they_were_sent(monkeypatch) -> None:
+    gate = asyncio.Event()
+    first_started = asyncio.Event()
+    prompts: list[str] = []
+
+    async def fake_stream_reply(*, prompt: str, follow_ups=None, **_: object) -> None:
+        prompts.append(prompt)
+        if prompt == "first":
+            first_started.set()
+            await gate.wait()
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    router = _router()
+    message = _text_msg(SUPERGROUP, 5, "first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+    context.application.bot_data["backend"] = SimpleNamespace(supports_streaming_input=True)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(first_started.wait(), 1)
+    running = turns.get(SUPERGROUP, 5)
+
+    for text in ("second", "third"):
+        message.text = text
+        await _handle_message(update, context)
+
+    gate.set()
+    await running.task
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task
+
+    assert prompts == ["first", "second", "third"]

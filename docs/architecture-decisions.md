@@ -787,6 +787,106 @@ not when its turn ends, so a crash mid-turn cannot re-fire the whole thing.
 
 ---
 
+## ADR-0017: A held turn stays answerable, and holds are bounded by count
+
+Status: Accepted Date: 2026-08-17 Amends: ADR-0015
+
+### Context
+
+ADR-0015 holds a turn open while its background work runs. A live session
+(`9999a2fc-…`, 2026-08-16) exposed three defects in how that hold behaved.
+
+**Messages stalled behind a hold.** `FollowUpChannel.take()` ran in exactly one
+place: at a `ResultMessage` boundary. While held, the model has already answered
+and no `ResultMessage` is coming, so a message offered into the live turn sat in
+the channel until a background task happened to finish. That session held for
+14m04s with nothing forwarded. Interactive Claude Code has no such gate — a
+prompt typed while background work runs is accepted straight away — so this read
+as Balam-specific breakage, and it was.
+
+**An accepted message could be lost.** `offer()` returns `True` while the channel
+is open, so the bot reacts 👀 and does *not* queue the message. `close()` only
+flipped a flag. A message accepted during a hold that the turn never reached was
+dropped silently — on the hold timeout, on the idle-guard timeout, and on turn
+error.
+
+**The cap measured the wrong thing.** `_BACKGROUND_HOLD_S` was armed at the first
+hold and never disarmed until teardown, so it counted foreground work too. In
+that session it was armed at 14:37:59 while the model was working and fired at
+15:07:59 — killing a CI watcher started at 14:53:40 after 14 of its 30 minutes.
+The agent had been told "background work is capped at 30 minutes", which was not
+the rule the runtime implemented.
+
+Behind all three: the cap existed to bound **memory** (a CLI process is
+~200-500 MB, the VM has 23 GB), but time is a poor proxy for memory. It cut short
+work that was still wanted while doing nothing about several topics holding
+processes at once.
+
+### Decision
+
+**1. A hold is interruptible.** While held, the backend also waits on the
+follow-up channel (`FollowUpChannel.wait()`) and forwards a message the moment it
+lands, instead of waiting for a step boundary that is not coming. `take()` →
+`put_nowait()` is one synchronous block, so cancelling that pump when the model
+wakes can never strand a message it had already taken. The channel keeps its
+single-consumer rule: the pump runs only while held, and ends before the
+`ResultMessage` branch can run again.
+
+**2. The hold clock measures waiting, not the turn.** It is disarmed wherever the
+model proves it is producing (`note_model_active()`, the same two points that
+decide `_is_foreign_result`) and at a folded-in follow-up. Each stretch of actual
+waiting gets the full budget; foreground work is never charged to it.
+
+**3. Memory is bounded by count, not by time.** `_MAX_HELD_TURNS` (3) caps how
+many topics may wait at once; arming one past the cap ends the longest-idle hold
+through the same teardown a timeout uses, so its topic gets the usual turn-end
+notice naming what stopped. With the real resource bounded directly,
+`_BACKGROUND_HOLD_S` becomes 4 hours — long enough for the CI watch or the slow
+build that is the whole point of waiting.
+
+**4. Accepted means recoverable.** `drain()` hands back anything still pending
+when a turn ends, and `start_turn` re-resolves each into a job at the *head* of
+the topic queue, so it runs next and in the order it was sent. Not after
+`/cancel`: the owner stopped that topic on purpose. Each is resolved fresh rather
+than copied, so a session minted during the finished turn is the one it runs
+against.
+
+**5. `/tasks` reports what is running.** The terminal shows a running background
+task in the session; a topic had nowhere to put that, so the only report was the
+turn-end notice naming what got *stopped*. The backend publishes each topic's
+live set — the same data the hold cap reads — and `/tasks` reads it without
+interrupting the turn. Empty on OpenCode, which has no background-task concept.
+
+**Rejected: decoupling the CLI process from the turn.** The bigger fix is a
+per-topic session that outlives its turn, so the turn can end while tasks keep
+running. It would need a new out-of-turn delivery path to open a Telegram message
+for an unsolicited task report, and a new meaning for `/cancel`. It buys a topic
+that *looks* idle while it waits; it does not buy anything the four changes above
+do not already deliver, since a held turn now answers messages as promptly as an
+idle one. Not worth the rewrite until something needs the process to survive a
+turn ending for another reason.
+
+### Consequences
+
+- **The system prompt now states the rule the runtime implements** — capped
+  while idle, a few topics at a time, `setsid` for anything that must outlive the
+  conversation. The old text promised a flat 30 minutes that was never what
+  happened.
+- **A topic can hold a CLI process for hours.** That is the point, and
+  `_MAX_HELD_TURNS` is what makes it affordable. Both constants are module-level
+  in `claude_sdk_backend.py`; they are the two dials for this trade.
+- **Eviction is visible, not silent.** Ending the longest-idle hold reuses the
+  turn-end notice, so that topic is told which tasks stopped rather than simply
+  going quiet.
+- **`ADR-0015`'s "delivery falls out of not hanging up" still holds.** Nothing
+  here changes how a finished task's report reaches the topic; it changes how
+  long the turn is willing to wait, and whether it can still hear the owner while
+  it does.
+- **A held turn is still one turn.** `/cancel` still ends it and its background
+  work, and the streamer still commits each step's answer as its own message.
+
+---
+
 ## Summary
 
 | ADR  | Decision                                                                    | Core reason                                                     |
@@ -806,3 +906,4 @@ not when its turn ends, so a crash mid-turn cannot re-fire the whole thing.
 | 0014 | Pluggable agent backend (OpenCode or the Claude Agent SDK) via `AGENT_BACKEND` | One seam, normalized events; SDK = Claude models + per-turn config |
 | 0015 | Hold an SDK turn open while its background work runs (amends 0014)          | Closing stdin kills background tasks; holding also delivers their report |
 | 0016 | Scheduled prompts are stored in SQLite (`/schedule`), not `config.yaml`     | Schedules are user data; unattended turns deny, missed runs catch up |
+| 0017 | A held turn stays answerable; holds bounded by count, not time (amends 0015) | Messages must not stall behind background work; memory is the real bound |

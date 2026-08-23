@@ -83,6 +83,7 @@ from balam.commands.session import (
     handle_rename,
     handle_status,
 )
+from balam.commands.tasks import handle_tasks
 from balam.commands.views import handle_artifacts, handle_browser, handle_diff
 from balam.config import Config
 from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
@@ -240,6 +241,7 @@ BOT_COMMANDS = [
     BotCommand("model", "Show or set this topic's model override"),
     BotCommand("effort", "Show or set this topic's effort override"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
+    BotCommand("tasks", "List the background work running in this topic"),
     BotCommand("context", "List contexts, or /context <name> [first message] to open a topic"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
@@ -327,6 +329,7 @@ def build_application(
     app.add_handler(CommandHandler("model", handle_model, filters=allowed))
     app.add_handler(CommandHandler("effort", handle_effort, filters=allowed))
     app.add_handler(CommandHandler("cancel", handle_cancel, filters=allowed))
+    app.add_handler(CommandHandler("tasks", handle_tasks, filters=allowed))
     app.add_handler(CommandHandler("context", handle_context, filters=allowed))
     app.add_handler(CommandHandler("diff", handle_diff, filters=allowed))
     app.add_handler(CommandHandler("browser", handle_browser, filters=allowed))

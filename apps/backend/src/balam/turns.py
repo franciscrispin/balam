@@ -133,6 +133,16 @@ class TurnRegistry:
         queue.append(job)
         return len(queue)
 
+    def enqueue_front(self, chat_id: int, thread_id: int | None, job: TurnJob) -> None:
+        """Put ``job`` at the *head* of the topic's queue.
+
+        For a message that was already accepted into a turn and is only being
+        re-queued because that turn ended before delivering it (see
+        :func:`recover_undelivered`). It was sent before anything else waiting,
+        so it runs before them and the topic keeps the order the user typed."""
+        queue = self._queues.setdefault(self._key(chat_id, thread_id), deque())
+        queue.appendleft(job)
+
     def pop_next(self, chat_id: int, thread_id: int | None) -> TurnJob | None:
         """Remove and return the topic's next queued job, or ``None`` if empty."""
         key = self._key(chat_id, thread_id)
@@ -181,6 +191,45 @@ async def _ack_follow_up(message: Message) -> None:
         await message.set_reaction(FOLLOW_UP_REACTION)
     except Exception:
         logger.debug("could not react to folded-in follow-up", exc_info=True)
+
+
+async def recover_undelivered(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: int | None,
+    follow_ups: FollowUpChannel | None,
+) -> list[TurnJob]:
+    """Rebuild jobs for follow-ups a turn accepted but never delivered.
+
+    ``offer`` returning ``True`` is a promise to the user — the bot reacts with
+    :data:`FOLLOW_UP_REACTION` and does *not* queue the message. Delivery happens
+    later, at a step boundary or while the turn is held (ADR-0017), so a turn that
+    ends first (hold timeout, eviction, agent error) would silently drop a message
+    it had already acknowledged.
+
+    Each one is resolved fresh rather than copied from the finished turn's job:
+    a session minted *during* that turn is the one these should run against, and
+    the model/effort a queued job runs under should be the topic's when it runs.
+    """
+    if follow_ups is None:
+        return []
+    pending = follow_ups.drain()
+    if not pending:
+        return []
+    logger.warning("recovering %d follow-up(s) the turn accepted but never delivered", len(pending))
+    jobs: list[TurnJob] = []
+    for follow_up in pending:
+        job = await resolve_turn_job(
+            context,
+            chat_id,
+            thread_id,
+            follow_up.prompt,
+            title=topic_title(None, thread_id),
+            files=follow_up.files,
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
 
 
 async def submit_turn(
@@ -394,11 +443,23 @@ def start_turn(
             logger.exception("failed to handle message")
             await notify_error(context.bot, chat_id, thread_id, exc)
         finally:
+            # Anything the turn accepted but never delivered becomes a job again,
+            # resolved before the atomic block below because resolving awaits.
+            # Not after a ``/cancel``: the owner stopped this topic on purpose,
+            # so replaying a message into it would be the opposite of that.
+            recovered = (
+                []
+                if cancelled
+                else await recover_undelivered(context, chat_id, thread_id, follow_ups)
+            )
             # Release the slot and hand it straight to the next queued message.
             # clear → pop → start_turn run without an ``await`` between them, so
             # the slot never blinks empty and a concurrent message can't slip a
-            # second turn onto the same session.
+            # second turn onto the same session. Recovered jobs go to the head in
+            # reverse, so the queue keeps the order the messages were sent in.
             turns.clear(chat_id, thread_id, task)
+            for recovered_job in reversed(recovered):
+                turns.enqueue_front(chat_id, thread_id, recovered_job)
             next_job = None if cancelled else turns.pop_next(chat_id, thread_id)
             if next_job is not None:
                 start_turn(context, chat_id, thread_id, next_job)

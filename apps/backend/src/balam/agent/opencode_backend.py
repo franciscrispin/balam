@@ -28,6 +28,7 @@ from typing import Any
 from balam.agent.backend import TurnRequest
 from balam.agent.events import (
     AgentEvent,
+    BackgroundTask,
     PermissionRequested,
     QuestionAsked,
     ReasoningUpdated,
@@ -171,6 +172,12 @@ class OpenCodeBackend:
 
     async def abort(self, session_id: str, *, directory: str) -> None:
         await self._opencode.abort_session(session_id, directory=directory)
+
+    def background_tasks(self, chat_id: int, thread_id: int | None) -> tuple[BackgroundTask, ...]:
+        # OpenCode has no background-task concept: a turn ends when the prompt is
+        # answered and nothing outlives it. Always empty, so /tasks reports the
+        # same "nothing running" it would for an idle topic.
+        return ()
 
     async def reply_permission(
         self,

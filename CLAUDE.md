@@ -19,7 +19,9 @@ normalized `balam.agent.events` vocabulary, so the streamer/router/permissions
 stay backend-agnostic. SDK mode runs Claude models (a context `model` is then a
 bare Claude id) and **holds a turn open while background work it started is still
 running** (ADR-0015) — closing stdin would kill that work, and staying connected
-is also what lets the CLI deliver the finished task's report into the topic.
+is also what lets the CLI deliver the finished task's report into the topic. A
+held turn stays answerable and the wait is bounded by how many topics may hold at
+once rather than by a clock (ADR-0017); `/tasks` shows what is running.
 
 > Status: core features built — the bot↔agent round-trip over forum topics,
 > workspace contexts + `/context`, the Mini App (diff viewer, markdown
@@ -106,7 +108,7 @@ full map; the load-bearing ones:
 - **Telegram surface:** `bot.py` is *only* the plain-message path plus the
   registrar — it builds the PTB app, fills `bot_data`, and wires handlers.
   Handlers live in `commands/` (`session.py`, `views.py`, `delete.py`,
-  `schedule.py`), `callbacks.py` (approval/question taps), `pickers.py` (the
+  `schedule.py`, `tasks.py`), `callbacks.py` (approval/question taps), `pickers.py` (the
   paged multi-select shared by `/delete` and `/schedule cancel`), `topics.py`
   (naming/opening/linking topics), `message_text.py` (forward/reply/quote
   gestures → agent-visible text). **Nothing imports `bot.py`** — keep it that way.
@@ -132,8 +134,8 @@ full map; the load-bearing ones:
   ADR-0006), `agent_tools.py` (agent-facing `send_file`).
 
 Slash commands (registered in `bot.py`'s `BOT_COMMANDS`, handled in `commands/`):
-`/new` `/rename` `/status` `/model` `/effort` `/cancel` `/context` `/diff`
-`/browser` `/artifacts` `/delete` `/schedule`. Anything *not* in that list falls
+`/new` `/rename` `/status` `/model` `/effort` `/cancel` `/tasks` `/context`
+`/diff` `/browser` `/artifacts` `/delete` `/schedule`. Anything *not* in that list falls
 through a catch-all handler and is forwarded verbatim to the agent, so a Claude
 slash command like `/goal` reaches it instead of being dropped.
 
