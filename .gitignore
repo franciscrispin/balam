@@ -19,6 +19,9 @@ config.yaml
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
 
 # Python backend (apps/backend, uv)
 __pycache__/
