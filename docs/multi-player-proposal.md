@@ -56,16 +56,16 @@ The rules the design must satisfy, stated implementation-free so they can be con
 | --- | --- |
 | Topic→session store | `topic_sessions`, `topic_auto_names`, `topic_overrides` all have `(chat_id, thread_id)` composite PKs (`store.py:59-99`); every query passes `chat_id` |
 | Schedules | `schedules.chat_id NOT NULL` (`store.py:103-119`); boot registration walks **all** chats (`store.py:419-426`); fires post into their own chat |
-| Turn concurrency | `TurnRegistry` locks/queues per `(chat_id, thread_key)` (`turns.py:94-155`) — different topics and different chats already run concurrently |
+| Turn concurrency | `TurnRegistry` locks/queues per `(chat_id, thread_key)` (`turns.py:94-167`) — different topics and different chats already run concurrently |
 | Model/effort | Overrides stored on each chat's General row (`router.py:30-34, 149-173`) — per-chat, so per-user under chat-as-tenant |
 | send_file | Bound per topic in both backends (`agent_tools.py:190-235`, `app.py:122-135`) |
 | PTB filters | `filters.User` / `filters.Chat` accept id lists — the mechanism is multi-ready; only the config type is not |
 
 ### 2.2 The four real gaps
 
-**Gap 1 — auth is two scalars.** `allowed_telegram_user_id: int` and `allowed_telegram_chat_id: int | None` (`config.py:50,54`), read by the message filters (`bot.py:320-322`), `auth.py`, four *hand-inlined* copies of the callback check in `callbacks.py` (62-68, 103-108, 153-158, 197-203), the Mini App auth (`webapp_auth.py:134-136`), and the VNC WebSocket (`vnc.py:83`). A single chat id cannot express two supergroups; a single user id cannot express two humans.
+**Gap 1 — auth is two scalars.** `allowed_telegram_user_id: int` and `allowed_telegram_chat_id: int | None` (`config.py:50,54`), read by the message filters (`bot.py:322-324`), `auth.py`, four *hand-inlined* copies of the callback check in `callbacks.py` (62-68, 103-108, 153-158, 197-203), the Mini App auth (`webapp_auth.py:134-136`), and the VNC WebSocket (`vnc.py:83`). A single chat id cannot express two supergroups; a single user id cannot express two humans.
 
-**Gap 2 — identity is ambient.** No code path configures who the agent *is*. The `claude` subprocess inherits the balam process environment wholesale (`claude_agent_sdk` transport builds env as `os.environ` + two keys, `claude_sdk_backend.py:277-289`); `CLAUDE_CONFIG_DIR` is never set anywhere in the repo; git/gh/ssh come from the one home directory. The claude.ai account-managed connectors (Calendar/Gmail/Drive/Notion) are bound to the single logged-in Claude account and ride into every turn via `strict_mcp_config=False` (`claude_sdk_backend.py:333-340`). OpenCode has one server, one auth store per VM user (`deploy/balam-opencode.service`).
+**Gap 2 — identity is ambient.** No code path configures who the agent *is*. The `claude` subprocess inherits the balam process environment wholesale (`claude_agent_sdk` transport builds env as `os.environ` + two keys, `claude_sdk_backend.py:331-343`); `CLAUDE_CONFIG_DIR` is never set anywhere in the repo; git/gh/ssh come from the one home directory. The claude.ai account-managed connectors (Calendar/Gmail/Drive/Notion) are bound to the single logged-in Claude account and ride into every turn via `strict_mcp_config=False` (`claude_sdk_backend.py:387-394`). OpenCode has one server, one auth store per VM user (`deploy/balam-opencode.service`).
 
 **Gap 3 — nothing has an owner.** Approval/question/picker keyboards are tappable by *any* allowed user (`approvals.py:218-224, 292-319, 510-520`); "Approve all edits" escalates by session id, not user; schedules belong to a chat, not a person; markdown snapshots live in one flat namespace any authenticated user can fetch (`content_store.py`, `server.py:132-140`); `/api/diff?context=<name>` serves **any** context to any authenticated user (`server.py:114-130`); the agent is never told who is speaking (no handler reads `message.from_user` for the prompt).
 
@@ -115,7 +115,7 @@ contexts:
 - `bot.py`: build the filters from lists (`filters.User(user_id=[...]) & filters.Chat(chat_id=[...])`), **plus an explicit pair check** — the AND of two lists would admit user A posting in user B's supergroup. A tiny custom filter (or first line of each handler) resolves `(from_user.id, chat.id)` to a profile and drops mismatches.
 - `auth.py`: `is_owner(...)` → `resolve_user(from_id, chat_id) -> UserProfile | None`. **Prep refactor first:** replace the four hand-inlined checks in `callbacks.py` with calls to the one shared function, so the auth shape changes in one place, not five.
 - `webapp_auth.py`: `RequireOwner` → `RequireUser`, validating the HMAC as today but resolving the embedded user id against the profile set and **returning the profile** (today it returns the single allowed id and every route discards it, `webapp_auth.py:136`).
-- `bot.py:252-266` `register_commands`: register the per-chat command scope for every profile's chat, not one.
+- `bot.py:254-268` `register_commands`: register the per-chat command scope for every profile's chat, not one.
 
 **What the sender's Telegram user id can and cannot decide.** Every update type carries it — `message.from_user.id`, `callback_query.from_user.id`, and the `user.id` inside Mini App `initData` — so one bot can always tell the two humans apart at the harness level; profile resolution keys on it, with the chat pair check as defense in depth. The per-message id settles **authorization** (may this person tap this keyboard, cancel this turn, delete this topic) and **attribution** (who said this). What it cannot do is give one *topic* two identities: a session is one continuous transcript living under one account's `~/.claude/projects/`, resumed by one login — so **identity attaches to the topic** (owner = creator; under chat-as-tenant, the chat's user), and a turn always runs as the topic owner regardless of who typed the message. One Telegram caveat: a user posting as an **anonymous admin** (or as a channel) has no visible user id — `from_user` becomes the group's anonymous bot — so such updates are dropped, and both users must post as themselves.
 
@@ -142,7 +142,7 @@ Each human gets a real account on the VM (`user1@server`, `user2@server`). Ident
 
 **Migration note (for the existing deployment):** session transcripts live under each account's `~/.claude/projects/`, so moving yourself from `ubuntu` to a personal account means live topics won't `resume` across the cutover unless the directory (login + `projects/`) is copied over.
 
-**Fallback variant — same account, env bundles.** Where creating accounts is unwanted, a profile can instead carry `state_dir` + an env map (`CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, …) injected through the SDK backend's per-turn `env` seam (`claude_sdk_backend.py:277-289` — the one identity seam that exists today). That yields the *correct* identity but not a *protected* one (same account, mutual read access), and flag-based CLIs stay shared. Keep it as the zero-ops option; the profile schema covers both (`identity.account` vs `identity.state_dir`).
+**Fallback variant — same account, env bundles.** Where creating accounts is unwanted, a profile can instead carry `state_dir` + an env map (`CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, …) injected through the SDK backend's per-turn `env` seam (`claude_sdk_backend.py:331-343` — the one identity seam that exists today). That yields the *correct* identity but not a *protected* one (same account, mutual read access), and flag-based CLIs stay shared. Keep it as the zero-ops option; the profile schema covers both (`identity.account` vs `identity.state_dir`).
 
 ### 3.4 Ownership and scoping
 
@@ -158,7 +158,7 @@ Each human gets a real account on the VM (`user1@server`, `user2@server`). Ident
 
 - **Packaging:** move `claude-agent-sdk` to `[project.optional-dependencies]` as the `claude` extra. `uv sync` installs core (httpx covers OpenCode); `uv sync --extra claude` adds the SDK. CI syncs `--all-extras`.
 - **Lazy imports:** move the backend imports inside the `AGENT_BACKEND` branch in `app.py:78-102` (the SDK modules `claude_sdk_backend.py` / `sdk_tasks.py` are the only importers of `claude_agent_sdk`). Boot failure becomes a config error with a fix in the message — "`AGENT_BACKEND=claude_sdk` but claude-agent-sdk is not installed; run `uv sync --extra claude`" — instead of an `ImportError` before config is even read.
-- **SDK-mode preflight:** `wait_for_ready()` is a no-op today (`claude_sdk_backend.py:191-193`); nothing validates credentials until the first turn dies. Add a boot check per user profile — under the accounts model, a cheap probe through the profile's wrapper (the balam service cannot read user homes, by design).
+- **SDK-mode preflight:** `wait_for_ready()` is a no-op today (`claude_sdk_backend.py:245-247`); nothing validates credentials until the first turn dies. Add a boot check per user profile — under the accounts model, a cheap probe through the profile's wrapper (the balam service cannot read user homes, by design).
 - **Deploy:** `install.sh` takes the backend choice; the `balam-opencode.service` unit installs only for OpenCode mode (ADR-0014 already notes it isn't needed in SDK mode). Parameterize the hardcoded `/home/ubuntu/...` paths (install user, repo path, PATH line) — the priority use case is literally "someone else sets this up on a new VM". Fix stale references while in there: the `BALAM_DEV_AUTH` comment (no such flag exists) and `RICH_MESSAGES=true` in `deploy/balam.env` (removed in `ea5aa55`).
 
 ---
@@ -193,7 +193,7 @@ Chat-as-tenant stops working; ownership must move down one level, to the **topic
 
 - `topic_sessions` gains `owner_user_id` — the topic's creator. Turns in a topic always run under the **owner's** identity, regardless of who typed.
 - The other user's messages in someone else's topic: allow (it's collaboration), but prefix sender attribution into the agent-visible text ("**Bob:** …") — today the agent has no idea who is speaking, and two humans' words are indistinguishable in one session.
-- Shared controls (agreed policy): approval/question keyboards, `/cancel`, `/delete`, mid-turn follow-up folding (`turns.py:237-249`), and armed custom-question answers (`approvals.py:447-471`) stay open to **any authorized user in the chat** — which is what the mechanism already does once the allowlist is a set. The actor is recorded and attributed; the constraint that holds it together is that execution identity stays the topic owner's (§3.2), so approving/answering means authorizing work that runs as the owner.
+- Shared controls (agreed policy): approval/question keyboards, `/cancel`, `/delete`, mid-turn follow-up folding (`turns.py:286-298`), and armed custom-question answers (`approvals.py:447-471`) stay open to **any authorized user in the chat** — which is what the mechanism already does once the allowlist is a set. The actor is recorded and attributed; the constraint that holds it together is that execution identity stays the topic owner's (§3.2), so approving/answering means authorizing work that runs as the owner.
 - `/model` and `/effort` are chat-global by design (ADR-0015) — under a shared chat they become a shared knob. Either accept and document, or move overrides from the General row to per-user rows.
 
 Everything in Phase 1's ownership work (initiator on keyboards, user on schedules) is deliberately shaped so this phase is additive, not a redesign. Still, it touches every keyboard and the attribution model — that is why it is Phase 2.
@@ -226,6 +226,6 @@ Everything in Phase 1's ownership work (initiator on keyboards, user on schedule
 | 0012 | Contexts gain optional `users:`; `default_context` and timezone become per-user with global fallback |
 | 0013 | Mini App auth resolves a *user*, and routes scope data per user |
 | 0014 | New: turns run as the profile's Unix account (per-profile `cli_path` wrapper / per-user OpenCode server); backend deps optional |
-| 0015 | Unchanged, but capacity note: held turns × users |
+| 0015 / 0017 | Unchanged, but capacity note: the hold cap (`_MAX_HELD_TURNS = 3`, ADR-0017) is one per-instance budget, so held turns are shared across users, not granted per user |
 | 0016 | Schedules owned by a user; fire with the owner's identity and timezone |
-| New 0017 | Users are first-class; the tenant boundary is the chat (priority case) with topic ownership as the extension point (same-chat case) |
+| New 0018 | Users are first-class; the tenant boundary is the chat (priority case) with topic ownership as the extension point (same-chat case) |
