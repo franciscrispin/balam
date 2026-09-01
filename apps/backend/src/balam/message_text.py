@@ -1,10 +1,12 @@
 """Turn a Telegram message into the text the agent actually sees.
 
-Telegram carries the owner's *gestures* — forwarding something, replying to a
+Telegram carries the sender's *gestures* — forwarding something, replying to a
 particular message, quoting part of it — as structured metadata, and drops all of
 it when a bot reads ``text``/``caption``. Without this module the agent would see
-a bare message and lose the context the owner meant to supply, so the gestures
-are rendered back into a short bracketed header instead.
+a bare message and lose the context the sender meant to supply, so the gestures
+are rendered back into a short bracketed header instead. :func:`sender_prefix`
+adds the one piece Telegram *does* keep but the agent still never sees: which
+person in the chat is speaking.
 
 Everything here is a pure function of the message object. They duck-type their
 input (``getattr`` rather than ``isinstance``) so a stripped-down test double
@@ -156,6 +158,24 @@ def forward_reply_prefix(message: Any) -> str:
     if reply_line:
         lines.append(reply_line)
     return "\n".join(lines) + "\n" if lines else ""
+
+
+def sender_prefix(message: Any, *, owner_id: int) -> str:
+    """A bracketed header naming who sent the message, when it wasn't the owner.
+
+    A topic is one session shared by everyone in the chat (ADR-0008/0009), so two
+    humans' messages otherwise arrive at the agent as one indistinguishable
+    voice — it cannot say "you asked me to" about the right person, and cannot
+    address either of them by name.
+
+    Returns ``""`` for the owner, so a single-user deployment's prompts are
+    unchanged; an allowlisted guest gets ``[From Bob (@bob)]``.
+    """
+    user = getattr(message, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if user_id is None or user_id == owner_id:
+        return ""
+    return f"[From {_user_label(user) or f'Telegram user {user_id}'}]\n"
 
 
 def command_remainder(text: str, *, args_consumed: int = 0) -> str:

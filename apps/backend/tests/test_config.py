@@ -67,3 +67,38 @@ def test_timezone_rejects_a_typo_at_load() -> None:
     # other trust-boundary checks — not at 07:30 when the schedule doesn't fire.
     with pytest.raises(ValidationError):
         Config(**_BASE, balam_timezone="Asia/Singapura")  # type: ignore[arg-type]
+
+
+# --- the allowlist: owner plus ADDITIONAL_TELEGRAM_USER_IDS (ADR-0008) --------
+
+
+def test_allowed_user_ids_defaults_to_just_the_owner() -> None:
+    assert Config(**_BASE).allowed_user_ids == (1,)  # type: ignore[arg-type]
+
+
+def test_allowed_user_ids_appends_additional_users() -> None:
+    cfg = Config(**_BASE, additional_telegram_user_ids="222,333")  # type: ignore[arg-type]
+    assert cfg.allowed_user_ids == (1, 222, 333)
+
+
+def test_allowed_user_ids_tolerates_spaces_and_blanks() -> None:
+    cfg = Config(**_BASE, additional_telegram_user_ids=" 222 , 333, ")  # type: ignore[arg-type]
+    assert cfg.allowed_user_ids == (1, 222, 333)
+    assert Config(**_BASE, additional_telegram_user_ids="  ").allowed_user_ids == (1,)  # type: ignore[arg-type]
+
+
+def test_allowed_user_ids_keeps_the_owner_first_and_unique() -> None:
+    # Listing the owner again must not duplicate them in the filter.
+    cfg = Config(**_BASE, additional_telegram_user_ids="1,222")  # type: ignore[arg-type]
+    assert cfg.allowed_user_ids == (1, 222)
+
+
+def test_additional_user_ids_reject_non_numeric() -> None:
+    with pytest.raises(ValidationError):
+        Config(**_BASE, additional_telegram_user_ids="222,@bob")  # type: ignore[arg-type]
+
+
+def test_additional_user_ids_reject_non_positive() -> None:
+    # A negative id is a chat id pasted into the wrong variable.
+    with pytest.raises(ValidationError):
+        Config(**_BASE, additional_telegram_user_ids="-1001234567890")  # type: ignore[arg-type]

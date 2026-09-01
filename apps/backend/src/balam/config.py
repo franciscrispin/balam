@@ -35,6 +35,26 @@ class ConfigError(Exception):
         )
 
 
+def _parse_user_ids(raw: str) -> tuple[int, ...]:
+    """Parse a comma- or space-separated list of Telegram user ids.
+
+    Deliberately a ``str`` field parsed here rather than a ``list[int]`` field:
+    pydantic-settings JSON-decodes complex types from the environment, so a
+    ``list[int]`` would need ``[222,333]`` in ``.env`` and would fail obscurely on
+    the ``222,333`` anyone would actually write.
+    """
+    ids: list[int] = []
+    for token in raw.replace(",", " ").split():
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise ValueError(f"{token!r} is not a numeric Telegram user ID") from exc
+        if value <= 0:
+            raise ValueError(f"{value} must be a positive integer (a numeric Telegram user ID)")
+        ids.append(value)
+    return tuple(ids)
+
+
 class Config(BaseSettings):
     """Validated settings, read from the environment / repo-root ``.env``."""
 
@@ -52,6 +72,13 @@ class Config(BaseSettings):
     # handlers gate on this chat id in addition to the owner id; unset → the
     # legacy owner-anywhere behavior.
     allowed_telegram_chat_id: int | None = None
+    # Optional: other Telegram user ids allowed to drive the bot, comma-separated
+    # ("222333444,555666777"). They are inside the same trust boundary as the
+    # owner (ADR-0008), not a lesser one: turns run as the same OS user, with the
+    # owner's files, credentials and agent session, so add only people you trust
+    # with this machine. Pair with ALLOWED_TELEGRAM_CHAT_ID so they are confined
+    # to the workspace supergroup instead of also getting a private bot.
+    additional_telegram_user_ids: str = ""
 
     # --- Agent backend (ADR-0013) ---
     # Which coding-agent runtime drives Balam: the OpenCode server (default) or
@@ -162,6 +189,32 @@ class Config(BaseSettings):
         if value <= 0:
             raise ValueError("must be a positive integer (your numeric Telegram user ID)")
         return value
+
+    @field_validator("additional_telegram_user_ids")
+    @classmethod
+    def _parseable_user_ids(cls, value: str) -> str:
+        # Parse at load so a typo'd id is a boot error, not a person who silently
+        # can't talk to the bot.
+        _parse_user_ids(value)
+        return value
+
+    @property
+    def allowed_user_ids(self) -> tuple[int, ...]:
+        """Every Telegram user id allowed to drive the bot (ADR-0008): the owner
+        first, then ``ADDITIONAL_TELEGRAM_USER_IDS``.
+
+        The single list the message filter, the callback checks and the Mini App
+        auth all gate on, so widening the allowlist happens in one place. The
+        owner stays distinguishable because some things still mean *the owner*
+        specifically — the account the agent runs as, and who needs no sender
+        attribution in a prompt.
+        """
+        extra = tuple(
+            uid
+            for uid in _parse_user_ids(self.additional_telegram_user_ids)
+            if uid != self.allowed_telegram_user_id
+        )
+        return (self.allowed_telegram_user_id, *extra)
 
     @property
     def db_path(self) -> str:

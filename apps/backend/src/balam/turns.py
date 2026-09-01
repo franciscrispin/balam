@@ -32,6 +32,7 @@ from balam.agent.backend import AgentBackend, FollowUp, FollowUpChannel
 from balam.approvals import PendingApprovals, PendingQuestions
 from balam.attachments import PromptFile
 from balam.config import Config
+from balam.message_text import sender_prefix
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
 from balam.streamer import stream_reply
@@ -254,11 +255,19 @@ async def submit_turn(
     ``thread_id`` is explicit because a General message has already been rehomed
     into a freshly created topic by the time it gets here; ``queued_reply`` is
     formatted with the job's 1-based queue ``position``. ``prompt_prefix`` is
-    prepended only to the agent-facing prompt (forward/reply header) — topic
-    auto-naming still uses the owner's own ``text``.
+    prepended only to the agent-facing prompt (sender attribution, then the
+    forward/reply header) — topic auto-naming still uses the sender's own ``text``.
     """
     turns: TurnRegistry = context.application.bot_data["turns"]
     chat_id = message.chat_id
+
+    # Who is speaking (ADR-0008). A chat may allow more than one person while a
+    # topic is still one session, so the agent is told which of them sent this.
+    # Empty for the owner, so single-user prompts are unchanged. Config is
+    # optional for the same reason as in :func:`start_turn` — unit tests of the
+    # bot path omit it, and attribution is then simply absent.
+    config: Config | None = context.application.bot_data.get("config")
+    sender = sender_prefix(message, owner_id=config.allowed_telegram_user_id) if config else ""
 
     job = await resolve_turn_job(
         context,
@@ -267,7 +276,7 @@ async def submit_turn(
         text,
         title=topic_title(message, thread_id),
         files=files,
-        prompt_prefix=prompt_prefix,
+        prompt_prefix=sender + prompt_prefix,
     )
     if job is None:
         return
@@ -289,7 +298,7 @@ async def submit_turn(
         if (
             backend.supports_streaming_input
             and running.follow_ups is not None
-            and running.follow_ups.offer(FollowUp(prompt=text, files=files))
+            and running.follow_ups.offer(FollowUp(prompt=sender + text, files=files))
         ):
             await _ack_follow_up(message)
             return

@@ -3,9 +3,9 @@
 The Mini App runs inside Telegram's webview, which hands the page a signed
 ``initData`` string. Every Mini App API request must prove it carries valid
 ``initData`` (HMAC-SHA256 with the bot token, per Telegram's Web App spec) *and*
-that the embedded user is the single allowed owner — the same trust boundary the
-bot enforces on incoming updates. The frontend sends it as
-``Authorization: tma <initData>`` (Telegram's ``tma`` scheme).
+that the embedded user is on the allowlist — the same trust boundary the bot
+enforces on incoming updates (``Config.allowed_user_ids``). The frontend sends it
+as ``Authorization: tma <initData>`` (Telegram's ``tma`` scheme).
 
 HMAC validation is adapted from the open-shrimp reference (ADR-0011).
 """
@@ -17,6 +17,7 @@ import hmac
 import json
 import logging
 import time
+from collections.abc import Collection
 from urllib.parse import parse_qs
 
 from fastapi import Header, HTTPException
@@ -86,15 +87,19 @@ def validate_init_data(
     return user
 
 
-def is_owner_init_data(
-    init_data: str, *, bot_token: str, allowed_user_id: int, now: int | None = None
+def is_allowed_init_data(
+    init_data: str,
+    *,
+    bot_token: str,
+    allowed_user_ids: Collection[int],
+    now: int | None = None,
 ) -> bool:
-    """True iff ``init_data`` is HMAC-valid, fresh, and embeds the allowed owner.
+    """True iff ``init_data`` is HMAC-valid, fresh, and embeds an allowed user.
 
     The WebSocket route's auth (ADR-0006): a browser cannot set an
     ``Authorization`` header on a WebSocket, so the noVNC client sends its
     ``initData`` as the first text frame and the route checks it with this
-    instead of :class:`RequireOwner`.
+    instead of :class:`RequireUser`.
     """
     try:
         user = validate_init_data(
@@ -102,21 +107,27 @@ def is_owner_init_data(
         )
     except InitDataError:
         return False
-    return int(user["id"]) == allowed_user_id
+    return int(user["id"]) in allowed_user_ids
 
 
-class RequireOwner:
-    """FastAPI dependency: authenticate a Mini App request as the allowed owner.
+class RequireUser:
+    """FastAPI dependency: authenticate a Mini App request as an allowed user.
 
     Reads the ``Authorization: tma <initData>`` header, validates it, and asserts
-    the embedded user id matches ``allowed_user_id``. Returns the owner's user id.
-    Raises ``HTTPException(401)`` otherwise. Valid ``initData`` is always required —
-    the Mini App is reachable over the internet (ADR-0013), so there is no bypass.
+    the embedded user id is on the allowlist (ADR-0008). Returns **that caller's**
+    user id, so a route can attribute or scope by it. Raises ``HTTPException(401)``
+    otherwise. Valid ``initData`` is always required — the Mini App is reachable
+    over the internet (ADR-0013), so there is no bypass.
+
+    Every allowed user sees the same data: the deployment's users share one
+    workspace, so diffs, markdown snapshots and the live browser view are shared
+    too. Per-user scoping would need per-user tenancy, which this deployment
+    deliberately does not have.
     """
 
-    def __init__(self, *, bot_token: str, allowed_user_id: int) -> None:
+    def __init__(self, *, bot_token: str, allowed_user_ids: Collection[int]) -> None:
         self._bot_token = bot_token
-        self._allowed_user_id = allowed_user_id
+        self._allowed_user_ids = tuple(allowed_user_ids)
 
     def __call__(self, authorization: str | None = Header(default=None)) -> int:
         if not authorization:
@@ -131,6 +142,7 @@ class RequireOwner:
         except InitDataError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-        if int(user["id"]) != self._allowed_user_id:
+        user_id = int(user["id"])
+        if user_id not in self._allowed_user_ids:
             raise HTTPException(status_code=403, detail="user not allowed")
-        return self._allowed_user_id
+        return user_id

@@ -49,9 +49,11 @@ alphabetically — the groups are the shape of the system.
 - **`contexts.py`** — loads the **required** `config.yaml`. A *context* = a
   working `directory` + optional `model`/`effort` + `allowed_tools` +
   `additional_directories` + `mcp` servers.
-- **`auth.py`** — the ADR-0008 trust boundary: `is_owner` and
-  `callback_authorized`. Message handlers get it as a PTB filter; callback
-  queries carry no filter and must ask for it themselves.
+- **`auth.py`** — the ADR-0008 trust boundary: `is_allowed_user` and
+  `callback_authorized`, both gating on `Config.allowed_user_ids` (the owner plus
+  `ADDITIONAL_TELEGRAM_USER_IDS` — one trust boundary, several people). Message
+  handlers get it as a PTB filter; callback queries carry no filter and must ask
+  for it themselves.
 
 ### The Telegram surface
 
@@ -70,7 +72,8 @@ alphabetically — the groups are the shape of the system.
   originating message, so `/context`, a General message and a `/schedule` timer
   all open topics the same way.
 - **`message_text.py`** — turns a Telegram message into the text the agent sees,
-  rendering back the forward/reply/quote gestures Telegram otherwise drops.
+  rendering back the forward/reply/quote gestures Telegram otherwise drops, plus
+  `sender_prefix` (`[From Bob Lee (@bob)]`) when the sender is not the owner.
 - **`telegram_utils.py`** — `thread_kwargs` (route a send to a topic) and
   `clear_keyboard`.
 

@@ -314,12 +314,14 @@ def build_application(
     # Photos of an album, held until the group is complete enough to run as one turn.
     app.bot_data["media_groups"] = MediaGroupBuffer()
 
-    # Trust boundary (ADR-0008): filters.User gates by sender id, so only the
-    # owner's messages reach the handlers; everyone else is dropped silently.
+    # Trust boundary (ADR-0008): filters.User gates by sender id, so only an
+    # allowed user's messages reach the handlers; everyone else is dropped
+    # silently. The list is the owner plus anyone in ADDITIONAL_TELEGRAM_USER_IDS.
     # When a target chat is configured (ADR-0010), additionally require that
     # chat, so the bot acts only inside the workspace supergroup. Unset → the
-    # legacy owner-anywhere behavior, preserving the DM round-trip.
-    allowed = filters.User(user_id=config.allowed_telegram_user_id)
+    # legacy owner-anywhere behavior, preserving the DM round-trip — which is why
+    # a deployment with extra users should always set the chat id.
+    allowed = filters.User(user_id=config.allowed_user_ids)
     if config.allowed_telegram_chat_id is not None:
         allowed = allowed & filters.Chat(chat_id=config.allowed_telegram_chat_id)
 

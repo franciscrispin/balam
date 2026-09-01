@@ -5,7 +5,7 @@ Runs in the same process as the bot (mounted from :mod:`balam.app`), bound to
 
   1. Serve the built Mini App (``apps/frontend/dist``) as a static SPA.
   2. Expose the Mini App API under ``/api`` — every route gated by the
-     ``initData`` trust boundary (:class:`balam.webapp_auth.RequireOwner`,
+     ``initData`` trust boundary (:class:`balam.webapp_auth.RequireUser`,
      ADR-0008).
   3. Emit the OpenAPI schema (``/openapi.json``) the frontend generates its
      TypeScript types from (ADR-0003).
@@ -35,7 +35,7 @@ from balam.git_diff import DiffHunk, NotAGitRepo, get_hunks
 from balam.router import Router
 from balam.store import SessionStore
 from balam.vnc import probe_vnc, vnc_websocket
-from balam.webapp_auth import RequireOwner
+from balam.webapp_auth import RequireUser
 
 logger = logging.getLogger(__name__)
 
@@ -101,20 +101,20 @@ def create_app(
         openapi_url=None,
     )
 
-    require_owner = RequireOwner(
+    require_user = RequireUser(
         bot_token=config.telegram_bot_token,
-        allowed_user_id=config.allowed_telegram_user_id,
+        allowed_user_ids=config.allowed_user_ids,
     )
     store = content_store if content_store is not None else ContentStore()
 
     @app.get("/api/app-info", response_model=AppInfo)
-    async def app_info(_owner: int = Depends(require_owner)) -> AppInfo:
+    async def app_info(_user: int = Depends(require_user)) -> AppInfo:
         return AppInfo(name="balam", version=_app_version())
 
     @app.get("/api/diff", response_model=DiffResponse)
     async def diff(
         context: str | None = Query(default=None),
-        _owner: int = Depends(require_owner),
+        _user: int = Depends(require_user),
     ) -> DiffResponse:
         name = context or router.contexts.default_context
         if name not in router.contexts.contexts:
@@ -132,7 +132,7 @@ def create_app(
     @app.get("/api/markdown/content/{content_id}", response_model=MarkdownContentResponse)
     async def markdown_content(
         content_id: str,
-        _owner: int = Depends(require_owner),
+        _user: int = Depends(require_user),
     ) -> MarkdownContentResponse:
         entry = store.get(content_id)
         if entry is None:
@@ -140,7 +140,7 @@ def create_app(
         return MarkdownContentResponse(title=entry.title, content=entry.content)
 
     @app.get("/api/browser/status", response_model=BrowserStatus)
-    async def browser_status(_owner: int = Depends(require_owner)) -> BrowserStatus:
+    async def browser_status(_user: int = Depends(require_user)) -> BrowserStatus:
         return BrowserStatus(running=await probe_vnc(config.balam_vnc_host, config.balam_vnc_port))
 
     # The RFB byte stream for the live browser view. Not in the OpenAPI schema
@@ -152,7 +152,7 @@ def create_app(
         await vnc_websocket(
             websocket,
             bot_token=config.telegram_bot_token,
-            allowed_user_id=config.allowed_telegram_user_id,
+            allowed_user_ids=config.allowed_user_ids,
             host=config.balam_vnc_host,
             port=config.balam_vnc_port,
         )

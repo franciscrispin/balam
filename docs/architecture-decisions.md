@@ -281,6 +281,44 @@ Treat the Telegram entry point as the trust boundary and lock it to one user:
 - This is the control that makes ADR-0007's "minimal security surface" true. If
   the system ever goes multi-user, this ADR and ADR-0007 are revisited together.
 
+### Amendment (2026-09-01): the allowlist may name more than one person
+
+The boundary is unchanged in kind — it is still an allowlist of numeric Telegram
+user IDs — but it is now a **list**, not a single id. `ADDITIONAL_TELEGRAM_USER_IDS`
+(comma-separated) adds people next to `ALLOWED_TELEGRAM_USER_ID`, and
+`Config.allowed_user_ids` is the one list the message filter (`bot.py`), the
+callback checks (`auth.callback_authorized`), the Mini App dependency
+(`webapp_auth.RequireUser`) and the noVNC WebSocket (`vnc.py`) all read.
+
+What this is, and what it is deliberately not:
+
+- **Everyone on the list is inside the *same* trust boundary, not a lesser one.**
+  There is no second tenant. Turns run as the same OS user, in the same topics,
+  on the same files, with the owner's Claude login, `gh`, git and ssh. Adding
+  someone gives them the owner's agent, so the list is for people trusted with
+  this machine.
+- **Chat scoping is what keeps them in the workspace.** The user-ID gate always
+  applies, but with the chat id unset a listed person could also open a private
+  chat with the bot. A deployment with more than one user should set
+  `ALLOWED_TELEGRAM_CHAT_ID`.
+- **The owner stays distinguishable** (`allowed_telegram_user_id`), because some
+  things still mean *the owner* specifically: the identity the agent runs as, and
+  who needs no sender attribution.
+- **Any allowed user may act.** Approval keyboards, question answers, `/cancel`,
+  `/delete` and `/schedule` are open to everyone on the list, in either
+  direction. Approving means authorizing work that runs with the owner's
+  credentials; that is understood, not hidden.
+- **A topic is still one session,** so the agent is told who is speaking:
+  `message_text.sender_prefix` prepends `[From Bob Lee (@bob)]` to a non-owner's
+  prompt (and to a mid-turn follow-up). The owner's prompts are unchanged.
+- **A person posting as an anonymous group admin has no real `from_user`** and is
+  dropped by the filter, so allowed users must post as themselves.
+- **Not per-user tenancy.** The Mini App shows every allowed user the same diffs,
+  markdown snapshots and live browser view; `/model` and `/effort` stay per-chat.
+  Per-user identity, credentials and data scoping are a separate, much larger
+  design (see `docs/multi-player-proposal.md`), which this amendment does not
+  implement and does not preclude.
+
 ---
 
 ## ADR-0009: One Telegram forum topic maps to one OpenCode session
