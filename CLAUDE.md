@@ -168,5 +168,10 @@ directory boundary and the human-approval keyboard stay local in `approvals.py`.
   systemd env vars take precedence). `ALLOWED_TELEGRAM_CHAT_ID` (optional `-100…`
   id) scopes the bot to the "workspace" forum supergroup; unset → legacy
   owner-anywhere DM behavior (ADR-0008 trust boundary unchanged).
+  `ADDITIONAL_TELEGRAM_USER_IDS` (optional, comma-separated) lets other people
+  drive the same bot in that chat — **one** trust boundary, not a second tenant:
+  their turns run as the same OS user with the owner's files and credentials, so
+  set the chat id too. `Config.allowed_user_ids` is the single list every check
+  reads; non-owner prompts are labelled `[From …]` (ADR-0008 amendment).
 - **Contexts:** copy `config.example.yaml` → `config.yaml` (**required**; path
   via `BALAM_CONFIG_PATH`). Secrets stay in `.env`, never `config.yaml`.

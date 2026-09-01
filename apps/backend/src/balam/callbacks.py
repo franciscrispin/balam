@@ -21,7 +21,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from balam.approvals import Choice, CustomAnswer, PendingApprovals, PendingQuestions
-from balam.auth import is_owner
+from balam.auth import callback_authorized
 from balam.config import Config
 from balam.markdown import escape_markdown_v2
 from balam.stream_render import _question_keyboard
@@ -48,8 +48,10 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
     """Resolve an approval inline keyboard (``appr:<choice>:<token>``).
 
     ``CallbackQueryHandler`` carries no ``filters``, so the ADR-0008 trust
-    boundary is re-checked here by hand: the press must come from the owner (and
-    the configured chat, when scoped). The matching pending future is resolved in
+    boundary is re-checked here via :func:`callback_authorized`: the press must
+    come from an allowed user (and the configured chat, when scoped) — any of
+    them, so either person in a shared workspace chat can answer the agent. The
+    matching pending future is resolved in
     :class:`PendingApprovals`; the streamer's waiting task then replies to
     OpenCode. We just acknowledge and strip the now-spent keyboard.
     """
@@ -58,15 +60,9 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     config: Config = context.application.bot_data["config"]
-    user = query.from_user
-    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+    if not callback_authorized(query, config):
         await query.answer()
         return
-    if config.allowed_telegram_chat_id is not None:
-        chat = query.message.chat if query.message else None
-        if chat is None or chat.id != config.allowed_telegram_chat_id:
-            await query.answer()
-            return
 
     parts = (query.data or "").split(":", 2)
     if len(parts) != 3:
@@ -99,15 +95,9 @@ async def handle_question_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     config: Config = context.application.bot_data["config"]
-    user = query.from_user
-    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+    if not callback_authorized(query, config):
         await query.answer()
         return
-    if config.allowed_telegram_chat_id is not None:
-        chat = query.message.chat if query.message else None
-        if chat is None or chat.id != config.allowed_telegram_chat_id:
-            await query.answer()
-            return
 
     parts = (query.data or "").split(":", 3)
     if len(parts) != 4:
@@ -149,15 +139,9 @@ async def handle_question_done_callback(update: Update, context: ContextTypes.DE
         return
 
     config: Config = context.application.bot_data["config"]
-    user = query.from_user
-    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+    if not callback_authorized(query, config):
         await query.answer()
         return
-    if config.allowed_telegram_chat_id is not None:
-        chat = query.message.chat if query.message else None
-        if chat is None or chat.id != config.allowed_telegram_chat_id:
-            await query.answer()
-            return
 
     parts = (query.data or "").split(":", 2)
     if len(parts) != 3:
@@ -193,15 +177,10 @@ async def handle_question_custom_callback(
         return
 
     config: Config = context.application.bot_data["config"]
-    user = query.from_user
-    if user is None or not is_owner(user.id, config.allowed_telegram_user_id):
+    if not callback_authorized(query, config):
         await query.answer()
         return
     chat = query.message.chat if query.message else None
-    if config.allowed_telegram_chat_id is not None:
-        if chat is None or chat.id != config.allowed_telegram_chat_id:
-            await query.answer()
-            return
     if chat is None:
         await query.answer("Malformed question answer.")
         return

@@ -12,7 +12,7 @@ from balam import schedules
 from balam.agent.events import BackgroundTask
 from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import Choice, PendingApprovals, PendingPicks, PendingQuestions
-from balam.auth import is_owner
+from balam.auth import is_allowed_user
 from balam.bot import (
     BOT_COMMANDS,
     _handle_message,
@@ -51,6 +51,7 @@ from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
 from balam.message_text import (
     forward_reply_prefix,
     forwarded_slash_command,
+    sender_prefix,
     strip_bot_mention_from_command,
 )
 from balam.router import Router, TopicRef
@@ -59,23 +60,33 @@ from balam.topics import topic_link, topic_name
 from balam.turns import FOLLOW_UP_REACTION, TurnJob, TurnRegistry
 
 OWNER = 424242
+#: A second person on the allowlist (ADDITIONAL_TELEGRAM_USER_IDS).
+GUEST = 515151
 SUPERGROUP = -1001234567890
 
 
 def test_accepts_owner_id() -> None:
-    assert is_owner(OWNER, OWNER) is True
+    assert is_allowed_user(OWNER, (OWNER,)) is True
 
 
 def test_rejects_other_id() -> None:
-    assert is_owner(999, OWNER) is False
+    assert is_allowed_user(999, (OWNER,)) is False
 
 
 def test_rejects_missing_sender() -> None:
-    assert is_owner(None, OWNER) is False
+    assert is_allowed_user(None, (OWNER,)) is False
 
 
 def test_does_not_treat_zero_as_wildcard() -> None:
-    assert is_owner(0, OWNER) is False
+    assert is_allowed_user(0, (OWNER,)) is False
+
+
+def test_accepts_a_second_allowed_user() -> None:
+    assert is_allowed_user(GUEST, (OWNER, GUEST)) is True
+
+
+def test_rejects_a_stranger_when_more_than_one_user_is_allowed() -> None:
+    assert is_allowed_user(GUEST + 1, (OWNER, GUEST)) is False
 
 
 def test_strip_bot_mention_removes_own_mention() -> None:
@@ -171,6 +182,30 @@ def test_forward_reply_prefix_reply_uses_who_and_snippet() -> None:
     assert forward_reply_prefix(_plain_msg(reply_to_message=reply)) == (
         '[Replying to Bob Lee (@bob): "let\'s finish the deck tomorrow"]\n'
     )
+
+
+# --- sender attribution: which of the chat's people is speaking (ADR-0008) ----
+
+
+def test_sender_prefix_is_empty_for_the_owner() -> None:
+    # A single-user deployment's prompts must be unchanged.
+    msg = _plain_msg(from_user=SimpleNamespace(id=OWNER, full_name="Owner", username="owner"))
+    assert sender_prefix(msg, owner_id=OWNER) == ""
+
+
+def test_sender_prefix_names_a_second_user() -> None:
+    msg = _plain_msg(from_user=SimpleNamespace(id=GUEST, full_name="Bob Lee", username="bob"))
+    assert sender_prefix(msg, owner_id=OWNER) == "[From Bob Lee (@bob)]\n"
+
+
+def test_sender_prefix_falls_back_to_the_id_when_there_is_no_name() -> None:
+    msg = _plain_msg(from_user=SimpleNamespace(id=GUEST, full_name=None, username=None))
+    assert sender_prefix(msg, owner_id=OWNER) == f"[From Telegram user {GUEST}]\n"
+
+
+def test_sender_prefix_is_empty_without_a_sender() -> None:
+    # Service messages and anonymous admins carry no usable user.
+    assert sender_prefix(_plain_msg(), owner_id=OWNER) == ""
 
 
 def test_forward_reply_prefix_prefers_highlighted_quote_over_full_message() -> None:
@@ -1135,12 +1170,15 @@ async def test_status_reports_queue_depth() -> None:
 # --- chat scoping (ADR-0010): the bot acts only in the workspace supergroup -----
 
 
-def _config(*, chat_id: int | None) -> SimpleNamespace:
-    # build_application only reads these three fields off the config.
+def _config(*, chat_id: int | None, user_ids: tuple[int, ...] = (OWNER,)) -> SimpleNamespace:
+    # What build_application reads off the config, plus what the turn path reads
+    # when this double is also used as bot_data["config"].
     return SimpleNamespace(
         telegram_bot_token="123456:fake-token-for-tests",
         allowed_telegram_user_id=OWNER,
+        allowed_user_ids=user_ids,
         allowed_telegram_chat_id=chat_id,
+        tool_stream="collapsed",
     )
 
 
@@ -1172,8 +1210,8 @@ def _text_update(chat_id: int, user_id: int, text: str = "hello") -> Update:
     return Update(update_id=1, message=message)
 
 
-def _build(chat_id: int | None):
-    return build_application(_config(chat_id=chat_id), backend=None, router=None)
+def _build(chat_id: int | None, *, user_ids: tuple[int, ...] = (OWNER,)):
+    return build_application(_config(chat_id=chat_id, user_ids=user_ids), backend=None, router=None)
 
 
 def test_message_handler_scoped_accepts_owner_in_target_chat() -> None:
@@ -1207,6 +1245,30 @@ def test_command_handler_scoped_rejects_owner_in_other_chat() -> None:
 def test_command_handler_scoped_accepts_owner_in_target_chat() -> None:
     handler = _command_handler(_build(SUPERGROUP))
     assert handler.check_update(_text_update(SUPERGROUP, OWNER, "/context")) is not False
+
+
+# --- a second allowed user in the same chat (ADDITIONAL_TELEGRAM_USER_IDS) -----
+
+
+def test_message_handler_accepts_second_allowed_user_in_target_chat() -> None:
+    handler = _message_handler(_build(SUPERGROUP, user_ids=(OWNER, GUEST)))
+    assert handler.check_update(_text_update(SUPERGROUP, GUEST)) is not False
+
+
+def test_message_handler_rejects_stranger_when_two_users_are_allowed() -> None:
+    handler = _message_handler(_build(SUPERGROUP, user_ids=(OWNER, GUEST)))
+    assert handler.check_update(_text_update(SUPERGROUP, GUEST + 1)) is False
+
+
+def test_message_handler_rejects_second_user_outside_the_target_chat() -> None:
+    # The chat scope still applies to everyone: no private bot on the side.
+    handler = _message_handler(_build(SUPERGROUP, user_ids=(OWNER, GUEST)))
+    assert handler.check_update(_text_update(GUEST, GUEST)) is False
+
+
+def test_command_handler_accepts_second_allowed_user() -> None:
+    handler = _command_handler(_build(SUPERGROUP, user_ids=(OWNER, GUEST)))
+    assert handler.check_update(_text_update(SUPERGROUP, GUEST, "/context")) is not False
 
 
 # --- command registration (setMyCommands) makes /context work in groups -------
@@ -1348,8 +1410,18 @@ class _FakeQuery:
         self.answers.append(text)
 
 
-def _callback_env(query: _FakeQuery, pending: PendingApprovals, *, chat_id: int | None = None):
-    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id)
+def _callback_env(
+    query: _FakeQuery,
+    pending: PendingApprovals,
+    *,
+    chat_id: int | None = None,
+    user_ids: tuple[int, ...] = (OWNER,),
+):
+    config = SimpleNamespace(
+        allowed_telegram_user_id=OWNER,
+        allowed_user_ids=user_ids,
+        allowed_telegram_chat_id=chat_id,
+    )
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
         application=SimpleNamespace(
@@ -1367,7 +1439,11 @@ def _callback_env(query: _FakeQuery, pending: PendingApprovals, *, chat_id: int 
 def _question_callback_env(
     query: _FakeQuery, pending_questions: PendingQuestions, *, chat_id: int | None = None
 ):
-    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=chat_id)
+    config = SimpleNamespace(
+        allowed_telegram_user_id=OWNER,
+        allowed_user_ids=(OWNER,),
+        allowed_telegram_chat_id=chat_id,
+    )
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
         application=SimpleNamespace(
@@ -1445,6 +1521,32 @@ async def test_approval_callback_ignores_stranger() -> None:
     await handle_approval_callback(update, context)
 
     assert not future.done()  # a stranger's tap never resolves the approval
+
+
+async def test_approval_callback_accepts_second_allowed_user() -> None:
+    # Agreed policy: any allowed user in the chat may answer the agent, because
+    # the work runs as the owner either way (ADR-0008).
+    pending = PendingApprovals()
+    token, future = pending.register("ses_x")
+    query = _FakeQuery(f"appr:allow:{token}", GUEST, _FakeCBMessage())
+    update, context = _callback_env(query, pending, user_ids=(OWNER, GUEST))
+
+    await handle_approval_callback(update, context)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert future.result() is Choice.ALLOW
+
+
+async def test_approval_callback_ignores_stranger_when_two_users_allowed() -> None:
+    pending = PendingApprovals()
+    token, future = pending.register("ses_x")
+    query = _FakeQuery(f"appr:allow:{token}", GUEST + 1, _FakeCBMessage())
+    update, context = _callback_env(query, pending, user_ids=(OWNER, GUEST))
+
+    await handle_approval_callback(update, context)
+
+    assert not future.done()
 
 
 async def test_approval_callback_rejects_owner_in_other_chat() -> None:
@@ -1769,7 +1871,7 @@ class _AttachmentBot:
         return _F()
 
 
-def _message_env(message, bot, *, router: Router | None = None):
+def _message_env(message, bot, *, router: Router | None = None, config: object | None = None):
     opencode = _FakeOpenCode()
     contexts = ContextsConfig(
         default_context="balam",
@@ -1778,15 +1880,18 @@ def _message_env(message, bot, *, router: Router | None = None):
     router = router or Router(SessionStore(":memory:"), opencode, contexts)
     turns = TurnRegistry()
     update = SimpleNamespace(message=message)
+    bot_data: dict[str, object] = {
+        "router": router,
+        "backend": OpenCodeBackend(opencode),
+        "turns": turns,
+        "pending": PendingApprovals(),
+    }
+    # Optional, mirroring the code: without a config there is no allowlist to
+    # attribute a sender against, so prompts go through unlabelled.
+    if config is not None:
+        bot_data["config"] = config
     context = SimpleNamespace(
-        application=SimpleNamespace(
-            bot_data={
-                "router": router,
-                "backend": OpenCodeBackend(opencode),
-                "turns": turns,
-                "pending": PendingApprovals(),
-            }
-        ),
+        application=SimpleNamespace(bot_data=bot_data),
         bot=bot,
     )
     return update, context, turns
@@ -1821,6 +1926,52 @@ async def test_message_with_photo_forwards_file_part_and_caption(monkeypatch) ->
     files = captured["files"]
     assert [f.mime for f in files] == ["image/jpeg"]
     assert files[0].url.startswith("data:image/jpeg;base64,")
+
+
+async def test_second_users_message_is_attributed_in_the_prompt(monkeypatch) -> None:
+    # One topic is one session, so the agent is told which person is speaking.
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    message = _text_msg(SUPERGROUP, 5, "deploy the branch")
+    message.from_user = SimpleNamespace(id=GUEST, full_name="Bob Lee", username="bob")
+    update, context, turns = _message_env(
+        message,
+        _FakeBot(),
+        config=_config(chat_id=SUPERGROUP, user_ids=(OWNER, GUEST)),
+    )
+
+    await _handle_message(update, context)
+    await turns.get(SUPERGROUP, 5).task
+
+    assert captured["prompt"] == "[From Bob Lee (@bob)]\ndeploy the branch"
+
+
+async def test_owner_message_is_not_attributed(monkeypatch) -> None:
+    # The single-user prompt is unchanged by the multi-user code path.
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    message = _text_msg(SUPERGROUP, 5, "deploy the branch")
+    message.from_user = SimpleNamespace(id=OWNER, full_name="Owner", username="owner")
+    update, context, turns = _message_env(
+        message,
+        _FakeBot(),
+        config=_config(chat_id=SUPERGROUP, user_ids=(OWNER, GUEST)),
+    )
+
+    await _handle_message(update, context)
+    await turns.get(SUPERGROUP, 5).task
+
+    assert captured["prompt"] == "deploy the branch"
 
 
 async def test_message_prepends_forward_and_reply_header_to_prompt(monkeypatch) -> None:
@@ -1930,7 +2081,11 @@ class _DeleteBot(_FakeBot):
 
 
 def _delete_callback_env(query: _FakeQuery, pending_deletions: PendingPicks, bot: _FakeBot):
-    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=None)
+    config = SimpleNamespace(
+        allowed_telegram_user_id=OWNER,
+        allowed_user_ids=(OWNER,),
+        allowed_telegram_chat_id=None,
+    )
     router = _router()
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
@@ -2154,6 +2309,7 @@ def _schedule_env(message: _FakeMessage, args: list[str], *, bot: _FakeBot | Non
                 "config": SimpleNamespace(
                     timezone=ZoneInfo("Asia/Singapore"),
                     allowed_telegram_user_id=OWNER,
+                    allowed_user_ids=(OWNER,),
                     allowed_telegram_chat_id=None,
                     tool_stream="collapsed",
                 ),
@@ -2528,7 +2684,11 @@ async def test_schedule_cancel_with_nothing_to_cancel() -> None:
 
 
 def _schedule_callback_env(query: _FakeQuery, picks: PendingPicks, store: SessionStore):
-    config = SimpleNamespace(allowed_telegram_user_id=OWNER, allowed_telegram_chat_id=None)
+    config = SimpleNamespace(
+        allowed_telegram_user_id=OWNER,
+        allowed_user_ids=(OWNER,),
+        allowed_telegram_chat_id=None,
+    )
     update = SimpleNamespace(callback_query=query)
     context = SimpleNamespace(
         application=SimpleNamespace(

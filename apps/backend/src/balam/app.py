@@ -206,8 +206,8 @@ def main() -> None:
     )
 
     logger.info(
-        "starting bot (owner %s, chat %s, contexts %s, default %s) ...",
-        config.allowed_telegram_user_id,
+        "starting bot (users %s, chat %s, contexts %s, default %s) ...",
+        ", ".join(str(uid) for uid in config.allowed_user_ids),
         config.allowed_telegram_chat_id or "any",
         sorted(contexts.contexts),
         contexts.default_context,

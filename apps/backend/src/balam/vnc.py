@@ -18,15 +18,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Collection
 
 from fastapi import WebSocket
 
-from balam.webapp_auth import is_owner_init_data
+from balam.webapp_auth import is_allowed_init_data
 
 logger = logging.getLogger(__name__)
 
 #: WebSocket close codes (4000–4999 are application-defined); mirror HTTP semantics.
-WS_CLOSE_UNAUTHORIZED = 4401  # missing/invalid token, or not the owner
+WS_CLOSE_UNAUTHORIZED = 4401  # missing/invalid token, or not an allowed user
 WS_CLOSE_VNC_UNAVAILABLE = 4502  # TCP connect to the VNC server failed
 
 _PROBE_TIMEOUT_S = 1.0
@@ -52,7 +53,7 @@ async def vnc_websocket(
     websocket: WebSocket,
     *,
     bot_token: str,
-    allowed_user_id: int,
+    allowed_user_ids: Collection[int],
     host: str,
     port: int,
 ) -> None:
@@ -62,7 +63,7 @@ async def vnc_websocket(
     ``?token=`` query param would land verbatim in uvicorn's accept log — so the
     client instead sends its ``initData`` as the **first (text) frame**, before
     any RFB bytes flow (same trust boundary as
-    :class:`balam.webapp_auth.RequireOwner`, ADR-0008). That ordering is safe
+    :class:`balam.webapp_auth.RequireUser`, ADR-0008). That ordering is safe
     because in the RFB protocol the *server* speaks first; the real stream only
     starts once auth passes and the TCP side is connected. Accept comes first so
     the application close codes actually reach the client.
@@ -80,8 +81,8 @@ async def vnc_websocket(
     # The token is a live credential (valid up to 24h) — never log it. A binary
     # first frame (e.g. a stock RFB client pointed here directly) is rejected.
     token = message.get("text") or ""
-    if not is_owner_init_data(token, bot_token=bot_token, allowed_user_id=allowed_user_id):
-        logger.info("vnc ws rejected: invalid or non-owner initData")
+    if not is_allowed_init_data(token, bot_token=bot_token, allowed_user_ids=allowed_user_ids):
+        logger.info("vnc ws rejected: invalid or non-allowlisted initData")
         await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="unauthorized")
         return
 

@@ -1,6 +1,6 @@
 # Balam multi-player — proposal
 
-**Date:** 2026-08-10 · **Status:** proposal for discussion · **Scope:** code + deploy changes to support two users on one Balam instance
+**Date:** 2026-08-10 · **Status:** proposal for discussion; a reduced version is implemented (§10) · **Scope:** code + deploy changes to support two users on one Balam instance
 
 **Target use cases**
 
@@ -8,6 +8,15 @@
 2. **Non-priority:** same deployment, but the 2 users share **one** supergroup.
 
 > **If only one gets implemented, it is the priority case — which is also the easier one.** Chat-as-tenant rides the store's existing `(chat_id, thread_id)` keys, so per-user scoping mostly falls out; the same-supergroup case needs everything the priority case needs *plus* topic ownership and per-message sender attribution. The work plan (§5) implements the priority case only and keeps the second as a deferred extension (§6).
+
+> **Update (2026-09-01): a smaller version of this shipped.** The immediate need
+> turned out to be narrower than either case above — one existing supergroup, a
+> second person, and **no** separate identity: same VM account, same GitHub, same
+> Claude login, same files. That removes the whole identity design (§3.3) and all
+> per-user tenancy, and leaves a widened allowlist. It is implemented on this branch;
+> see **§10** for exactly what it covers and what it does not do. The rest of this
+> document stays valid as the design for real multi-user support, which the
+> shipped version does not preclude.
 
 This proposal is grounded in a full audit of the backend (three parallel code sweeps: Telegram auth/routing, agent-backend identity, shared resources). ADR-0007 and ADR-0008 both say "revisit together if this ever goes multi-user" — this is that revisit.
 
@@ -229,3 +238,63 @@ Everything in Phase 1's ownership work (initiator on keyboards, user on schedule
 | 0015 / 0017 | Unchanged, but capacity note: the hold cap (`_MAX_HELD_TURNS = 3`, ADR-0017) is one per-instance budget, so held turns are shared across users, not granted per user |
 | 0016 | Schedules owned by a user; fire with the owner's identity and timezone |
 | New 0018 | Users are first-class; the tenant boundary is the chat (priority case) with topic ownership as the extension point (same-chat case) |
+
+---
+
+## 10. What was implemented (2026-09-01): one chat, two people, one identity
+
+The use case that arrived was smaller than both cases in this document: an
+existing forum supergroup, the owner, and one more person — with **no** request
+for separate GitHub accounts, separate Unix accounts, or separate Claude logins.
+Everyone shares one identity on the VM.
+
+That removes almost all of the work above. There is no second tenant, so there is
+nothing to scope per user; there is one identity, so there is nothing to switch
+turns between. What is left is the allowlist.
+
+### What changed
+
+| Area | Change |
+| --- | --- |
+| Config | `ADDITIONAL_TELEGRAM_USER_IDS` (comma-separated) next to `ALLOWED_TELEGRAM_USER_ID`; `Config.allowed_user_ids` is the one list every check reads. Parsed from a `str` field on purpose — pydantic-settings JSON-decodes `list[int]`, which would need `[222,333]` in `.env` |
+| Message filter | `filters.User(user_id=config.allowed_user_ids)`; the chat filter is unchanged |
+| Callbacks | The four hand-inlined checks in `callbacks.py` now call `auth.callback_authorized` (Phase 0, item 1), so the allowlist widened in one place |
+| `auth.py` | `is_owner(...)` → `is_allowed_user(from_id, allowed_user_ids)` |
+| Mini App | `RequireOwner` → `RequireUser`, gating on the list and returning **the caller's** id; `is_owner_init_data` → `is_allowed_init_data`; same for the noVNC WebSocket |
+| Attribution | `message_text.sender_prefix` prepends `[From Bob Lee (@bob)]` to a non-owner's prompt and to a mid-turn follow-up. The owner's prompts are byte-identical to before |
+| Docs | ADR-0008 amendment, `.env.example`, CLAUDE.md, codebase guide |
+
+No database migration, no `config.yaml` change, no deploy change. Roughly 300
+lines across 11 source files and 3 test files.
+
+### What it deliberately does not do
+
+- **No credential isolation.** The second person's turns run as `ubuntu`, with
+  the owner's Claude login and limits, `gh`, git, ssh and files. `send_file` still
+  has no path boundary (§7), so it can deliver any file the process can read. This
+  is the trade that makes the change small; it is only safe between people who
+  already trust each other with the machine.
+- **No per-user data scoping.** The Mini App shows both people the same diffs,
+  markdown snapshots and live browser view. `/model` and `/effort` stay per-chat.
+  Either person can cancel or delete the other's topics and schedules, and either
+  can tap approve on the other's turn.
+- **No per-user identity in the agent.** The agent is told who is speaking, but it
+  still acts as one person.
+
+### Operational notes for this deployment
+
+- Set `ALLOWED_TELEGRAM_CHAT_ID`. Without it, an added user id can also open a
+  private chat with the bot and get an unscoped agent.
+- Group privacy mode in BotFather must stay off, or the bot only receives
+  commands and replies. It is already off wherever plain messages work today.
+- The added person must post as themselves. A message sent as an anonymous group
+  admin carries no real `from_user` and is dropped.
+- One supergroup means one Telegram flood budget (about 20 messages per minute)
+  shared by both people's streaming turns.
+
+### If real multi-user is wanted later
+
+Nothing here blocks it. §3.1–3.4 stay the design: user profiles in `config.yaml`,
+`resolve_user` in place of a flat list, ownership columns, and per-user Unix
+accounts for identity. The implemented version is the degenerate case of that
+design with one tenant and one identity.
