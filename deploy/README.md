@@ -16,6 +16,10 @@ the security conditions this setup enforces.
 The frontend is **not** a runtime service: `bun run build` produces `apps/frontend/dist`,
 which FastAPI serves. OpenCode (`:4096`) and any VNC ports are **never** tunneled.
 
+This is one bot on one Claude account. To run a second bot on a **second Claude
+account** on the same VM, see [A second instance, on a second Claude
+account](#a-second-instance-on-a-second-claude-account) below.
+
 ## In-Telegram Mini App: direct link
 
 Telegram allows the in-app `web_app` button **only in private chats**. Balam is
@@ -63,6 +67,120 @@ journalctl -u balam -f                 # bot + Mini App logs
 journalctl -u cloudflared-balam -f     # tunnel logs
 sudo systemctl restart balam           # after editing code / .env / balam.env
 ```
+
+## A second instance, on a second Claude account
+
+One VM can run several Balam bots, each signed in to a different Claude account.
+The first instance stays exactly as described above. Each extra instance is a
+**second checkout** with its own bot, its own port, and its own Claude login.
+
+What makes the accounts separate is one environment variable. The `claude` CLI
+reads its whole identity from `CLAUDE_CONFIG_DIR` (default `~/.claude`): the
+saved login in `.credentials.json`, plus `.claude.json`, `projects/`,
+`sessions/`, `settings.json`, `skills/` and `plugins/`. The Agent SDK starts the
+CLI with the unit's environment, so setting the variable in the unit is enough.
+Balam needs no code change, and this works only for `AGENT_BACKEND=claude_sdk`.
+
+### Layout, by convention
+
+For an instance named `<name>` (lowercase letters, digits and dashes):
+
+| Thing        | Path or name                       | Notes                                          |
+| ------------ | ---------------------------------- | ---------------------------------------------- |
+| checkout     | `~/projects/balam-<name>`          | own `.env`, `config.yaml`, `balam.sqlite`      |
+| Claude account | `~/.claude-<name>`               | own login, settings, skills, sessions          |
+| bot service  | `balam@<name>.service`             | from the `balam@.service` template             |
+| tunnel       | `cloudflared-balam@<name>.service` | optional; ingress `/etc/cloudflared/balam-<name>.yml` |
+
+The units hard-code these paths through systemd's `%i`, so the names are not
+free-form.
+
+### Install
+
+```sh
+deploy/install-instance.sh <name>
+```
+
+Run it once with the name you want. The first run creates the checkout (a local
+clone of `~/projects/balam`, with `origin` repointed at the real remote), copies
+`.env.example` and `config.example.yaml` into place, and then stops and lists
+what you must fill in. Fill those in and run it again.
+
+Before it starts anything, the script refuses an instance that would break
+quietly:
+
+- **A reused bot token.** Two pollers on one token make Telegram answer `409
+  Conflict`, and both bots stop receiving messages. Each instance needs its own
+  BotFather bot.
+- **A shared `BALAM_PORT`.** The Mini App server binds `127.0.0.1:BALAM_PORT`,
+  and the port has one owner.
+- **`CLAUDE_CONFIG_DIR` set in the instance `.env`.** systemd lets an
+  `EnvironmentFile` override the unit's `Environment=`, whatever the order in
+  the unit file. Such a line would point the new bot at the first bot's Claude
+  account — the one failure this whole setup exists to prevent. The unit owns
+  this variable.
+- **`AGENT_BACKEND` other than `claude_sdk`.** The OpenCode path would need a
+  second server on its own port with its own `OPENCODE_DB`; these units do not
+  set that up.
+- **A config directory with no Claude login.** The script prints the exact
+  command: `CLAUDE_CONFIG_DIR=~/.claude-<name> claude auth login`. Skip this
+  check with `--skip-auth-check` (it is skipped anyway when the instance `.env`
+  sets `ANTHROPIC_API_KEY`).
+
+It also warns, without stopping, when both instances share `BALAM_VNC_PORT` —
+`/browser` then shows whichever agent's Chrome is on that display.
+
+### What a new config directory starts with
+
+`~/.claude-<name>` starts empty. The SDK backend asks for
+`setting_sources=["user", …]` and `skills="all"`, so without help the new bot
+sees none of your global skills and none of your settings allow-list, and every
+tool call reaches the approval keyboard. The script therefore seeds the
+directory: it **symlinks** `skills/` to `~/.claude/skills` (one copy, shared) and
+**copies** `settings.json` and `CLAUDE.md` (independent from then on). Pass
+`--no-seed` to skip this. Plugins are not seeded; install them per config
+directory if you want them.
+
+### One-time tunnel setup (per instance)
+
+Only if this instance needs a public Mini App:
+
+```sh
+cloudflared tunnel create balam-<name>
+cloudflared tunnel route dns balam-<name> <your-host>
+```
+
+Then copy `cloudflared-balam.example.yml` to
+`~/projects/balam-<name>/deploy/cloudflared-balam.yml`, point its ingress at
+that instance's `BALAM_PORT`, register a BotFather Mini App for the new bot, and
+put `BALAM_PUBLIC_URL` and `BALAM_MINIAPP_SHORTNAME` in
+`~/projects/balam-<name>/deploy/balam.env`. Re-run the install script. Without a
+tunnel the instance still works; `/diff` replies with a `127.0.0.1` URL instead
+of an in-Telegram button.
+
+### Operate
+
+```sh
+systemctl status balam@<name>
+journalctl -u balam@<name> -f
+sudo systemctl restart balam@<name>              # after editing that checkout or its .env
+CLAUDE_CONFIG_DIR=~/.claude-<name> claude auth status
+```
+
+### What is shared, and what that means
+
+Every instance runs as the same OS user, `ubuntu`. This is **configuration**
+separation, not **security** separation: either bot's agent can read the other's
+`.credentials.json`, files, SSH keys and `gh` login. That is acceptable when both
+Claude accounts belong to one person, which is what this setup assumes. It is the
+same trust boundary ADR-0008 already describes for
+`ADDITIONAL_TELEGRAM_USER_IDS`.
+
+If the two accounts belong to two different people, give the second instance its
+own OS user instead. A different `HOME` gives it a different `~/.claude` with no
+environment variable at all, and real file separation. The cost is that the
+second user needs its own skills, its own git and `gh` credentials, and its own
+uv environment.
 
 ## Alternative: quick (ephemeral) tunnel
 
