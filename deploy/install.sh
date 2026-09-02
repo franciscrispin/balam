@@ -14,6 +14,9 @@
 #   - deploy/balam.env (git-ignored) with the public-mode overlay:
 #       BALAM_PUBLIC_URL=https://<your-host>
 #       BALAM_MINIAPP_SHORTNAME=<botfather short name>
+#
+# This installs THE first instance. For a second bot on a second Claude account,
+# use install-instance.sh instead (see "A second instance" in README.md).
 set -euo pipefail
 
 REPO=/home/ubuntu/projects/balam

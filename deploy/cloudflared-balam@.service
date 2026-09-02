@@ -1,0 +1,32 @@
+# Cloudflare named tunnel for an EXTRA Balam instance's Mini App (ADR-0013).
+# The first instance keeps cloudflared-balam.service; this template serves the
+# ones after it.
+#
+# One tunnel per instance, because each needs its own stable hostname for its own
+# BotFather Mini App. One-time setup, per instance (install-instance.sh does not
+# do this — it creates account-side state):
+#
+#   cloudflared tunnel create balam-%i
+#   cloudflared tunnel route dns balam-%i <your-host>
+#
+# then fill in /home/ubuntu/projects/balam-%i/deploy/cloudflared-balam.yml
+# (copy cloudflared-balam.example.yml, point ingress at that instance's
+# BALAM_PORT). install-instance.sh installs it as /etc/cloudflared/balam-%i.yml.
+
+[Unit]
+Description=Cloudflare named tunnel for the Balam Mini App, instance %i (ADR-0013)
+After=network-online.target balam@%i.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+# Ingress maps ONLY this instance's hostname to its own 127.0.0.1:<BALAM_PORT>.
+# The agent's VNC port is never tunneled. The explicit --config avoids
+# cloudflared auto-loading ~/.cloudflared/config.yml (another app).
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /etc/cloudflared/balam-%i.yml tunnel run balam-%i
+Restart=on-failure
+RestartSec=6s
+
+[Install]
+WantedBy=multi-user.target

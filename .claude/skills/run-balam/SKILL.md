@@ -69,13 +69,35 @@ daemon-reload`.
 
 The bot poller is a **singleton**. If `balam.service` is up and you _also_ start
 a second poller (e.g. `uv run balam` by hand, or the old dev scripts), Telegram
-returns **`409 Conflict`** and the bot silently stops receiving messages. There
-is one bot, one workspace — never run a second copy. If the bot looks dead and
-the logs show 409, find and kill the rival poller (or just `sudo systemctl
-restart balam` after ensuring nothing else is running `balam`).
+returns **`409 Conflict`** and the bot silently stops receiving messages. Never
+run a second poller **on the same bot token**. If the bot looks dead and the logs
+show 409, find and kill the rival poller (or just `sudo systemctl restart balam`
+after ensuring nothing else is running `balam`).
 
 Likewise `:4096` (OpenCode) and `:3000` (Mini App) are single-owner ports; a
 hand-started copy will collide with the systemd one.
+
+The trap is the **token**, not the machine. A separate instance with its own
+BotFather token and its own port is fine — see below.
+
+## Extra instances (a second Claude account)
+
+This VM can run more than one Balam bot, each signed in to a different Claude
+account. Instance `<name>` is a separate checkout at `~/projects/balam-<name>`,
+with its own bot token, its own `BALAM_PORT`, and its own Claude login in
+`~/.claude-<name>` (the unit sets `CLAUDE_CONFIG_DIR`). Extra instances are
+`claude_sdk`-only, so they do not use `balam-opencode.service`.
+
+| Action      | Command                                        |
+| ----------- | ---------------------------------------------- |
+| **Status**  | `systemctl status balam@<name>`                |
+| **Logs**    | `journalctl -u balam@<name> -n 100 --no-pager` |
+| **Restart** | `sudo systemctl restart --no-block balam@<name>` |
+| **Install / update** | `deploy/install-instance.sh <name>`   |
+| **Which account** | `CLAUDE_CONFIG_DIR=~/.claude-<name> claude auth status` |
+
+`systemctl status 'balam@*'` lists them all. `deploy/README.md` has the full
+setup, including the checks the install script makes and why each one matters.
 
 ## Restarting the bot from the bot
 
