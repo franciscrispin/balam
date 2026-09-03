@@ -4,10 +4,10 @@
 # /etc/cloudflared/balam.yml. The tunnel id is not secret; the credentials JSON
 # it points at IS — keep it out of git (it lives in ~/.cloudflared).
 #
-# Exposes ONLY the FastAPI server on 127.0.0.1:3000. OpenCode (:4096) and VNC are
+# Exposes ONLY the FastAPI server on 127.0.0.1:<BALAM_PORT>. OpenCode (:4096) and VNC are
 # never tunneled. Stable hostname → BotFather Web App URL never churns.
 tunnel: <tunnel-id>
-credentials-file: /home/ubuntu/.cloudflared/<tunnel-id>.json
+credentials-file: <home>/.cloudflared/<tunnel-id>.json  # e.g. /home/ubuntu/.cloudflared/...
 
 ingress:
   - hostname: <your-host> # e.g. balam.example.com

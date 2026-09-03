@@ -5,12 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=@USER@
 # Named tunnel with a STABLE hostname, so the
 # BotFather Web App URL never churns. Ingress maps ONLY that host → 127.0.0.1:3000
 # (the FastAPI server). OpenCode (:4096) and VNC are never tunneled. The explicit
 # --config avoids cloudflared auto-loading ~/.cloudflared/config.yml (another app).
-ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /etc/cloudflared/balam.yml tunnel run balam
+ExecStart=@CLOUDFLARED@ --no-autoupdate --config /etc/cloudflared/@TUNNEL_NAME@.yml tunnel run @TUNNEL_NAME@
 Restart=on-failure
 RestartSec=6s
 

@@ -9,9 +9,9 @@ the security conditions this setup enforces.
 
 | Unit                        | What it does                                              |
 | --------------------------- | -------------------------------------------------------- |
-| `balam-opencode.service`    | `opencode serve` on `127.0.0.1:4096` (the agent)         |
-| `balam.service`             | `uv run balam` — the bot **and** the Mini App API/server on `127.0.0.1:3000` |
-| `cloudflared-balam.service` | named tunnel: `https://<your-host>` → `127.0.0.1:3000` only (`/etc/cloudflared/balam.yml`) |
+| `balam-opencode.service`    | `opencode serve` on `127.0.0.1:4096` (the agent) — **only** when `AGENT_BACKEND=opencode` |
+| `balam.service`             | `uv run balam` — the bot **and** the Mini App API/server on `127.0.0.1:$BALAM_PORT` |
+| `cloudflared-balam.service` | named tunnel: `https://<your-host>` → that port only (`/etc/cloudflared/balam.yml`) |
 
 The frontend is **not** a runtime service: `bun run build` produces `apps/frontend/dist`,
 which FastAPI serves. OpenCode (`:4096`) and any VNC ports are **never** tunneled.
@@ -28,6 +28,43 @@ scoped to a forum **supergroup**, so `/diff` instead sends a **direct Mini App l
 Telegram's webview (with signed `initData`) in any chat type. This needs a
 BotFather-registered Mini App and a **stable** hostname (hence the named tunnel —
 the BotFather Web App URL is fixed).
+
+## Unit files are rendered, not copied
+
+systemd units are static files — no variables, no "this user's home". So the
+units here are **templates**: `balam.service.in`, `balam@.service.in`, and so on,
+carrying `@USER@` / `@HOME@` / `@REPO@` / `@PATH@` placeholders. The install
+scripts render them into `/etc/systemd/system` through `lib.sh`. Nothing in this
+directory is tied to one host, and there is no per-machine fork of the units to
+keep in sync.
+
+`lib.sh` **derives** every value from the machine: the OS user running the
+installer, that user's home, the checkout the script itself lives in, and
+`command -v uv` / `bun` / `cloudflared`. The unit `PATH` is probed from the
+toolchains actually installed under that home (bun, `.local/bin`, the highest
+nvm node, cargo, go) — systemd sources no profile, so anything missing from that
+line is missing for every shell the agent's Bash tool spawns.
+
+A typical host therefore needs **no configuration at all**. To override
+something — a different OS user, instances checked out elsewhere, a pinned
+`PATH`, which Claude account the first bot runs as — copy
+`deploy.env.example` to `deploy/deploy.env` (git-ignored) and set only what
+differs. It holds paths, never secrets; those stay in the repo `.env`.
+
+Rendered units carry a `# GENERATED …` header. Editing one in `/etc/` is
+pointless — the next install overwrites it. Edit the template or `deploy.env`
+and re-run the installer.
+
+### Which Claude account the first bot runs as
+
+`BALAM_PRIMARY_CLAUDE_CONFIG_DIR` is worth calling out. Unset — the default —
+leaves `balam.service` on `~/.claude`, which is right when the machine runs one
+bot and nobody uses `claude` interactively on it.
+
+Set it when `~/.claude` is a **person's** login rather than the bot's. Otherwise
+the bot's account is whatever that person last ran `claude auth login` as, and
+the two share one rate limit. Extra instances are always pinned, by
+`balam@.service`.
 
 ## One-time setup (creates public / account state — not in `install.sh`)
 
@@ -56,8 +93,12 @@ OpenCode password).
 deploy/install.sh
 ```
 
-Copies the units + `/etc/cloudflared/balam.yml`, builds the Mini App, and starts
-opencode + bot + tunnel.
+Renders the units into `/etc/systemd/system`, installs
+`/etc/cloudflared/balam.yml`, builds the Mini App, and starts the bot + tunnel —
+plus `balam-opencode.service`, but **only** when the repo `.env` says
+`AGENT_BACKEND=opencode`. In `claude_sdk` mode the agent runs in-process, so that
+unit is neither installed nor ordered against; installing it anyway would leave a
+service that fails on every boot.
 
 ## Operate
 
@@ -87,13 +128,15 @@ For an instance named `<name>` (lowercase letters, digits and dashes):
 
 | Thing        | Path or name                       | Notes                                          |
 | ------------ | ---------------------------------- | ---------------------------------------------- |
-| checkout     | `~/projects/balam-<name>`          | own `.env`, `config.yaml`, `balam.sqlite`      |
+| checkout     | `<next to the primary>-<name>`     | own `.env`, `config.yaml`, `balam.sqlite`      |
 | Claude account | `~/.claude-<name>`               | own login, settings, skills, sessions          |
 | bot service  | `balam@<name>.service`             | from the `balam@.service` template             |
 | tunnel       | `cloudflared-balam@<name>.service` | optional; ingress `/etc/cloudflared/balam-<name>.yml` |
 
-The units hard-code these paths through systemd's `%i`, so the names are not
-free-form.
+The instance name reaches the unit through systemd's `%i`, and the surrounding
+paths are rendered from the machine — so the checkout lands beside the primary
+(`/srv/balam` → `/srv/balam-work`), and `BALAM_INSTANCE_ROOT` /
+`BALAM_INSTANCE_PREFIX` in `deploy.env` move it if you want it elsewhere.
 
 ### Install
 
@@ -102,7 +145,7 @@ deploy/install-instance.sh <name>
 ```
 
 Run it once with the name you want. The first run creates the checkout (a local
-clone of `~/projects/balam`, with `origin` repointed at the real remote), copies
+clone of the primary checkout, with `origin` repointed at the real remote), copies
 `.env.example` and `config.example.yaml` into place, and then stops and lists
 what you must fill in. Fill those in and run it again.
 
@@ -137,7 +180,8 @@ It also warns, without stopping, when both instances share `BALAM_VNC_PORT` —
 sees none of your global skills and none of your settings allow-list, and every
 tool call reaches the approval keyboard. The script therefore seeds the
 directory: it **symlinks** `skills/` to `~/.claude/skills` (one copy, shared) and
-**copies** `settings.json` and `CLAUDE.md` (independent from then on). Pass
+**copies** `settings.json` and `CLAUDE.md` (independent from then on). Set
+`BALAM_SEED_FROM` in `deploy.env` to seed from somewhere else, or pass
 `--no-seed` to skip this. Plugins are not seeded; install them per config
 directory if you want them.
 
@@ -150,11 +194,11 @@ cloudflared tunnel create balam-<name>
 cloudflared tunnel route dns balam-<name> <your-host>
 ```
 
-Then copy `cloudflared-balam.example.yml` to
-`~/projects/balam-<name>/deploy/cloudflared-balam.yml`, point its ingress at
+Then copy `cloudflared-balam.example.yml` to that instance's
+`deploy/cloudflared-balam.yml`, point its ingress at
 that instance's `BALAM_PORT`, register a BotFather Mini App for the new bot, and
-put `BALAM_PUBLIC_URL` and `BALAM_MINIAPP_SHORTNAME` in
-`~/projects/balam-<name>/deploy/balam.env`. Re-run the install script. Without a
+put `BALAM_PUBLIC_URL` and `BALAM_MINIAPP_SHORTNAME` in that instance's
+`deploy/balam.env`. Re-run the install script. Without a
 tunnel the instance still works; `/diff` replies with a `127.0.0.1` URL instead
 of an in-Telegram button.
 
@@ -169,7 +213,7 @@ CLAUDE_CONFIG_DIR=~/.claude-<name> claude auth status
 
 ### What is shared, and what that means
 
-Every instance runs as the same OS user, `ubuntu`. This is **configuration**
+Every instance runs as the same OS user. This is **configuration**
 separation, not **security** separation: either bot's agent can read the other's
 `.credentials.json`, files, SSH keys and `gh` login. That is acceptable when both
 Claude accounts belong to one person, which is what this setup assumes. It is the

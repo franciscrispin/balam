@@ -4,13 +4,17 @@
 #
 #   deploy/install-instance.sh <name> [--no-seed] [--skip-auth-check]
 #
-# The first instance stays as it is (balam.service, ~/projects/balam, ~/.claude).
-# Every instance after it follows this convention, which the unit templates
-# hard-code:
+# The first instance stays as it is (balam.service, this checkout, its Claude
+# config dir). Every instance after it follows this convention, which the unit
+# template is rendered with — the paths come from the machine and from
+# deploy/deploy.env, not from a hardcoded host:
 #
-#   checkout   /home/ubuntu/projects/balam-<name>   own .env, config.yaml, balam.sqlite
-#   Claude     /home/ubuntu/.claude-<name>          own login, settings, skills, sessions
-#   units      balam@<name>.service                 + cloudflared-balam@<name>.service
+#   checkout   <instance root>/<prefix>-<name>   own .env, config.yaml, balam.sqlite
+#   Claude     <home>/.claude-<name>             own login, settings, skills, sessions
+#   units      balam@<name>.service              + cloudflared-balam@<name>.service
+#
+# By default <instance root>/<prefix> is the parent directory and basename of THIS
+# checkout, so the instance lands next to the primary.
 #
 # The second Claude account comes from CLAUDE_CONFIG_DIR, which the unit sets.
 # The `claude` CLI resolves .credentials.json, .claude.json, projects/,
@@ -26,10 +30,13 @@
 # Idempotent: re-run it after editing the instance .env or pulling new code.
 set -euo pipefail
 
-PROJECTS=/home/ubuntu/projects
-USER_HOME=/home/ubuntu
-PRIMARY="$PROJECTS/balam"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib.sh
+. "$SCRIPT_DIR/lib.sh"
+balam_deploy_init
+
+PRIMARY="$BALAM_REPO"
+USER_HOME="$BALAM_HOME"
 
 usage() {
   cat <<'USAGE'
@@ -37,9 +44,9 @@ Install an extra Balam instance: a second bot on a second Claude account.
 
   deploy/install-instance.sh <name> [--no-seed] [--skip-auth-check]
 
-  <name>              instance name, e.g. "work". Its checkout is
-                      ~/projects/balam-<name> and its Claude account lives in
-                      ~/.claude-<name>.
+  <name>              instance name, e.g. "work". Its checkout sits next to this
+                      one as <prefix>-<name>, and its Claude account lives in
+                      ~/.claude-<name>. Both paths are printed below.
   --no-seed           do not copy ~/.claude/settings.json + CLAUDE.md or symlink
                       skills/ into the new config dir.
   --skip-auth-check   install even when that config dir has no Claude login yet.
@@ -84,14 +91,21 @@ if ! printf '%s' "$NAME" | grep -qE '^[a-z][a-z0-9-]{0,20}$'; then
   exit 2
 fi
 
-REPO="$PROJECTS/balam-$NAME"
+REPO="$BALAM_INSTANCE_ROOT/$BALAM_INSTANCE_PREFIX-$NAME"
 CFG="$USER_HOME/.claude-$NAME"
 ENV_FILE="$REPO/.env"
 OVERLAY="$REPO/deploy/balam.env"
 
-for tool in git uv bun; do
-  command -v "$tool" >/dev/null || {
-    echo "$tool is not on PATH" >&2
+# uv and bun are resolved by lib.sh (command -v, or a deploy.env override), so
+# check the resolved paths rather than PATH — the installer may well run from a
+# shell whose PATH differs from the unit's.
+command -v git >/dev/null || {
+  echo "git is not on PATH" >&2
+  exit 2
+}
+for tool in "$BALAM_UV" "$BALAM_BUN"; do
+  [ -x "$tool" ] || {
+    echo "$tool is not executable — set BALAM_UV / BALAM_BUN in deploy/deploy.env" >&2
     exit 2
   }
 done
@@ -102,16 +116,6 @@ problems=()
 problem() { problems+=("$1"); }
 warn() { printf '  ! %s\n' "$1"; }
 
-# Read one KEY=value out of an env file. Last assignment wins, quotes stripped,
-# commented lines ignored — close enough to how systemd and pydantic-settings
-# read the same file for the checks below.
-env_get() {
-  [ -f "$1" ] || return 0
-  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | tail -1 |
-    sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
-}
-
-env_has() { [ -f "$1" ] && grep -qE "^[[:space:]]*$2[[:space:]]*=" "$1"; }
 
 port_in_use() { ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
 
@@ -156,21 +160,21 @@ fi
 
 echo "==> Checking the instance configuration"
 
-backend=$(env_get "$ENV_FILE" AGENT_BACKEND)
+backend=$(balam_env_get "$ENV_FILE" AGENT_BACKEND)
 if [ "$backend" != "claude_sdk" ]; then
   problem "AGENT_BACKEND is '${backend:-unset}'. Extra instances are claude_sdk-only: the whole point is a second Claude account, and the OpenCode path would need its own server port and its own OPENCODE_DB, which these units do not set up."
 fi
 
-token=$(env_get "$ENV_FILE" TELEGRAM_BOT_TOKEN)
+token=$(balam_env_get "$ENV_FILE" TELEGRAM_BOT_TOKEN)
 if [ -z "$token" ]; then
   problem "TELEGRAM_BOT_TOKEN is empty in $ENV_FILE. Make a second bot with BotFather."
-elif [ "$token" = "$(env_get "$PRIMARY/.env" TELEGRAM_BOT_TOKEN)" ]; then
+elif [ "$token" = "$(balam_env_get "$PRIMARY/.env" TELEGRAM_BOT_TOKEN)" ]; then
   problem "TELEGRAM_BOT_TOKEN is the same token as $PRIMARY/.env. Two pollers on one token make Telegram return 409 Conflict, and both bots stop receiving messages. Each instance needs its own bot."
 fi
 
-primary_port=$(env_get "$PRIMARY/.env" BALAM_PORT)
+primary_port=$(balam_env_get "$PRIMARY/.env" BALAM_PORT)
 primary_port=${primary_port:-3000}
-port=$(env_get "$ENV_FILE" BALAM_PORT)
+port=$(balam_env_get "$ENV_FILE" BALAM_PORT)
 if [ -z "$port" ]; then
   problem "BALAM_PORT is unset in $ENV_FILE. It defaults to 3000, which the first instance owns — pick a free port (e.g. $((primary_port + 1)))."
 elif [ "$port" = "$primary_port" ]; then
@@ -184,15 +188,15 @@ fi
 # would therefore win and run this instance as the first instance's Claude
 # account — the exact failure this whole setup exists to avoid.
 for f in "$ENV_FILE" "$OVERLAY"; do
-  if env_has "$f" CLAUDE_CONFIG_DIR; then
+  if balam_env_has "$f" CLAUDE_CONFIG_DIR; then
     problem "$f sets CLAUDE_CONFIG_DIR. systemd lets an EnvironmentFile override the unit's Environment=, so that line would silently point this instance at another account's Claude login. Remove it — balam@.service owns this variable and sets it to $CFG."
   fi
 done
 
-db=$(env_get "$ENV_FILE" BALAM_DB_PATH)
+db=$(balam_env_get "$ENV_FILE" BALAM_DB_PATH)
 # A relative BALAM_DB_PATH resolves against each unit's own WorkingDirectory, so
 # the two databases are already separate. Only an absolute path can collide.
-if [ -n "$db" ] && [ "${db#/}" != "$db" ] && [ "$db" = "$(env_get "$PRIMARY/.env" BALAM_DB_PATH)" ]; then
+if [ -n "$db" ] && [ "${db#/}" != "$db" ] && [ "$db" = "$(balam_env_get "$PRIMARY/.env" BALAM_DB_PATH)" ]; then
   problem "BALAM_DB_PATH $db is the first instance's database. Sharing it would mix both bots' topic-to-session maps and schedules."
 fi
 
@@ -208,12 +212,12 @@ if [ "${#problems[@]}" -gt 0 ]; then
 fi
 
 # Warnings: real, but not worth refusing to install over.
-vnc=$(env_get "$ENV_FILE" BALAM_VNC_PORT)
-primary_vnc=$(env_get "$PRIMARY/.env" BALAM_VNC_PORT)
+vnc=$(balam_env_get "$ENV_FILE" BALAM_VNC_PORT)
+primary_vnc=$(balam_env_get "$PRIMARY/.env" BALAM_VNC_PORT)
 if [ "${vnc:-5900}" = "${primary_vnc:-5900}" ]; then
   warn "BALAM_VNC_PORT ${vnc:-5900} is shared with the first instance, so /browser shows whichever agent's Chrome is on that display. Give this instance its own x11vnc port if both will browse."
 fi
-config_path=$(env_get "$ENV_FILE" BALAM_CONFIG_PATH)
+config_path=$(balam_env_get "$ENV_FILE" BALAM_CONFIG_PATH)
 if [ -n "$config_path" ] && [ "${config_path#"$REPO"}" = "$config_path" ]; then
   warn "BALAM_CONFIG_PATH points outside $REPO ($config_path), so this bot's contexts are not the ones in its own checkout."
 fi
@@ -222,7 +226,7 @@ fi
 
 mkdir -p "$CFG"
 
-if [ "$AUTH_CHECK" -eq 1 ] && [ -z "$(env_get "$ENV_FILE" ANTHROPIC_API_KEY)" ]; then
+if [ "$AUTH_CHECK" -eq 1 ] && [ -z "$(balam_env_get "$ENV_FILE" ANTHROPIC_API_KEY)" ]; then
   email=$(claude_email "$CFG")
   if [ -z "$email" ]; then
     echo >&2
@@ -235,7 +239,7 @@ if [ "$AUTH_CHECK" -eq 1 ] && [ -z "$(env_get "$ENV_FILE" ANTHROPIC_API_KEY)" ];
     exit 1
   fi
   echo "    Claude account for this instance: $email"
-  if [ "$email" = "$(claude_email "$USER_HOME/.claude")" ]; then
+  if [ "$email" = "$(claude_email "${BALAM_PRIMARY_CLAUDE_CONFIG_DIR:-$USER_HOME/.claude}")" ]; then
     warn "that is the same account the first instance uses — both bots will draw on one subscription."
   fi
 fi
@@ -243,26 +247,27 @@ fi
 # --- build ------------------------------------------------------------------
 
 echo "==> Syncing the backend venv (uv sync)"
-(cd "$REPO/apps/backend" && uv sync --quiet)
+(cd "$REPO/apps/backend" && "$BALAM_UV" sync --quiet)
 
 echo "==> Building the Mini App (FastAPI serves dist/ from this checkout)"
-(cd "$REPO" && bun install --silent >/dev/null && bun run build >/dev/null)
+(cd "$REPO" && "$BALAM_BUN" install --silent >/dev/null)
+balam_build_miniapp "$REPO"
 
 # --- seed the config dir ----------------------------------------------------
 
 if [ "$SEED" -eq 1 ]; then
-  echo "==> Seeding $CFG from ~/.claude (nothing existing is overwritten)"
+  echo "==> Seeding $CFG from $BALAM_SEED_FROM (nothing existing is overwritten)"
   # A fresh config dir has no skills and no settings, and the SDK backend asks
   # for setting_sources=["user",...] with skills="all" — so without this the
   # instance's agent sees none of the global skills and none of the settings
   # allow-list, and every tool call goes to the approval keyboard.
-  if [ ! -e "$CFG/skills" ] && [ -d "$USER_HOME/.claude/skills" ]; then
-    ln -s "$USER_HOME/.claude/skills" "$CFG/skills"
-    echo "    skills -> ~/.claude/skills (symlink: one copy, both instances)"
+  if [ ! -e "$CFG/skills" ] && [ -d "$BALAM_SEED_FROM/skills" ]; then
+    ln -s "$BALAM_SEED_FROM/skills" "$CFG/skills"
+    echo "    skills -> $BALAM_SEED_FROM/skills (symlink: one copy, both instances)"
   fi
   for f in settings.json CLAUDE.md; do
-    if [ ! -e "$CFG/$f" ] && [ -f "$USER_HOME/.claude/$f" ]; then
-      cp "$USER_HOME/.claude/$f" "$CFG/$f"
+    if [ ! -e "$CFG/$f" ] && [ -f "$BALAM_SEED_FROM/$f" ]; then
+      cp "$BALAM_SEED_FROM/$f" "$CFG/$f"
       echo "    $f copied (independent from now on)"
     fi
   done
@@ -270,17 +275,19 @@ fi
 
 # --- units ------------------------------------------------------------------
 
-echo "==> Installing unit files to /etc/systemd/system"
+echo "==> Rendering unit files into /etc/systemd/system"
 # Shared templates: every extra instance runs the same balam@.service, so this
-# also updates any instance installed earlier from an older checkout.
-sudo cp "$SCRIPT_DIR/balam@.service" /etc/systemd/system/balam@.service
+# also updates any instance installed earlier from an older checkout. That is
+# safe only because the template is machine-level, not instance-level — every
+# per-instance value reaches it through systemd's %i.
+balam_render "$SCRIPT_DIR/balam@.service.in" /etc/systemd/system/balam@.service
 
 TUNNEL=0
 if [ -f "$REPO/deploy/cloudflared-balam.yml" ]; then
   TUNNEL=1
-  sudo cp "$SCRIPT_DIR/cloudflared-balam@.service" /etc/systemd/system/cloudflared-balam@.service
+  balam_render "$SCRIPT_DIR/cloudflared-balam@.service.in" /etc/systemd/system/cloudflared-balam@.service
   sudo mkdir -p /etc/cloudflared
-  sudo cp "$REPO/deploy/cloudflared-balam.yml" "/etc/cloudflared/balam-$NAME.yml"
+  sudo install -m 0644 "$REPO/deploy/cloudflared-balam.yml" "/etc/cloudflared/balam-$NAME.yml"
   echo "    tunnel ingress -> /etc/cloudflared/balam-$NAME.yml"
 else
   echo "    no $REPO/deploy/cloudflared-balam.yml — skipping the tunnel."

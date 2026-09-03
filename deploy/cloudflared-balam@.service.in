@@ -9,7 +9,7 @@
 #   cloudflared tunnel create balam-%i
 #   cloudflared tunnel route dns balam-%i <your-host>
 #
-# then fill in /home/ubuntu/projects/balam-%i/deploy/cloudflared-balam.yml
+# then fill in @INSTANCE_ROOT@/@INSTANCE_PREFIX@-%i/deploy/cloudflared-balam.yml
 # (copy cloudflared-balam.example.yml, point ingress at that instance's
 # BALAM_PORT). install-instance.sh installs it as /etc/cloudflared/balam-%i.yml.
 
@@ -20,11 +20,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=@USER@
 # Ingress maps ONLY this instance's hostname to its own 127.0.0.1:<BALAM_PORT>.
 # The agent's VNC port is never tunneled. The explicit --config avoids
 # cloudflared auto-loading ~/.cloudflared/config.yml (another app).
-ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /etc/cloudflared/balam-%i.yml tunnel run balam-%i
+ExecStart=@CLOUDFLARED@ --no-autoupdate --config /etc/cloudflared/balam-%i.yml tunnel run balam-%i
 Restart=on-failure
 RestartSec=6s
 
