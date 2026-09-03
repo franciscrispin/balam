@@ -60,10 +60,11 @@ systemctl restart --no-block balam`.
 - **Frontend code (`apps/frontend`):** rebuild first, since the backend serves
   the static build — `bun run build` (from repo root), then `sudo systemctl
 restart --no-block balam`.
-- **A unit file or the tunnel ingress (`deploy/*.service`,
-  `cloudflared-balam.yml`):** re-run `deploy/install.sh` (it copies the units,
-  `daemon-reload`s, rebuilds, and restarts), or copy by hand + `sudo systemctl
-daemon-reload`.
+- **A unit template, `deploy/deploy.env`, or the tunnel ingress
+  (`deploy/*.service.in`, `cloudflared-balam.yml`):** re-run `deploy/install.sh`.
+  The units in `/etc/systemd/system` are **rendered** from the `.in` templates,
+  not copied, so editing one in `/etc/` is pointless — the next install
+  overwrites it. The script `daemon-reload`s, rebuilds and restarts.
 
 ## The 409 singleton trap
 
@@ -119,8 +120,9 @@ process from both the bot and the agent.
 
 ## First install on a fresh VM
 
-`deploy/install.sh` copies the units + tunnel config, builds the Mini App, and
-enables+starts all three. It assumes the **one-time** account/public state is
+`deploy/install.sh` renders the units from `deploy/*.service.in`, installs the
+tunnel config, builds the Mini App, and enables+starts them. It installs
+`balam-opencode.service` only when the repo `.env` says `AGENT_BACKEND=opencode`. It assumes the **one-time** account/public state is
 already done (named tunnel + DNS, BotFather Mini App, `deploy/balam.env`) — see
 `deploy/README.md` for those steps. Deps are assumed installed; on a brand-new
 checkout, once:

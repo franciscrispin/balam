@@ -2,9 +2,9 @@
 # VM and OS user. The first instance stays plain balam.service; this template is
 # only for the ones after it.
 #
-# Instance %i is a SEPARATE CHECKOUT at /home/ubuntu/projects/balam-%i with its
+# Instance %i is a SEPARATE CHECKOUT at @INSTANCE_ROOT@/@INSTANCE_PREFIX@-%i with its
 # own .env (bot token, BALAM_PORT), its own config.yaml, its own balam.sqlite,
-# and its own Claude login under /home/ubuntu/.claude-%i.
+# and its own Claude login under @HOME@/.claude-%i.
 #
 # Install with deploy/install-instance.sh %i — it checks the things that break
 # quietly rather than loudly (a shared port, a reused bot token, an overridden
@@ -17,8 +17,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/projects/balam-%i/apps/backend
+User=@USER@
+WorkingDirectory=@INSTANCE_ROOT@/@INSTANCE_PREFIX@-%i/apps/backend
 
 # This one line is what makes the instance a second Claude account. The `claude`
 # CLI resolves its whole identity from CLAUDE_CONFIG_DIR (default ~/.claude):
@@ -32,25 +32,26 @@ WorkingDirectory=/home/ubuntu/projects/balam-%i/apps/backend
 # order in this file. A CLAUDE_CONFIG_DIR line in the instance .env would
 # therefore win, and this instance would silently run as the first instance's
 # Claude account. install-instance.sh refuses that line for exactly this reason.
-Environment=CLAUDE_CONFIG_DIR=/home/ubuntu/.claude-%i
+Environment=CLAUDE_CONFIG_DIR=@HOME@/.claude-%i
+Environment=HOME=@HOME@
 
 # Secrets + config from this instance's own checkout. Same layering as
 # balam.service: the repo .env, then the optional public-mode overlay (note the
 # leading "-") holding BALAM_PUBLIC_URL and BALAM_MINIAPP_SHORTNAME.
-EnvironmentFile=/home/ubuntu/projects/balam-%i/.env
-EnvironmentFile=-/home/ubuntu/projects/balam-%i/deploy/balam.env
+EnvironmentFile=@INSTANCE_ROOT@/@INSTANCE_PREFIX@-%i/.env
+EnvironmentFile=-@INSTANCE_ROOT@/@INSTANCE_PREFIX@-%i/deploy/balam.env
 
-# Mirror the interactive zsh PATH, same as balam.service (keep the three in
-# sync). The agent subprocess is spawned by THIS unit, so its tool shells only
+# Rendered by deploy/lib.sh from the toolchains present on the machine (same as
+# balam.service). The agent subprocess is spawned by THIS unit, so its tool shells only
 # see this PATH; without it, user-installed CLIs (node, bun, glab, Go binaries in
 # ~/go/bin) are not found.
-Environment=PATH=/home/ubuntu/.bun/bin:/home/ubuntu/.opencode/bin:/home/ubuntu/.local/bin:/home/ubuntu/.nvm/versions/node/v24.15.0/bin:/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/usr/local/go/bin:/home/ubuntu/go/bin
-Environment=GOPATH=/home/ubuntu/go
+Environment=PATH=@PATH@
+Environment=GOPATH=@GOPATH@
 
 # No Requires=balam-opencode.service: extra instances are claude_sdk-only
 # (ADR-0014). The OpenCode path would need a second server on its own port and
 # its own OPENCODE_DB, which this template does not set up.
-ExecStart=/home/ubuntu/.local/bin/uv run balam
+ExecStart=@UV@ run balam
 Restart=on-failure
 RestartSec=5s
 

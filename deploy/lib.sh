@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Shared machine facts + unit-file rendering for the Balam deploy scripts.
+#
+# systemd unit files are static: no variables, no includes, no way to say "this
+# user's home". So the units in this directory are TEMPLATES (*.service.in) with
+# @TOKEN@ placeholders, and the install scripts render them into
+# /etc/systemd/system. That is what keeps deploy/ machine-independent instead of
+# forking a per-machine copy of every unit.
+#
+# Every value below is DERIVED from the machine by default — the OS user running
+# the install, its home, the checkout this script lives in, the uv/cloudflared on
+# PATH. A deployment that matches those defaults needs no configuration at all.
+# deploy/deploy.env (git-ignored) overrides any of them; see deploy.env.example.
+#
+# Sourced, never executed: `. "$(dirname "$0")/lib.sh"`.
+
+# --- facts ------------------------------------------------------------------
+
+balam_deploy_init() {
+  BALAM_DEPLOY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+  # The checkout being installed FROM is the one this script lives in — not a
+  # configured path. An installer that could target a different checkout than the
+  # one you are reading is a footgun, so this is deliberately not overridable.
+  BALAM_REPO=$(cd -- "$BALAM_DEPLOY_DIR/.." && pwd)
+
+  # shellcheck source=/dev/null
+  [ -f "$BALAM_DEPLOY_DIR/deploy.env" ] && . "$BALAM_DEPLOY_DIR/deploy.env"
+
+  BALAM_USER=${BALAM_USER:-$(id -un)}
+  BALAM_HOME=${BALAM_HOME:-$(getent passwd "$BALAM_USER" | cut -d: -f6)}
+  if [ -z "$BALAM_HOME" ]; then
+    echo "cannot determine the home directory of user '$BALAM_USER' — set BALAM_HOME in deploy/deploy.env" >&2
+    return 1
+  fi
+
+  # Where extra instances are checked out: alongside the primary checkout, so
+  # balam-<name> sits next to balam.
+  BALAM_INSTANCE_ROOT=${BALAM_INSTANCE_ROOT:-$(dirname "$BALAM_REPO")}
+  # The instance checkout basename is "<primary basename>-<name>".
+  BALAM_INSTANCE_PREFIX=${BALAM_INSTANCE_PREFIX:-$(basename "$BALAM_REPO")}
+
+  BALAM_UV=${BALAM_UV:-$(command -v uv || echo "$BALAM_HOME/.local/bin/uv")}
+  BALAM_BUN=${BALAM_BUN:-$(command -v bun || echo "$BALAM_HOME/.bun/bin/bun")}
+  BALAM_CLOUDFLARED=${BALAM_CLOUDFLARED:-$(command -v cloudflared || echo /usr/local/bin/cloudflared)}
+  BALAM_OPENCODE=${BALAM_OPENCODE:-$(command -v opencode || echo "$BALAM_HOME/.opencode/bin/opencode")}
+  BALAM_OPENCODE_DB=${BALAM_OPENCODE_DB:-$BALAM_HOME/.local/share/opencode/balam.db}
+  BALAM_GOPATH=${BALAM_GOPATH:-$BALAM_HOME/go}
+  BALAM_UNIT_PATH=${BALAM_UNIT_PATH:-$(balam_default_path)}
+
+  # Optional: pin the FIRST instance to a non-default Claude config directory.
+  # Unset (the common case) leaves it on ~/.claude. Set it when ~/.claude belongs
+  # to a person rather than to the bot — e.g. the operator's own interactive
+  # login — so the bot's account and the operator's account stay separate.
+  BALAM_PRIMARY_CLAUDE_CONFIG_DIR=${BALAM_PRIMARY_CLAUDE_CONFIG_DIR:-}
+
+  # Where a NEW instance's Claude config dir is seeded from: the global skills and
+  # settings a fresh directory would otherwise lack. Defaults to the operator's
+  # own ~/.claude, which is where machine-wide skills live even when no bot uses
+  # that directory.
+  BALAM_SEED_FROM=${BALAM_SEED_FROM:-$BALAM_HOME/.claude}
+
+  # The tunnel name, and so the unit's `tunnel run <name>` argument and the
+  # ingress file at /etc/cloudflared/<name>.yml.
+  BALAM_TUNNEL_NAME=${BALAM_TUNNEL_NAME:-balam}
+}
+
+# The agent subprocess (the `claude` CLI, or opencode) is spawned by the unit, so
+# its tool shells see ONLY the unit's PATH — systemd does not source a profile.
+# Probe for the user-installed toolchains that are actually present rather than
+# hardcoding one machine's list.
+balam_default_path() {
+  local dirs=() d node
+  for d in "$BALAM_HOME/.bun/bin" "$BALAM_HOME/.opencode/bin" "$BALAM_HOME/.local/bin"; do
+    [ -d "$d" ] && dirs+=("$d")
+  done
+  # nvm keeps one bin dir per node version; take the highest.
+  node=$(ls -d "$BALAM_HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1)
+  [ -n "$node" ] && dirs+=("$node")
+  [ -d "$BALAM_HOME/.cargo/bin" ] && dirs+=("$BALAM_HOME/.cargo/bin")
+  dirs+=(/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /usr/games /usr/local/games)
+  for d in /snap/bin /usr/local/go/bin "$BALAM_GOPATH/bin"; do
+    [ -d "$d" ] && dirs+=("$d")
+  done
+  (
+    IFS=:
+    printf '%s' "${dirs[*]}"
+  )
+}
+
+# --- building the Mini App --------------------------------------------------
+
+# balam_build_miniapp <repo>
+#
+# `bun run build` at the workspace root re-invokes bun through a plain shell
+# (`bun run --filter './apps/frontend' build`), so calling it by absolute path is
+# NOT enough — bun has to be ON PATH for that child, or the build dies with
+# "bun: command not found". The installer often runs from a shell whose PATH
+# lacks it (a systemd timer, a cron job, an agent), so put it there explicitly.
+balam_build_miniapp() {
+  (
+    cd "$1" || exit 1
+    PATH="$(dirname "$BALAM_BUN"):$PATH"
+    export PATH
+    "$BALAM_BUN" run build >/dev/null
+  )
+}
+
+# --- reading the instance's own .env ---------------------------------------
+
+# Read one KEY=value out of an env file. Last assignment wins, quotes stripped,
+# commented lines ignored — close enough to how systemd and pydantic-settings
+# read the same file.
+balam_env_get() {
+  [ -f "$1" ] || return 0
+  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | tail -1 |
+    sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+balam_env_has() { [ -f "$1" ] && grep -qE "^[[:space:]]*$2[[:space:]]*=" "$1"; }
+
+# --- rendering --------------------------------------------------------------
+
+# balam_render <template.in> <dest> [EXTRA_TOKEN=value ...]
+#
+# Tokens are @NAME@. Values are paths, so `|` is the sed delimiter; a value
+# containing `|` would break this, and none of these can.
+balam_render() {
+  local template=$1 dest=$2
+  shift 2
+
+  local -a script=(
+    -e "s|@USER@|$BALAM_USER|g"
+    -e "s|@HOME@|$BALAM_HOME|g"
+    -e "s|@REPO@|$BALAM_REPO|g"
+    -e "s|@INSTANCE_ROOT@|$BALAM_INSTANCE_ROOT|g"
+    -e "s|@INSTANCE_PREFIX@|$BALAM_INSTANCE_PREFIX|g"
+    -e "s|@UV@|$BALAM_UV|g"
+    -e "s|@CLOUDFLARED@|$BALAM_CLOUDFLARED|g"
+    -e "s|@OPENCODE@|$BALAM_OPENCODE|g"
+    -e "s|@OPENCODE_DB@|$BALAM_OPENCODE_DB|g"
+    -e "s|@PATH@|$BALAM_UNIT_PATH|g"
+    -e "s|@GOPATH@|$BALAM_GOPATH|g"
+    -e "s|@TUNNEL_NAME@|$BALAM_TUNNEL_NAME|g"
+  )
+  local kv
+  for kv in "$@"; do
+    script+=(-e "s|@${kv%%=*}@|${kv#*=}|g")
+  done
+
+  local tmp
+  tmp=$(mktemp)
+  {
+    printf '# GENERATED by deploy/%s from %s — do not edit this file.\n' \
+      "$(basename "${BASH_SOURCE[1]:-install.sh}")" "$(basename "$template")"
+    printf '# Edit the template in the checkout, or deploy/deploy.env, and re-run the installer.\n'
+    sed "${script[@]}" "$template"
+  } >"$tmp"
+
+  # Any @TOKEN@ left over means a template gained a placeholder that lib.sh does
+  # not know about — silently shipping it would produce a unit systemd rejects.
+  local leftover
+  # `|| true`: grep exits 1 when it finds nothing, which is the good case, and
+  # the callers run under `set -e`.
+  leftover=$( (grep -o '@[A-Z_]\{2,\}@' "$tmp" || true) | sort -u | tr '\n' ' ')
+  if [ -n "$leftover" ]; then
+    rm -f "$tmp"
+    echo "unsubstituted token(s) in $(basename "$template"): $leftover" >&2
+    return 1
+  fi
+
+  sudo install -m 0644 -o root -g root "$tmp" "$dest"
+  rm -f "$tmp"
+  echo "    $(basename "$dest")"
+}

@@ -9,7 +9,8 @@
 # Run this after starting OR restarting cloudflared-balam.service.
 set -euo pipefail
 
-ENV_FILE=/home/ubuntu/projects/balam/deploy/balam.env
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ENV_FILE="$SCRIPT_DIR/balam.env"
 
 url=""
 for _ in $(seq 1 30); do
