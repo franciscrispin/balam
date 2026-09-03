@@ -60,6 +60,7 @@ class Tool(StrEnum):
     TODOWRITE = "todowrite"
     TASK = "task"
     AGENT = "agent"
+    TOOLSEARCH = "toolsearch"
 
 
 class Permission(StrEnum):
@@ -88,6 +89,7 @@ class Permission(StrEnum):
     SKILL = "skill"
     PLAN_ENTER = "plan_enter"
     PLAN_EXIT = "plan_exit"
+    TOOLSEARCH = "toolsearch"
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,12 @@ REGISTRY: tuple[ToolSpec, ...] = (
     ToolSpec(Tool.TASK, "Task", Permission.TASK, ("Task",)),
     # OpenCode's alias for spawning a subagent; gates on the task permission.
     ToolSpec(Tool.AGENT, "Agent", Permission.TASK),
+    # SDK-only (the mirror image of apply_patch): the CLI defers most tool
+    # schemas, and ToolSearch is how the model loads one. Registered so an
+    # ``allowed_tools: [ToolSearch]`` entry — lowercased to ``toolsearch`` by
+    # parse_allowed_tool — matches the category; without it _category would fall
+    # back to the raw SDK name and the case-sensitive evaluator never matches.
+    ToolSpec(Tool.TOOLSEARCH, "ToolSearch", Permission.TOOLSEARCH, ("ToolSearch",)),
 )
 
 #: Wire name → Telegram display label.
