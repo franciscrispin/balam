@@ -2,7 +2,7 @@
 # Install an EXTRA Balam instance: a second bot, driven by a second Claude
 # account, on this same VM and the same OS user.
 #
-#   deploy/install-instance.sh <name> [--no-seed] [--skip-auth-check]
+#   deploy/install-instance.sh <name> [--no-seed] [--skip-auth-check] [--allow-shared-tunnel]
 #
 # The first instance stays as it is (balam.service, this checkout, its Claude
 # config dir). Every instance after it follows this convention, which the unit
@@ -42,7 +42,7 @@ usage() {
   cat <<'USAGE'
 Install an extra Balam instance: a second bot on a second Claude account.
 
-  deploy/install-instance.sh <name> [--no-seed] [--skip-auth-check]
+  deploy/install-instance.sh <name> [--no-seed] [--skip-auth-check] [--allow-shared-tunnel]
 
   <name>              instance name, e.g. "work". Its checkout sits next to this
                       one as <prefix>-<name>, and its Claude account lives in
@@ -50,6 +50,9 @@ Install an extra Balam instance: a second bot on a second Claude account.
   --no-seed           do not copy ~/.claude/settings.json + CLAUDE.md or symlink
                       skills/ into the new config dir.
   --skip-auth-check   install even when that config dir has no Claude login yet.
+  --allow-shared-tunnel
+                      start this instance's tunnel (balam-<name>) even though
+                      another machine is already serving it.
 
 The header of this script explains the layout and the trust boundary.
 USAGE
@@ -60,10 +63,12 @@ USAGE
 NAME=""
 SEED=1
 AUTH_CHECK=1
+ALLOW_SHARED_TUNNEL=${BALAM_ALLOW_SHARED_TUNNEL:-0}
 for arg in "$@"; do
   case "$arg" in
     --no-seed) SEED=0 ;;
     --skip-auth-check) AUTH_CHECK=0 ;;
+    --allow-shared-tunnel) ALLOW_SHARED_TUNNEL=1 ;;
     -h | --help)
       usage
       exit 0
@@ -198,6 +203,15 @@ db=$(balam_env_get "$ENV_FILE" BALAM_DB_PATH)
 # the two databases are already separate. Only an absolute path can collide.
 if [ -n "$db" ] && [ "${db#/}" != "$db" ] && [ "$db" = "$(balam_env_get "$PRIMARY/.env" BALAM_DB_PATH)" ]; then
   problem "BALAM_DB_PATH $db is the first instance's database. Sharing it would mix both bots' topic-to-session maps and schedules."
+fi
+
+# Tunnel names are account-wide (balam_tunnel_check in lib.sh has the story): a
+# second machine on the same tunnel round-robins this instance's Mini App with
+# it, and nothing on either machine says so.
+if [ -f "$REPO/deploy/cloudflared-balam.yml" ]; then
+  if ! BALAM_ALLOW_SHARED_TUNNEL="$ALLOW_SHARED_TUNNEL" balam_tunnel_check "balam-$NAME" "cloudflared-balam@$NAME.service"; then
+    problem "cannot start tunnel balam-$NAME (details above). Use a tunnel of your own, stop it on the other machine, or pass --allow-shared-tunnel."
+  fi
 fi
 
 if [ "${#problems[@]}" -gt 0 ]; then

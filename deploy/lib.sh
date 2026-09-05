@@ -173,3 +173,126 @@ balam_render() {
   rm -f "$tmp"
   echo "    $(basename "$dest")"
 }
+
+# --- the named tunnel -------------------------------------------------------
+
+# balam_tunnel_check <tunnel name> <this host's tunnel unit>
+#
+# Tunnel names are account-wide, so the name this host is about to run may
+# already be running on another machine, and nothing on this host would show
+# it. Cloudflare balances a tunnel's traffic across ALL of its connectors, so a
+# second machine joining the same tunnel — a copied credentials file, or
+# `cloudflared tunnel token <name>` — round-robins the Mini App between two VMs
+# while both look healthy. So: ask Cloudflare who is connected, subtract this
+# host's own connector (cloudflared logs "Connector ID: <uuid>" at every start
+# and the unit's journal keeps them), and refuse if anyone else is left.
+#
+# BALAM_ALLOW_SHARED_TUNNEL=1 (the installers' --allow-shared-tunnel flag)
+# downgrades the refusal to a warning. A deliberate two-connector setup is the
+# only reason to.
+#
+# `--config /dev/null` stops cloudflared from auto-loading ~/.cloudflared/config.yml,
+# which belongs to whatever OTHER tunnel this machine runs and makes a bare
+# `tunnel info <name>` resolve that tunnel's credentials instead of the name.
+# The account certificate (~/.cloudflared/cert.pem, from `cloudflared tunnel
+# login`) is found regardless.
+#
+# Exit status: 0 = the tunnel is exclusively ours, or the refusal was overridden,
+# or the check could not run at all (a network blip must not block a re-install
+# of a working system — a warning says so); 1 = another machine is serving the
+# tunnel, or the tunnel does not exist on this account.
+balam_tunnel_check() {
+  local name=$1 unit=$2
+  local py
+  py=$(command -v python3 || true)
+  if [ -z "$py" ] && [ -x "$BALAM_REPO/apps/backend/.venv/bin/python" ]; then
+    py="$BALAM_REPO/apps/backend/.venv/bin/python"
+  fi
+  if [ -z "$py" ]; then
+    echo "  ! no python3 to parse cloudflared's output — cannot check whether tunnel '$name' is served elsewhere." >&2
+    echo "    Verify by hand: cloudflared --config /dev/null tunnel info $name" >&2
+    return 0
+  fi
+
+  local err listing info
+  err=$(mktemp)
+  # stdout only: cloudflared prints "your version is outdated" on stderr, and
+  # that line would break the JSON.
+  if ! listing=$("$BALAM_CLOUDFLARED" --config /dev/null tunnel list -n "$name" -o json 2>"$err"); then
+    echo "  ! could not ask Cloudflare about tunnel '$name' (is 'cloudflared tunnel login' done on this host?):" >&2
+    sed 's/^/    /' "$err" >&2
+    rm -f "$err"
+    echo "  ! skipping the shared-tunnel check. Verify by hand: cloudflared --config /dev/null tunnel info $name" >&2
+    return 0
+  fi
+  if [ "$(printf '%s' "$listing" | "$py" -c 'import json,sys; print(len(json.load(sys.stdin) or []))')" = "0" ]; then
+    rm -f "$err"
+    echo "tunnel '$name' does not exist on this Cloudflare account." >&2
+    echo "  Create it (cloudflared tunnel create $name) and route DNS to it, or point BALAM_TUNNEL_NAME" >&2
+    echo "  in deploy/deploy.env at the tunnel you did create. Existing ones: cloudflared tunnel list" >&2
+    return 1
+  fi
+  if ! info=$("$BALAM_CLOUDFLARED" --config /dev/null tunnel info -o json "$name" 2>"$err"); then
+    echo "  ! could not read the connectors of tunnel '$name':" >&2
+    sed 's/^/    /' "$err" >&2
+    rm -f "$err"
+    echo "  ! skipping the shared-tunnel check. Verify by hand: cloudflared --config /dev/null tunnel info $name" >&2
+    return 0
+  fi
+  rm -f "$err"
+
+  local ours foreign
+  # `|| true`: grep exits 1 when the unit has never run here, which is the
+  # normal first-install case, and the callers run under `set -e`.
+  ours=$(sudo journalctl -u "$unit" -o cat --no-pager 2>/dev/null |
+    grep -o 'Connector ID: [0-9a-f-]\{36\}' | awk '{print $3}' | sort -u | tr '\n' ' ' || true)
+  # The JSON travels in the environment: stdin is taken by the heredoc.
+  if ! foreign=$(BALAM_TUNNEL_INFO="$info" "$py" - "$ours" <<'PY'
+import json
+import os
+import sys
+
+ours = set(sys.argv[1].split())
+info = json.loads(os.environ["BALAM_TUNNEL_INFO"])
+for c in info.get("conns") or []:
+    if c.get("id") in ours:
+        continue
+    ips = sorted({e.get("origin_ip") or "?" for e in c.get("conns") or []})
+    print(
+        f"{c.get('id', '?')}  from {', '.join(ips) or '?'}  "
+        f"{c.get('arch', '?')} cloudflared {c.get('version', '?')}  running since {c.get('run_at', '?')}"
+    )
+PY
+  ); then
+    echo "  ! could not parse cloudflared's answer for tunnel '$name'; skipping the shared-tunnel check." >&2
+    echo "    Verify by hand: cloudflared --config /dev/null tunnel info $name" >&2
+    return 0
+  fi
+  if [ -z "$foreign" ]; then
+    return 0
+  fi
+
+  if [ "${BALAM_ALLOW_SHARED_TUNNEL:-0}" = "1" ]; then
+    echo "  ! tunnel '$name' is also served by another machine (--allow-shared-tunnel: continuing):" >&2
+    printf '%s\n' "$foreign" | sed 's/^/    /' >&2
+    return 0
+  fi
+
+  cat >&2 <<EOF
+Tunnel '$name' is already being served by another machine:
+$(printf '%s\n' "$foreign" | sed 's/^/    /')
+
+Cloudflare balances a tunnel's requests across every connector, so starting the
+tunnel here would round-robin the Mini App between this VM and that one — and
+nothing on either machine would report it. Either:
+  - use a tunnel of your own: cloudflared tunnel create <new name>, route DNS to
+    it, point deploy/cloudflared-balam.yml at its id, and (first instance only)
+    set BALAM_TUNNEL_NAME=<new name> in deploy/deploy.env;
+  - stop the tunnel on the other machine first; or
+  - pass --allow-shared-tunnel if two connectors is really what you want.
+(If that connector is this host's own $unit and its journal was cleared,
+ restart the unit and re-run: the check knows this host by the connector ids
+ the unit logged.)
+EOF
+  return 1
+}
