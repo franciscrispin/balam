@@ -31,7 +31,13 @@ The design and the reasons behind it live in
 - [uv](https://docs.astral.sh/uv/) — the Python backend's runtime and package
   manager.
 - [Bun](https://bun.sh) — the frontend + shared workspace runtime.
-- [OpenCode](https://opencode.ai) — installed and run as a local server.
+- An agent runtime, chosen by `AGENT_BACKEND`: [OpenCode](https://opencode.ai)
+  installed and run as a local server, or, for `claude_sdk`, a Claude login
+  (`claude auth login`) or `ANTHROPIC_API_KEY`.
+- A Telegram bot from BotFather with **group privacy mode disabled**, and the
+  `-100…` id of the forum supergroup it lives in. Both fail silently when wrong;
+  [deploy/README.md](deploy/README.md#telegram-the-bot-and-the-group) has the
+  steps and the checks.
 
 ## Setup
 

@@ -54,6 +54,11 @@ alphabetically — the groups are the shape of the system.
   `ADDITIONAL_TELEGRAM_USER_IDS` — one trust boundary, several people). Message
   handlers get it as a PTB filter; callback queries carry no filter and must ask
   for it themselves.
+- **`startup_checks.py`** — asks Telegram, once at boot, about the two setups
+  that fail silently: group privacy mode still on (the bot then hears only
+  commands in the group) and a target chat it cannot see, or that has Topics
+  off. Returns warnings; `app.py` logs them. The *shape* of a wrong chat id
+  (not `-100…`) is refused earlier, in `config.py`.
 
 ### The Telegram surface
 

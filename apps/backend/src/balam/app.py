@@ -2,16 +2,19 @@
 
 Boot sequence:
   1. Validate configuration — fail fast on a bad trust boundary (ADR-0008).
-  2. Wait for the OpenCode server — we are its client (ADR-0001). Done in PTB's
-     ``post_init`` hook, before polling starts.
-  3. Open the SQLite topic→session map (ADR-0009).
-  4. Start the FastAPI Mini App server (ADR-0003) as an asyncio task alongside
+  2. Ask Telegram about the two setups that fail silently — group privacy mode
+     still on, a target chat the bot cannot see — and log a warning for each
+     (:mod:`balam.startup_checks`). Done in PTB's ``post_init`` hook.
+  3. Wait for the OpenCode server — we are its client (ADR-0001). Also in
+     ``post_init``, before polling starts.
+  4. Open the SQLite topic→session map (ADR-0009).
+  5. Start the FastAPI Mini App server (ADR-0003) as an asyncio task alongside
      the bot, bound to 127.0.0.1 (ADR-0007). Done in ``post_init``.
-  5. Re-arm the ``/schedule`` timers and run anything missed while Balam was
+  6. Re-arm the ``/schedule`` timers and run anything missed while Balam was
      down (ADR-0016) — last in ``post_init``, so a caught-up run finds a ready
      backend and a listening tool server.
-  6. Start the bot via long polling (ADR-0007: no public URL).
-  7. Stop the Mini App server, close OpenCode + SQLite on shutdown
+  7. Start the bot via long polling (ADR-0007: no public URL).
+  8. Stop the Mini App server, close OpenCode + SQLite on shutdown
      (``post_shutdown``).
 
 The same FastAPI server also bridges the noVNC WebSocket for the live-Chrome
@@ -39,6 +42,7 @@ from balam.contexts import ContextsConfigError, load_contexts
 from balam.opencode import OpenCode
 from balam.router import Router
 from balam.server import create_app
+from balam.startup_checks import check_telegram_setup
 from balam.store import SessionStore
 
 logger = logging.getLogger("balam")
@@ -113,6 +117,11 @@ def main() -> None:
         # registered list, not just by delivery).
         await register_commands(application.bot, config.allowed_telegram_chat_id)
         logger.info("registered bot commands (chat scope %s)", config.allowed_telegram_chat_id)
+        # Privacy mode left on, or a chat id that is no longer the group's, makes
+        # a bot that answers /status and ignores every plain message — with
+        # nothing from Telegram to say so. One WARNING each, here, instead.
+        for problem in await check_telegram_setup(application.bot, config):
+            logger.warning(problem)
         logger.info("waiting for the %s backend ...", config.agent_backend)
         await backend.wait_for_ready()
         logger.info("%s backend is ready.", config.agent_backend)

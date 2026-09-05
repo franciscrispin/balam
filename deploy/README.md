@@ -1,9 +1,13 @@
 # Deploy — Balam under systemd + Cloudflare tunnel (ADR-0013)
 
-Runs the three Balam services under systemd and exposes **only** the Mini App to
-the internet through a Cloudflare **named tunnel** (stable hostname), with Telegram
-`initData` (ADR-0008) as the trust boundary. Read **ADR-0013** first — it states
-the security conditions this setup enforces.
+Runs the Balam services under systemd (two, or three with the OpenCode backend)
+and exposes **only** the Mini App to the internet through a Cloudflare **named
+tunnel** (stable hostname), with Telegram `initData` (ADR-0008) as the trust
+boundary. Read **ADR-0013** first — it states the security conditions this setup
+enforces. Setting up a fresh VM? Work through the *Prerequisites* and *One-time
+setup* sections below in order — several of those steps fail silently on the
+Telegram or Cloudflare side. The installer and the bot catch what they can, and
+each section says which check exists.
 
 ## What runs
 
@@ -66,17 +70,108 @@ the bot's account is whatever that person last ran `claude auth login` as, and
 the two share one rate limit. Extra instances are always pinned, by
 `balam@.service`.
 
+## Prerequisites
+
+Install these on the VM before anything below. `install.sh` checks only for
+`cloudflared`, and only when a tunnel is configured; anything else missing
+fails later, somewhere less obvious.
+
+- **`uv`, `bun`, `git`** — the same toolchain as local development (root
+  `README.md`).
+- **`cloudflared`** — for the named tunnel. Install the build for the VM's
+  architecture ([GitHub releases](https://github.com/cloudflare/cloudflared/releases),
+  or Cloudflare's [downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/downloads/)),
+  then run `cloudflared tunnel login` once. It stores the account certificate in
+  `~/.cloudflared/cert.pem`, which `tunnel create` and `tunnel route dns` need.
+- **The agent runtime.** `AGENT_BACKEND=opencode` needs `opencode` on `PATH`.
+  `AGENT_BACKEND=claude_sdk` needs a Claude login in the config directory the
+  bot will use — `claude auth login`, or `CLAUDE_CONFIG_DIR=<dir> claude auth
+  login` when `BALAM_PRIMARY_CLAUDE_CONFIG_DIR` pins one — or `ANTHROPIC_API_KEY`
+  in `.env`.
+- **A Telegram bot and a forum supergroup**, set up as the next section
+  describes. The bot token, your user id and the group's chat id go in `.env`.
+
 ## One-time setup (creates public / account state — not in `install.sh`)
 
-1. **Named tunnel + DNS** (stable hostname):
+### Telegram: the bot and the group
+
+Two settings here fail **silently** on Telegram's side: the bot looks alive,
+answers `/status`, and ignores every plain message in a topic. Balam catches
+what it can at boot. A chat id that is not a `-100…` supergroup id is a config
+error, and privacy mode left on, Topics switched off, or a chat the bot cannot
+see each log a `WARNING` in `journalctl -u balam` right after
+`Application started`. Read that journal once after the first start.
+
+1. **Turn group privacy mode off.** BotFather's default ("Enable") makes a bot
+   in a group receive only commands, `@mentions` of it, and replies to its own
+   messages — so plain messages in a forum topic never reach Balam. In
+   BotFather: `/setprivacy` → pick the bot → **Disable**. Telegram applies the
+   change to a group only when the bot is (re-)added, so remove the bot from the
+   supergroup and add it back afterwards. (Promoting the bot to group **admin**
+   also works: admins receive every message regardless of the setting.) Verify:
+   ```sh
+   curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe"
+   # … "can_read_all_group_messages": true …
+   ```
+2. **Find `ALLOWED_TELEGRAM_CHAT_ID` (and your user id).** Create the group as
+   a supergroup with **Topics** enabled *first*, add the bot, and only then read
+   the id. A supergroup id starts with `-100`. Turning Topics on for an existing
+   basic group upgrades it to a supergroup and gives it a **new** id: the old,
+   shorter `-…` id still looks valid and produces the same silent ignore as
+   privacy mode. To read the id, stop the bot (a running poller consumes the
+   updates, and a second `getUpdates` caller gets `409 Conflict`), send
+   `/status` in any topic (a command arrives even while privacy mode is still
+   on), then:
+   ```sh
+   curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates" \
+     | jq '.result[] | .message? // empty
+            | {chat_id: .chat.id, type: .chat.type, is_forum: .chat.is_forum,
+               title: .chat.title, from_id: .from.id, migrate_to: .migrate_to_chat_id}'
+   ```
+   Take the `-100…` `chat_id` whose `type` is `supergroup` and `is_forum` is
+   `true`; `from_id` is your own `ALLOWED_TELEGRAM_USER_ID`. An update carrying
+   `migrate_to_chat_id` is the upgrade itself, and that value is the id to use.
+   Balam refuses to boot with an id of any other shape.
+
+### Public Mini App: tunnel, BotFather app, overlay
+
+1. **Named tunnel + DNS** (stable hostname). Tunnel names are shared by every
+   machine on the Cloudflare account. `install.sh` asks Cloudflare who is
+   connected to the tunnel before starting it and refuses when another machine
+   is (`--allow-shared-tunnel` overrides), but it cannot pick a name for you,
+   so look before creating one:
+   ```sh
+   cloudflared tunnel list     # CONNECTIONS shows where each tunnel is running now
+   ```
+   If `balam` is already listed, another machine is serving it. Pick a new name
+   (say `balam-<host>`), set `BALAM_TUNNEL_NAME=<name>` in `deploy/deploy.env`
+   so the unit runs that tunnel, and use it in place of `balam` below.
+   `cloudflared tunnel create` refuses a duplicate name, but a copied
+   credentials file or `cloudflared tunnel token <name>` joins the existing
+   tunnel as a second connector: Cloudflare then spreads the Mini App's
+   requests across both machines, and neither machine reports it.
+   `cloudflared --config /dev/null tunnel info <name>` lists a tunnel's
+   connectors; the `--config /dev/null` stops cloudflared from picking up an
+   unrelated `~/.cloudflared/config.yml`, which otherwise makes it resolve the
+   wrong tunnel.
    ```sh
    cloudflared tunnel create balam
    cloudflared tunnel route dns balam <your-host>      # e.g. balam.example.com
    ```
    Copy `cloudflared-balam.example.yml` to `cloudflared-balam.yml` (git-ignored) and
-   fill in the tunnel id + hostname (ingress → `127.0.0.1:3000`).
-2. **BotFather Mini App** (`/newapp` on your bot): Web App URL = `https://<your-host>/`,
-   pick a short name (e.g. `diff`).
+   fill in the tunnel id + hostname (ingress → `127.0.0.1:$BALAM_PORT`).
+2. **BotFather Mini App — `/newapp`, not "Configure Mini App".** Send `/newapp`
+   to BotFather, pick the bot, and answer its prompts: title, description, a
+   640×360 photo, an optional demo GIF (`/empty` skips it), the Web App URL
+   `https://<your-host>/`, and a **short name** (e.g. `diff`). The short name is
+   what Balam's links need: `/diff` sends `t.me/<bot>/<shortname>?startapp=…`
+   (`miniapp.py`), and only a `/newapp` app answers that form. BotFather's
+   newer Bot Settings → **Configure Mini App** looks like the same step and is
+   not: it sets the bot's *main* Mini App (`has_main_web_app`), which has no
+   short name and a different link form. Without a short name, `/diff` in the
+   supergroup falls back to a plain URL button that opens in the external
+   browser, where there is no signed `initData`, so every `/api` call is
+   rejected. `/myapps` in BotFather lists the apps that count.
 3. **`deploy/balam.env`** (git-ignored — public-mode overlay):
    ```
    BALAM_PUBLIC_URL=https://<your-host>
@@ -100,13 +195,21 @@ plus `balam-opencode.service`, but **only** when the repo `.env` says
 unit is neither installed nor ordered against; installing it anyway would leave a
 service that fails on every boot.
 
+No `deploy/cloudflared-balam.yml` means no tunnel: the script installs the bot
+alone, `/diff` replies with a `127.0.0.1` URL, and `balam.env` is optional.
+Create the ingress file and `balam.env` later and re-run to add the tunnel.
+With an ingress file, `balam.env` is required, because a tunnel the bot does
+not know the URL of is a quiet half-install. Before starting the tunnel the
+script checks that `cloudflared` is installed and that no other machine is
+already serving the same tunnel name (see the tunnel step above).
+
 ## Operate
 
 ```sh
-systemctl status balam balam-opencode cloudflared-balam
-journalctl -u balam -f                 # bot + Mini App logs
-journalctl -u cloudflared-balam -f     # tunnel logs
-sudo systemctl restart balam           # after editing code / .env / balam.env
+systemctl status balam cloudflared-balam   # add balam-opencode in opencode mode
+journalctl -u balam -f                     # bot + Mini App logs
+journalctl -u cloudflared-balam -f         # tunnel logs
+sudo systemctl restart balam               # after editing code / .env / balam.env
 ```
 
 ## A second instance, on a second Claude account

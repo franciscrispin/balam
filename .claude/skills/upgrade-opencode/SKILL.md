@@ -5,16 +5,27 @@ description: >-
   and upgrade it safely: compare the installed binary against the newest GitHub
   release, scan the changelog for HTTP/SSE API changes that could break the
   Balam backend, run `opencode upgrade`, then restart the systemd services.
-  Use this whenever the user asks to "upgrade opencode", "update opencode",
-  "bump opencode", asks "is opencode up to date / on the latest version", or
-  reports agent breakage that smells like an OpenCode version mismatch. For
-  plain start/stop/restart with no version change, use `run-balam` instead.
+  Only applies when the repo .env says AGENT_BACKEND=opencode; a claude_sdk
+  host has no OpenCode server and nothing here to upgrade. Use this whenever
+  the user asks to "upgrade opencode", "update opencode", "bump opencode", asks
+  "is opencode up to date / on the latest version", or reports agent breakage
+  that smells like an OpenCode version mismatch. For plain start/stop/restart
+  with no version change, use `run-balam` instead.
 ---
 
-# Upgrade OpenCode (the agent behind Balam)
+# Upgrade OpenCode (the agent behind Balam, in `opencode` mode)
+
+**Scope check first.** This skill applies only when the repo `.env` has
+`AGENT_BACKEND=opencode`. In `claude_sdk` mode (ADR-0014) there is no
+`balam-opencode.service` — the agent is the `claude` CLI the SDK spawns inside
+`balam.service` — so every `systemctl` call below fails, and "upgrade the agent"
+means upgrading the Claude CLI instead (`CLAUDE_SDK_CLI_PATH` in `.env.example`,
+`docs/claude-cli-gated-features.md`). Run `grep '^AGENT_BACKEND' .env` and stop
+here unless it says `opencode`.
 
 OpenCode is a separate process from this repo — `balam-opencode.service` runs
-`/home/ubuntu/.opencode/bin/opencode serve` on `127.0.0.1:4096`, and the Balam
+`opencode serve` on `127.0.0.1:4096` (the binary path is rendered into the unit
+by `deploy/lib.sh`; `systemctl cat balam-opencode` shows it), and the Balam
 backend talks to it over its **raw HTTP/SSE API** (hand-written client in
 `apps/backend/src/balam/opencode.py`, ADR-0002/0011). That raw-API coupling is
 why this skill exists: an upgrade can silently change endpoints Balam depends
@@ -35,8 +46,9 @@ curl -sL https://api.github.com/repos/anomalyco/opencode/releases/latest \
 Gotchas, learned the hard way:
 
 - Always check the **service's** binary by full path. A bare `opencode` on
-  `$PATH` can resolve to a different install; the path in
-  `deploy/balam-opencode.service`'s `ExecStart` is the one that matters.
+  `$PATH` can resolve to a different install; the path in the rendered unit's
+  `ExecStart` (`systemctl cat balam-opencode`, or `BALAM_OPENCODE` in
+  `deploy/deploy.env`) is the one that matters.
 - The project moved from the `sst` GitHub org to **`anomalyco`**. The old
   `sst/opencode` API URL returns a "Moved Permanently" JSON stub instead of a
   release — query `anomalyco/opencode` (and keep `-L` for any future move).
