@@ -102,3 +102,27 @@ def test_additional_user_ids_reject_non_positive() -> None:
     # A negative id is a chat id pasted into the wrong variable.
     with pytest.raises(ValidationError):
         Config(**_BASE, additional_telegram_user_ids="-1001234567890")  # type: ignore[arg-type]
+
+
+# --- ALLOWED_TELEGRAM_CHAT_ID: the forum supergroup (ADR-0010) -----------------
+
+
+def test_chat_id_accepts_a_supergroup_id() -> None:
+    cfg = Config(**_BASE, allowed_telegram_chat_id=-1004345919833)  # type: ignore[arg-type]
+    assert cfg.allowed_telegram_chat_id == -1004345919833
+
+
+def test_chat_id_blank_means_unset() -> None:
+    assert Config(**_BASE, allowed_telegram_chat_id=" ").allowed_telegram_chat_id is None  # type: ignore[arg-type]
+
+
+def test_chat_id_rejects_a_basic_group_id() -> None:
+    # The pre-Topics id of a group that was later upgraded: it looks valid and
+    # silently matches nothing. It must fail at boot, and say why.
+    with pytest.raises(ValidationError, match="-100"):
+        Config(**_BASE, allowed_telegram_chat_id=-5041599920)  # type: ignore[arg-type]
+
+
+def test_chat_id_rejects_a_user_id() -> None:
+    with pytest.raises(ValidationError):
+        Config(**_BASE, allowed_telegram_chat_id=123456)  # type: ignore[arg-type]

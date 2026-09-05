@@ -104,7 +104,8 @@ Backend modules (`apps/backend/src/balam/`) — `docs/codebase-guide.md` has the
 full map; the load-bearing ones:
 
 - **Entry / config:** `app.py` (boot), `config.py` (env validation), `contexts.py`
-  (`config.yaml` workspace contexts), `auth.py` (the ADR-0008 allowlist).
+  (`config.yaml` workspace contexts), `auth.py` (the ADR-0008 allowlist),
+  `startup_checks.py` (boot-time Telegram warnings: privacy mode, unreachable chat).
 - **Telegram surface:** `bot.py` is *only* the plain-message path plus the
   registrar — it builds the PTB app, fills `bot_data`, and wires handlers.
   Handlers live in `commands/` (`session.py`, `views.py`, `delete.py`,

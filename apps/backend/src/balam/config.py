@@ -190,6 +190,23 @@ class Config(BaseSettings):
             raise ValueError("must be a positive integer (your numeric Telegram user ID)")
         return value
 
+    @field_validator("allowed_telegram_chat_id")
+    @classmethod
+    def _forum_supergroup_chat_id(cls, value: int | None) -> int | None:
+        # A forum lives in a supergroup, and every supergroup id starts with
+        # -100. The shorter negative id of a basic group is the classic trap:
+        # enabling Topics upgrades the group to a supergroup with a NEW id, and
+        # the old one keeps looking valid while every update silently fails the
+        # chat filter. Refuse it here, where the message can say what to do.
+        if value is not None and not str(value).startswith("-100"):
+            raise ValueError(
+                f"{value} is not a forum supergroup id (those start with -100). A shorter "
+                "negative id is a basic group, which has no topics; enabling Topics upgrades it "
+                "to a supergroup with a NEW id. Read the current id with getUpdates "
+                "(.env.example, deploy/README.md)."
+            )
+        return value
+
     @field_validator("additional_telegram_user_ids")
     @classmethod
     def _parseable_user_ids(cls, value: str) -> str:
