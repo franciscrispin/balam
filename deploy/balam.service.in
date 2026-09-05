@@ -10,9 +10,9 @@ User=@USER@
 WorkingDirectory=@REPO@/apps/backend
 # Secrets + config from the repo .env (read by pydantic-settings). The optional
 # deploy/balam.env (note the leading "-") overlays the public-mode settings the
-# tunnel needs — BALAM_DEV_AUTH=0 and the current BALAM_PUBLIC_URL — and is
-# rewritten by deploy/refresh-tunnel-url.sh. Later EnvironmentFile wins, and a
-# real env var beats the repo .env (ADR-0008), so these take effect.
+# tunnel needs — BALAM_PUBLIC_URL and BALAM_MINIAPP_SHORTNAME — and is rewritten
+# by deploy/refresh-tunnel-url.sh under a quick tunnel. Later EnvironmentFile
+# wins, and a real env var beats the repo .env (ADR-0008), so these take effect.
 EnvironmentFile=@REPO@/.env
 EnvironmentFile=-@REPO@/deploy/balam.env
 # systemd derives HOME from User=, but state it so the agent subprocess and its
