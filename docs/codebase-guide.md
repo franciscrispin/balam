@@ -48,7 +48,10 @@ alphabetically — the groups are the shape of the system.
   with one combined message.
 - **`contexts.py`** — loads the **required** `config.yaml`. A *context* = a
   working `directory` + optional `model`/`effort` + `allowed_tools` +
-  `additional_directories` + `mcp` servers.
+  `additional_directories` + `mcp` servers + `respond_to` (`all`, or
+  `mentions` for topics where the bot answers only when @mentioned, replied
+  to, or sent a slash command — the gate is in `bot.py`, the detection in
+  `message_text.addresses_bot`).
 - **`auth.py`** — the ADR-0008 trust boundary: `is_allowed_user` and
   `callback_authorized`, both gating on `Config.allowed_user_ids` (the owner plus
   `ADDITIONAL_TELEGRAM_USER_IDS` — one trust boundary, several people). Message
