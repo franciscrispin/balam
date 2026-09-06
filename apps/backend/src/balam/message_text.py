@@ -8,6 +8,13 @@ are rendered back into a short bracketed header instead. :func:`sender_prefix`
 adds the one piece Telegram *does* keep but the agent still never sees: which
 person in the chat is speaking.
 
+One more gesture matters in a ``respond_to: mentions`` context, where people talk
+among themselves and the bot stays quiet: whether a message is *aimed at the bot*
+at all. :func:`addresses_bot` reads the three ways Telegram lets someone address
+a bot in a group — an ``@mention``, a reply to one of its messages, a slash
+command — and :func:`strip_bot_mention` removes the ``@handle`` again, since to
+the agent it is routing, not content.
+
 Everything here is a pure function of the message object. They duck-type their
 input (``getattr`` rather than ``isinstance``) so a stripped-down test double
 works as well as a real :class:`telegram.Message`.
@@ -15,6 +22,8 @@ works as well as a real :class:`telegram.Message`.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from typing import Any
 
 from telegram import Message, MessageEntity
@@ -46,6 +55,92 @@ def forwarded_slash_command(message: Message) -> bool:
         and ents[0].offset == 0
         and (ents[0].type == MessageEntity.BOT_COMMAND)
     )
+
+
+def _entity_text(source: str, entity: Any) -> str:
+    """The text an entity covers. The Bot API counts ``offset``/``length`` in
+    UTF-16 code units, so slice the UTF-16 encoding rather than the ``str`` —
+    an emoji ahead of the mention would otherwise shift the window."""
+    data = source.encode("utf-16-le")
+    start = entity.offset * 2
+    end = (entity.offset + entity.length) * 2
+    return data[start:end].decode("utf-16-le", errors="ignore")
+
+
+def mentions_bot(message: Any, *, bot_id: int | None, bot_username: str | None) -> bool:
+    """Whether the message ``@mentions`` this bot in its text or its caption.
+
+    Covers both entity shapes: a plain ``mention`` (``@balambot``, matched on the
+    username, case-insensitively) and a ``text_mention`` (a user linked by id,
+    which clients produce when the account has no username — rare for a bot,
+    but free to honour).
+    """
+    username = (bot_username or "").lower()
+    sources = (
+        (getattr(message, "text", None), getattr(message, "entities", None)),
+        (getattr(message, "caption", None), getattr(message, "caption_entities", None)),
+    )
+    for source, entities in sources:
+        for entity in entities or []:
+            if entity.type == MessageEntity.TEXT_MENTION:
+                user = getattr(entity, "user", None)
+                if user is not None and bot_id is not None and user.id == bot_id:
+                    return True
+            elif entity.type == MessageEntity.MENTION and source and username:
+                if _entity_text(source, entity).lstrip("@").lower() == username:
+                    return True
+    return False
+
+
+def _is_topic_anchor(reply: Any, message: Any) -> bool:
+    """Whether ``reply`` is forum bookkeeping rather than something the sender
+    chose to reply to. In a forum supergroup a message carries the topic's own
+    service message (topic created/edited) or anchor as ``reply_to_message``;
+    the person never replied to it, so it must not read as a reply — least of
+    all as a reply *to the bot*, which created the topic."""
+    if getattr(reply, "forum_topic_created", None) is not None:
+        return True
+    thread_id = getattr(message, "message_thread_id", None)
+    return thread_id is not None and getattr(reply, "message_id", None) == thread_id
+
+
+def replies_to_bot(message: Any, *, bot_id: int | None) -> bool:
+    """Whether the message is a genuine reply to one of the bot's own messages."""
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None or bot_id is None or _is_topic_anchor(reply, message):
+        return False
+    user = getattr(reply, "from_user", None)
+    return getattr(user, "id", None) == bot_id
+
+
+def addresses_bot(messages: Iterable[Any], *, bot_id: int | None, bot_username: str | None) -> bool:
+    """Whether any of ``messages`` is aimed at the bot — the gate for a
+    ``respond_to: mentions`` context (:class:`balam.contexts.ContextConfig`).
+
+    Three gestures count, mirroring what Telegram itself delivers to a bot in
+    privacy mode: an ``@mention`` in the text or caption, a reply to one of the
+    bot's messages, or a slash command. ``messages`` is one message in the
+    ordinary case and a whole album in the buffered one, where the mention sits
+    in whichever caption the client attached it to.
+    """
+    return any(
+        forwarded_slash_command(m)
+        or mentions_bot(m, bot_id=bot_id, bot_username=bot_username)
+        or replies_to_bot(m, bot_id=bot_id)
+        for m in messages
+    )
+
+
+def strip_bot_mention(text: str, bot_username: str | None) -> str:
+    """Remove every ``@<bot>`` token from ``text``, with the space that led into
+    it, so the agent sees ``what's the status`` rather than ``@balambot what's
+    the status``. Only this bot's handle, only as a whole token: ``@balambot2``
+    and ``mail@balambot`` are left alone. Everything else — line breaks, code,
+    indentation — is untouched."""
+    if not text or not bot_username:
+        return text
+    pattern = re.compile(rf"[ \t]*(?<![\w@])@{re.escape(bot_username)}(?!\w)", re.IGNORECASE)
+    return pattern.sub("", text).strip()
 
 
 def _user_label(user: Any) -> str | None:
@@ -115,12 +210,8 @@ def _reply_context_line(message: Any) -> str | None:
     quote = getattr(message, "quote", None)
     if reply is None and quote is None:
         return None
-    if reply is not None:
-        if getattr(reply, "forum_topic_created", None) is not None:
-            return None
-        thread_id = getattr(message, "message_thread_id", None)
-        if thread_id is not None and getattr(reply, "message_id", None) == thread_id:
-            return None
+    if reply is not None and _is_topic_anchor(reply, message):
+        return None
 
     who = None
     if reply is not None:

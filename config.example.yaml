@@ -28,6 +28,12 @@ contexts:
       # the per-edit approval prompt.
     # additional_directories:            # extra dirs the agent may read/edit
     #   - /home/ubuntu/projects/open-shrimp
+    # respond_to: mentions               # optional: all (default) | mentions.
+    #                                    # "mentions" makes this context's topics
+    #                                    # places people can talk among themselves:
+    #                                    # the agent answers only when @mentioned,
+    #                                    # replied to, or sent a slash command.
+    #                                    # Only allowlisted users are heard either way.
     # mcp:                               # optional per-context MCP servers
     #   # Local (stdio) server — OpenCode spawns the command:
     #   my-db:

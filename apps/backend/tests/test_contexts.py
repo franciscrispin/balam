@@ -218,3 +218,22 @@ def test_mcp_bad_shape_rejected(tmp_path) -> None:
 def test_mcp_defaults_to_empty(tmp_path) -> None:
     cfg = load_contexts(_write(tmp_path, CONFIG))
     assert cfg.get("balam").mcp == {}
+
+
+TEAM_CONTEXT = "  team:\n    directory: /home/me/team\n    description: Team chat\n"
+
+
+def test_respond_to_defaults_to_all(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG))
+    assert cfg.get("balam").respond_to == "all"
+
+
+def test_respond_to_mentions_accepted(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG + TEAM_CONTEXT + "    respond_to: mentions\n"))
+    assert cfg.get("team").respond_to == "mentions"
+    assert cfg.get("balam").respond_to == "all"
+
+
+def test_respond_to_unknown_value_rejected(tmp_path) -> None:
+    with pytest.raises(ContextsConfigError, match="respond_to"):
+        load_contexts(_write(tmp_path, CONFIG + TEAM_CONTEXT + "    respond_to: sometimes\n"))

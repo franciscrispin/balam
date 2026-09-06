@@ -88,8 +88,10 @@ from balam.commands.views import handle_artifacts, handle_browser, handle_diff
 from balam.config import Config
 from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
 from balam.message_text import (
+    addresses_bot,
     forward_reply_prefix,
     forwarded_slash_command,
+    strip_bot_mention,
     strip_bot_mention_from_command,
 )
 from balam.router import Router
@@ -170,6 +172,29 @@ async def _dispatch_messages(messages: list[Message], context: ContextTypes.DEFA
             await message.reply_text("✅ Custom answer added. Select more options or tap Done.")
             return
 
+    router: Router = context.application.bot_data["router"]
+
+    # A ``respond_to: mentions`` context turns its topics into places people talk
+    # among themselves: only a message aimed at the bot — an @mention, a reply to
+    # one of its messages, or a slash command — becomes a turn. Anything else is
+    # dropped right here, before an attachment is downloaded, so it never reaches
+    # the agent, its session, or a running turn's follow-up channel. General is
+    # exempt: a message there opens a new topic, which is already an explicit ask.
+    # Who may speak at all is decided earlier, by the allowlist filter (ADR-0008);
+    # this only decides which of their messages the agent hears.
+    bot_username = getattr(context.bot, "username", None)
+    mention_only = (
+        not is_forum_general_message(message)
+        and router.topic_context(chat_id, thread_id).respond_to == "mentions"
+    )
+    if mention_only:
+        if not addresses_bot(
+            messages, bot_id=getattr(context.bot, "id", None), bot_username=bot_username
+        ):
+            return
+        # The @handle was routing, not content: the agent sees the ask alone.
+        text = strip_bot_mention(text, bot_username)
+
     # Download any image/document attachments as native file parts (tier-1 plan §4);
     # the text is the message text or an attachment's caption.
     try:
@@ -181,9 +206,13 @@ async def _dispatch_messages(messages: list[Message], context: ContextTypes.DEFA
         await notify_error(context.bot, chat_id, thread_id, exc)
         return
     if not text and not files:
+        if mention_only:
+            # A bare "@balambot" got the bot's attention and nothing else; say so
+            # rather than leave the person wondering whether it heard.
+            await message.reply_text(
+                "👋 Mention me with a question, or reply to one of my messages."
+            )
         return
-
-    router: Router = context.application.bot_data["router"]
 
     if is_forum_general_message(message):
         created_thread_id = await create_topic_from_general(

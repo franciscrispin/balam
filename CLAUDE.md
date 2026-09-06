@@ -162,6 +162,11 @@ and replies with a "Go to topic" link — it does not rebind the current topic.
 ADR-0012: `permissions.py` translates them into a native OpenCode permission
 ruleset (pre-approved tools run without prompting), while the symlink-safe
 directory boundary and the human-approval keyboard stay local in `approvals.py`.
+`respond_to: mentions` makes a context's topics places people talk among
+themselves: the agent answers only when @mentioned, replied to, or sent a slash
+command (`message_text.addresses_bot`, gated in `bot.py`; ADR-0012 amendment).
+The allowlist still decides who is heard at all — this only picks which of an
+allowed user's messages become turns.
 
 ## Configuration
 

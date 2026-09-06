@@ -23,6 +23,10 @@ from balam.router import Router, TopicRef
 
 logger = logging.getLogger(__name__)
 
+#: The greeting line in a ``respond_to: mentions`` topic — the one place the
+#: rule is written down for the people talking there.
+MENTION_ONLY_RULE = "💬 Talk freely here — I only reply when @mentioned or replied to."
+
 
 def topic_title(message: Any, thread_id: int | None) -> str:
     """Best-effort human label for a freshly created session."""
@@ -190,9 +194,12 @@ async def open_topic_in_context(
 
     With a ``prompt`` the topic is named after it (``context: prompt``, as a
     General message would), and marked auto-named so the first turn doesn't
-    rename it again.
+    rename it again. A ``respond_to: mentions`` topic is marked auto-named too:
+    it is a place people talk, so it keeps the name it was given — the first
+    message that happens to tag the bot is not its subject.
     """
     ctx = router.contexts.contexts[name]
+    mention_only = ctx.respond_to == "mentions"
     title = topic_name(name, prompt) if prompt else name
     try:
         topic = await bot.create_forum_topic(chat_id=chat_id, name=title)
@@ -207,7 +214,7 @@ async def open_topic_in_context(
     new_thread_id = topic.message_thread_id
     try:
         await router.create_topic_session(
-            chat_id, new_thread_id, title, name, auto_named=bool(prompt)
+            chat_id, new_thread_id, title, name, auto_named=bool(prompt) or mention_only
         )
     except Exception as exc:
         logger.exception("failed to start session for new topic")
@@ -220,11 +227,16 @@ async def open_topic_in_context(
         raise TopicOpenError(f"⚠️ Couldn't start a session for {name!r}: {exc}") from exc
 
     # Greet inside the new topic so it isn't empty. With a prompt the turn lands
-    # right below the header, so don't ask for a message.
-    header = f"🗂 Context {name} — {ctx.directory}"
+    # right below the header, so don't ask for a message. A mention-only topic
+    # states its rule instead, for whoever reads it later.
+    lines = [f"🗂 Context {name} — {ctx.directory}"]
+    if mention_only:
+        lines.append(MENTION_ONLY_RULE)
+    elif not prompt:
+        lines.append("Send a message to start.")
     await bot.send_message(
         chat_id=chat_id,
-        text=header if prompt else f"{header}\nSend a message to start.",
+        text="\n".join(lines),
         message_thread_id=new_thread_id,
     )
     return new_thread_id, title

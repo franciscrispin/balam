@@ -568,6 +568,44 @@ context. Secrets never go in `config.yaml`.
   are command globs.
 - Adding a workspace is a config edit, not a code change.
 
+### Amendment (2026-09-06): `respond_to` — topics where the bot waits to be asked
+
+A context may set `respond_to: mentions` (default `all`). In its topics only a
+message *aimed at the bot* becomes a turn: an `@mention` in the text or caption,
+a reply to one of the bot's own messages, or a slash command — the same three
+gestures Telegram itself delivers to a bot in privacy mode
+(`message_text.addresses_bot`). Everything else is dropped in `bot.py` before
+any attachment is downloaded, so it never reaches the agent, its session, or a
+running turn's follow-up channel. The result is a topic where people talk among
+themselves and call the agent in when they want it.
+
+What this is, and what it is deliberately not:
+
+- **Not a trust-boundary change (ADR-0008).** The allowlist filter runs first and
+  still decides who is heard at all; someone not on the list is dropped whether
+  or not they tag the bot. Letting outsiders tag the bot would hand them the
+  owner's agent, credentials and connectors, so that stays out of scope.
+- **Context-level, not per-topic.** A topic binds to one context for life
+  (ADR-0009), so the policy is stable, needs no store migration, and
+  `/context team` or `/new team` opens a mention-only topic. A per-topic toggle
+  can come later if flipping an existing topic proves necessary.
+- **General is exempt.** A message there opens a new topic, which is already an
+  explicit ask, even when `default_context` is mention-only.
+- **The agent does not see the chatter.** Its session holds only the tagged
+  messages and its own replies, so "summarise what we discussed" cannot work.
+  The obvious follow-up is a bounded in-memory buffer of recent allowlisted
+  messages handed over on a tag; it is left out until the need is real, and if
+  built it must never include messages from people outside the allowlist, which
+  would be prompt-injection surface.
+- **Mention-only topics keep their name.** They are marked auto-named at
+  creation so the first tagged message never renames them, and the greeting
+  states the rule for whoever reads it later.
+- **The `@handle` is routing, not content.** It is stripped from the prompt
+  (`strip_bot_mention`); a bare `@handle` with nothing else gets a one-line hint
+  rather than silence.
+- **Telegram's privacy mode stays off.** It is bot-wide with no per-topic form
+  (`startup_checks.py` still warns when it is on), so the gate lives in Balam.
+
 ---
 
 ## ADR-0013: Expose the Mini App through an authenticated Cloudflare tunnel
