@@ -1,11 +1,18 @@
-"""Rich-message (Bot API 10.1) payload construction — mainly the math escaping.
+"""Rich-message (Bot API 10.1) payload construction — the two dialect fix-ups.
 
-The bug these guard: Telegram's rich parser implements the GFM math extension,
+The bugs these guard. Telegram's rich parser implements the GFM math extension,
 so ``$…$`` in agent prose became a ``mathematical_expression`` — serif italics,
 collapsed whitespace, ``-`` as ``−``, and any markdown inside it left literal.
+And it will not start a table on the line after a paragraph, where GitHub will,
+so every table the agent glued to its intro sentence went out as literal pipes.
 """
 
-from balam.rich_messages import _rich_payload, chunk_rich, escape_math_delimiters
+from balam.rich_messages import (
+    _rich_payload,
+    chunk_rich,
+    escape_math_delimiters,
+    separate_glued_tables,
+)
 
 # The line that actually shipped broken, from session fa2e5a2c (chaska, Amex
 # Shop Small). Telegram parsed it as "S" + math("3 back per in-store bill of
@@ -88,10 +95,97 @@ def test_leaves_dollar_free_markdown_untouched() -> None:
     assert escape_math_delimiters(source) == source
 
 
+# --- separate_glued_tables --------------------------------------------------
+
+# How the agent writes every table: header row right under the intro line.
+GLUED = "Here are the results:\n| Metric | Value |\n|---|---|\n| Speed | 42 |"
+UNGLUED = "Here are the results:\n\n| Metric | Value |\n|---|---|\n| Speed | 42 |"
+
+
+def test_inserts_a_blank_line_before_a_table_glued_to_a_paragraph() -> None:
+    assert separate_glued_tables(GLUED) == UNGLUED
+
+
+def test_leaves_a_separated_table_alone_so_the_fix_is_idempotent() -> None:
+    assert separate_glued_tables(UNGLUED) == UNGLUED
+
+
+def test_leaves_a_table_at_the_start_of_the_message_alone() -> None:
+    source = "| a | b |\n|---|---|\n| 1 | 2 |"
+    assert separate_glued_tables(source) == source
+
+
+def test_recognizes_alignment_colons_and_optional_outer_pipes() -> None:
+    assert separate_glued_tables("intro\n| a | b |\n|:---|---:|") == (
+        "intro\n\n| a | b |\n|:---|---:|"
+    )
+    assert separate_glued_tables("intro\na | b\n--- | :-:") == "intro\n\na | b\n--- | :-:"
+
+
+def test_a_bare_dash_line_is_not_a_delimiter_row() -> None:
+    # "---" under a line is a setext heading underline (or a thematic break);
+    # only a pipe-bearing row is a table delimiter. Splitting here would demote
+    # the heading to a paragraph.
+    source = "Title\nA | B heading\n---"
+    assert separate_glued_tables(source) == source
+
+
+def test_a_pipe_free_line_before_the_delimiter_is_not_a_header() -> None:
+    source = "intro\nno pipes here\n|---|---|"
+    assert separate_glued_tables(source) == source
+
+
+def test_a_table_inside_fenced_code_is_left_alone() -> None:
+    # A markdown example inside a code block is code, not a table to fix.
+    source = "See:\n```md\nname\n| a | b |\n|---|---|\n```\ndone"
+    assert separate_glued_tables(source) == source
+
+
+def test_an_unclosed_fence_hides_its_table_from_the_fix_up() -> None:
+    source = "intro\n```\nx\n| a |\n|---|"
+    assert separate_glued_tables(source) == source
+
+
+def test_a_table_right_after_a_closing_fence_gets_its_blank_line() -> None:
+    # A fence is its own block, so the blank line changes nothing for GitHub —
+    # and it is what Telegram wants.
+    assert separate_glued_tables("```\nx\n```\n| a |\n|---|") == "```\nx\n```\n\n| a |\n|---|"
+
+
+def test_fixes_every_glued_table_in_a_message() -> None:
+    source = "one\n| a |\n|---|\n| 1 |\n\ntwo\n| b |\n|---|\n| 2 |"
+    assert separate_glued_tables(source) == (
+        "one\n\n| a |\n|---|\n| 1 |\n\ntwo\n\n| b |\n|---|\n| 2 |"
+    )
+
+
+def test_a_header_row_still_waiting_for_its_delimiter_is_left_alone() -> None:
+    # Mid-stream the delimiter row has not arrived yet, so there is nothing to
+    # fix; the next live-edit carries it and gets the blank line.
+    source = "intro\n| a | b |"
+    assert separate_glued_tables(source) == source
+
+
+# --- _rich_payload ------------------------------------------------------------
+
+
 def test_rich_payload_escapes_so_no_send_path_can_miss_it() -> None:
     payload = _rich_payload(REGRESSION)
     assert "\\$" in payload["markdown"]
     assert payload["skip_entity_detection"] is True
+
+
+def test_rich_payload_unglues_tables_so_no_send_path_can_miss_it() -> None:
+    assert _rich_payload(GLUED)["markdown"] == UNGLUED
+
+
+def test_rich_payload_applies_both_fix_ups_to_one_table() -> None:
+    # The Amex table as it actually went out: glued to its intro *and* full of
+    # prices. Telegram got neither a table nor the right text.
+    payload = _rich_payload("Offers:\n" + REGRESSION + "\n|---|---|")
+    assert payload["markdown"] == (
+        "Offers:\n\n| Offer | S\\$3 back per in-store bill of **S\\$10+** |\n|---|---|"
+    )
 
 
 def test_chunk_rich_leaves_escaping_to_the_payload() -> None:

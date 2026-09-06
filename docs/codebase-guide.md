@@ -102,6 +102,10 @@ alphabetically — the groups are the shape of the system.
   to ≤4096 chars at code-block-aware boundaries. The per-message fallback when
   Telegram rejects a rich payload, and the renderer for keyboard prompts.
 - **`rich_messages.py`** — the Bot API 10.1 native-GFM path every reply takes.
+  Also where the agent's GFM is reconciled with Telegram's dialect on the way
+  out: `$` escaped so prices are not read as LaTeX, and a blank line put before
+  a table glued to a paragraph (Telegram will not start one otherwise). Both run
+  in `_rich_payload`, so send, edit and draft cannot diverge.
 - **`schedules.py`** — `/schedule`'s timers (ADR-0016): the `<when>` parser,
   `JobQueue` registration, the fire path, and boot catch-up. `commands/schedule.py`
   holds only the command surface.

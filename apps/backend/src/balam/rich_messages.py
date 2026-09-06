@@ -8,10 +8,13 @@ structure MarkdownV2 has no way to express — tables, headings, task lists,
 ``<details>`` collapsibles — and lift the length cap from 4096 to 32768
 characters.
 
-Near-as-is, though, not as-is: Telegram's dialect is a *superset* of the agent's,
-so one construct still has to be escaped on the way out. See
-:func:`escape_math_delimiters` — ``$…$`` is LaTeX to Telegram and a pair of
-prices to everyone else.
+Near-as-is, though, not as-is: the two dialects disagree in both directions, so
+two things are reconciled on the way out, in :func:`_rich_payload`. Where
+Telegram reads *more* than the agent meant, :func:`escape_math_delimiters` — a
+``$…$`` pair is LaTeX to Telegram and two prices to everyone else. Where it
+reads *less*, :func:`separate_glued_tables` — GitHub lets a table start on the
+line after a paragraph, Telegram wants a blank line first and otherwise shows
+the pipes.
 
 python-telegram-bot does not wrap these methods: upstream paused Bot API 10.1
 work on 2026-06-18 pending an internal refactor and closed the community PRs, so
@@ -120,6 +123,38 @@ def _escape_dollars_outside_codespans(text: str) -> str:
     return "".join(out)
 
 
+def _fenced_segments(markdown: str) -> list[tuple[bool, list[str]]]:
+    """Split ``markdown`` into runs of lines, each flagged ``is_fenced_code``.
+
+    A fenced block runs from its opening fence line through its closing fence
+    line inclusive; an unclosed fence runs to the end (truncation mid-stream
+    leaves one, and treating the tail as code is the safe direction for every
+    caller — a missed fix-up, never a corrupted code block).
+    """
+    segments: list[tuple[bool, list[str]]] = []
+    fence: str | None = None
+
+    for line in markdown.split("\n"):
+        match = _FENCE_RE.match(line)
+        if fence is None:
+            if match:
+                fence = match.group(1)
+                segments.append((True, [line]))
+            elif segments and not segments[-1][0]:
+                segments[-1][1].append(line)
+            else:
+                segments.append((False, [line]))
+            continue
+        segments[-1][1].append(line)
+        # A closing fence is the same character, at least as long, and alone on
+        # its line — otherwise ```` ```python ```` would close ```` ``` ````.
+        if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+            if not match.group(2).strip():
+                fence = None
+
+    return segments
+
+
 def escape_math_delimiters(markdown: str) -> str:
     """Escape ``$`` so Telegram does not read agent prose as LaTeX.
 
@@ -141,39 +176,88 @@ def escape_math_delimiters(markdown: str) -> str:
     extension, and a backslash there is **kept literally** — escaping ``echo
     $PATH`` would show the user ``echo \\$PATH``.
     """
-    segments: list[tuple[bool, list[str]]] = []  # (is_fenced_code, lines)
-    fence: str | None = None
-
-    for line in markdown.split("\n"):
-        match = _FENCE_RE.match(line)
-        if fence is None:
-            if match:
-                fence = match.group(1)
-                segments.append((True, [line]))
-            elif segments and not segments[-1][0]:
-                segments[-1][1].append(line)
-            else:
-                segments.append((False, [line]))
-            continue
-        segments[-1][1].append(line)
-        # A closing fence is the same character, at least as long, and alone on
-        # its line — otherwise ```` ```python ```` would close ```` ``` ````.
-        if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
-            if not match.group(2).strip():
-                fence = None
-
     return "\n".join(
         "\n".join(lines) if is_code else _escape_dollars_outside_codespans("\n".join(lines))
-        for is_code, lines in segments
+        for is_code, lines in _fenced_segments(markdown)
     )
+
+
+#: A GFM table delimiter row: cells of hyphens with optional alignment colons,
+#: separated by pipes, outer pipes optional. Callers also require at least one
+#: pipe, so a bare ``---`` — a setext heading underline or a thematic break — is
+#: never taken for one.
+_DELIMITER_CELL = r"[ \t]*:?-+:?[ \t]*"
+_TABLE_DELIMITER_RE = re.compile(
+    rf"^ {{0,3}}\|?{_DELIMITER_CELL}(?:\|{_DELIMITER_CELL})*\|?[ \t]*$"
+)
+
+
+def _is_table_delimiter_row(line: str) -> bool:
+    return "|" in line and _TABLE_DELIMITER_RE.match(line) is not None
+
+
+def separate_glued_tables(markdown: str) -> str:
+    """Put a blank line between a paragraph and a table glued to its last line.
+
+    The agent writes tables GitHub-style — the header row on the line right
+    after the sentence introducing it, no blank line between::
+
+        Here are the results:
+        | Metric | Value |
+        |---|---|
+
+    GitHub's GFM lets a table interrupt a paragraph (the paragraph's last line
+    becomes the header row), so the agent never learns to leave the gap.
+    Telegram's rich-message parser does not: the header row stays paragraph
+    text, the rows below follow it, and the user sees pipes and dashes where a
+    table should be. Nothing fails — the payload is accepted — which is how
+    every table the bot sent went out this way unnoticed.
+
+    Normalizing here beats asking the agent to leave the blank line: the model
+    drifts, and nothing would tell us when it did.
+
+    Detection is a delimiter row (``|---|---|``) whose previous line has pipes
+    and whose line before *that* is non-blank; the blank line goes in before
+    the header row. Fenced code is skipped — a markdown example inside a code
+    block is code, not a table to fix. The line before the header may be a
+    closing fence: a blank line after a fence changes nothing for GitHub and is
+    what Telegram wants. Applied per payload, so mid-stream a header row that
+    has arrived without its delimiter is left alone until the next edit brings
+    the delimiter along.
+    """
+    lines: list[str] = []
+    is_code: list[bool] = []
+    for fenced, segment in _fenced_segments(markdown):
+        lines.extend(segment)
+        is_code.extend([fenced] * len(segment))
+
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        header_glued_to_paragraph = (
+            0 < i < len(lines) - 1
+            and not is_code[i]
+            and not is_code[i + 1]
+            and "|" in line
+            and _is_table_delimiter_row(lines[i + 1])
+            and bool(lines[i - 1].strip())
+        )
+        if header_glued_to_paragraph:
+            out.append("")
+        out.append(line)
+    return "\n".join(out)
 
 
 def _rich_payload(markdown: str) -> dict[str, Any]:
     # skip_entity_detection stops Telegram from auto-linkifying bare URLs, @names
     # and #tags inside agent output (code identifiers turn into stray links).
-    # Every rich send/edit/draft funnels through here, so escaping the math
-    # delimiters here is what makes it impossible for one path to miss it.
-    return {"markdown": escape_math_delimiters(markdown), "skip_entity_detection": True}
+    # Every rich send/edit/draft funnels through here, so reconciling the agent's
+    # GFM with Telegram's here is what makes it impossible for one path to miss
+    # it. Order is immaterial: one only inserts blank lines, the other only
+    # touches ``$`` outside code.
+    return {
+        "markdown": escape_math_delimiters(separate_glued_tables(markdown)),
+        "skip_entity_detection": True,
+    }
 
 
 async def send_rich_message(
