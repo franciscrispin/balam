@@ -145,6 +145,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Context: {name}",
         f"Backend: {config.agent_backend}",
         f"Directory: {ctx.directory}",
+        f"Replies to: {ctx.respond_to}",
         f"Model: {effective_model}",
         f"Effort: {override_effort or ctx.effort or '(server default)'}",
         f"Session: {session_id or '(none yet — send a message to start)'}",

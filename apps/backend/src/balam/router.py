@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from balam.agent_tools import ToolScopes, server_name
-from balam.contexts import ContextsConfig
+from balam.contexts import ContextConfig, ContextsConfig
 from balam.opencode import OpenCode
 from balam.permissions import build_ruleset, send_file_rules
 from balam.store import SessionStore
@@ -130,6 +130,12 @@ class Router:
         """The context name a topic is bound to (or the default if unbound)."""
         row = self._store.get_row(ref.chat_id, ref.thread_id)
         return self._contexts.resolve_name(row[1] if row else None)
+
+    def topic_context(self, chat_id: int, thread_id: int | None) -> ContextConfig:
+        """The context a topic is bound to (or the default if unbound) — for the
+        callers that need its *policy* (``respond_to``) before a turn exists."""
+        row = self._store.get_row(chat_id, thread_id)
+        return self._contexts.get(row[1] if row else None)
 
     def current_session_id(self, ref: TopicRef) -> str | None:
         """The agent session a topic maps to, or ``None`` if it has none yet (no

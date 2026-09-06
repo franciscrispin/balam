@@ -49,14 +49,18 @@ from balam.commands.views import handle_artifacts
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
 from balam.message_text import (
+    addresses_bot,
     forward_reply_prefix,
     forwarded_slash_command,
+    mentions_bot,
+    replies_to_bot,
     sender_prefix,
+    strip_bot_mention,
     strip_bot_mention_from_command,
 )
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
-from balam.topics import topic_link, topic_name
+from balam.topics import MENTION_ONLY_RULE, topic_link, topic_name
 from balam.turns import FOLLOW_UP_REACTION, TurnJob, TurnRegistry
 
 OWNER = 424242
@@ -329,6 +333,7 @@ class _FakeBot:
     def __init__(self, *, new_thread_id: int = 777, bot_id: int = BOT_ID) -> None:
         self._new_thread_id = new_thread_id
         self.id = bot_id
+        self.username = "balambot"
         self.created_topics: list[tuple[int, str]] = []
         self.deleted_topics: list[tuple[int, int]] = []
         self.edited_topics: list[tuple[int, int, str]] = []
@@ -3087,3 +3092,328 @@ async def test_undelivered_follow_ups_keep_the_order_they_were_sent(monkeypatch)
         await turn.task
 
     assert prompts == ["first", "second", "third"]
+
+
+# --- respond_to: mentions — topics where people talk and the bot waits to be asked ---
+
+
+def _mention_entity(text: str, handle: str = "@balambot") -> MessageEntity:
+    """A ``mention`` entity for ``handle`` where it sits in ``text``. Offsets are
+    UTF-16 code units, as the Bot API counts them."""
+    prefix = text[: text.index(handle)]
+    offset = len(prefix.encode("utf-16-le")) // 2
+    return MessageEntity(type=MessageEntity.MENTION, offset=offset, length=len(handle))
+
+
+def test_mentions_bot_matches_own_handle_case_insensitively() -> None:
+    text = "hey @BalamBot help"
+    msg = SimpleNamespace(text=text, entities=[_mention_entity(text, "@BalamBot")])
+    assert mentions_bot(msg, bot_id=BOT_ID, bot_username="balambot") is True
+
+
+def test_mentions_bot_ignores_other_handles_and_a_missing_username() -> None:
+    text = "hey @otherbot help"
+    msg = SimpleNamespace(text=text, entities=[_mention_entity(text, "@otherbot")])
+    assert mentions_bot(msg, bot_id=BOT_ID, bot_username="balambot") is False
+    text = "hey @balambot"
+    msg = SimpleNamespace(text=text, entities=[_mention_entity(text)])
+    assert mentions_bot(msg, bot_id=BOT_ID, bot_username=None) is False
+    assert (
+        mentions_bot(SimpleNamespace(text="no entities"), bot_id=BOT_ID, bot_username="b") is False
+    )
+
+
+def test_mentions_bot_reads_utf16_offsets_past_an_emoji() -> None:
+    # Each party popper is two UTF-16 code units; a str slice would land one
+    # character short per emoji and miss the handle.
+    text = "🎉🎉 @balambot ship it"
+    msg = SimpleNamespace(text=text, entities=[_mention_entity(text)])
+    assert mentions_bot(msg, bot_id=BOT_ID, bot_username="balambot") is True
+
+
+def test_mentions_bot_reads_a_caption_and_a_text_mention() -> None:
+    caption = "@balambot what is this?"
+    photo = SimpleNamespace(
+        text=None, entities=None, caption=caption, caption_entities=[_mention_entity(caption)]
+    )
+    assert mentions_bot(photo, bot_id=BOT_ID, bot_username="balambot") is True
+    # A text_mention links the user by id rather than by handle.
+    linked = MessageEntity(
+        type=MessageEntity.TEXT_MENTION,
+        offset=0,
+        length=5,
+        user=User(id=BOT_ID, is_bot=True, first_name="Balam"),
+    )
+    msg = SimpleNamespace(text="Balam help", entities=[linked])
+    assert mentions_bot(msg, bot_id=BOT_ID, bot_username="balambot") is True
+    assert mentions_bot(msg, bot_id=BOT_ID + 1, bot_username="balambot") is False
+
+
+def test_replies_to_bot_needs_a_real_reply_to_the_bot() -> None:
+    bot_msg = SimpleNamespace(message_id=42, from_user=SimpleNamespace(id=BOT_ID))
+    reply = SimpleNamespace(message_thread_id=5, reply_to_message=bot_msg)
+    assert replies_to_bot(reply, bot_id=BOT_ID) is True
+
+    human_msg = SimpleNamespace(message_id=43, from_user=SimpleNamespace(id=GUEST))
+    reply = SimpleNamespace(message_thread_id=5, reply_to_message=human_msg)
+    assert replies_to_bot(reply, bot_id=BOT_ID) is False
+    assert replies_to_bot(SimpleNamespace(reply_to_message=None), bot_id=BOT_ID) is False
+    assert replies_to_bot(SimpleNamespace(reply_to_message=bot_msg), bot_id=None) is False
+
+
+def test_replies_to_bot_ignores_the_topic_anchor_the_bot_created() -> None:
+    # A forum topic's messages carry the topic's own service message as
+    # reply_to_message. Balam created the topic, so its from_user is the bot —
+    # without this rule every message in the topic would read as a reply to it.
+    anchor = SimpleNamespace(
+        message_id=5,
+        from_user=SimpleNamespace(id=BOT_ID),
+        forum_topic_created=SimpleNamespace(name="team"),
+    )
+    msg = SimpleNamespace(message_thread_id=5, reply_to_message=anchor)
+    assert replies_to_bot(msg, bot_id=BOT_ID) is False
+    bare_anchor = SimpleNamespace(message_id=5, from_user=SimpleNamespace(id=BOT_ID))
+    msg = SimpleNamespace(message_thread_id=5, reply_to_message=bare_anchor)
+    assert replies_to_bot(msg, bot_id=BOT_ID) is False
+
+
+def test_addresses_bot_accepts_a_slash_command_and_any_album_caption() -> None:
+    cmd = SimpleNamespace(text="/goal ship", entities=[_cmd_entity()])
+    assert addresses_bot([cmd], bot_id=BOT_ID, bot_username="balambot") is True
+    plain = SimpleNamespace(text="just chatting", entities=[])
+    assert addresses_bot([plain], bot_id=BOT_ID, bot_username="balambot") is False
+    # An album's caption sits on whichever photo the client chose.
+    caption = "@balambot look at these"
+    first = SimpleNamespace(text=None, entities=None, caption=None, caption_entities=None)
+    second = SimpleNamespace(
+        text=None, entities=None, caption=caption, caption_entities=[_mention_entity(caption)]
+    )
+    assert addresses_bot([first, second], bot_id=BOT_ID, bot_username="balambot") is True
+
+
+def test_strip_bot_mention_removes_only_this_bots_whole_handle() -> None:
+    assert strip_bot_mention("@balambot what's up", "balambot") == "what's up"
+    assert strip_bot_mention("hey @BalamBot, status?", "balambot") == "hey, status?"
+    assert strip_bot_mention("thanks @balambot", "balambot") == "thanks"
+    # Line breaks and indentation after the handle survive (code in a message).
+    assert strip_bot_mention("@balambot\nline one\n  indented", "balambot") == (
+        "line one\n  indented"
+    )
+    # Not this bot, or not a whole token: left alone.
+    assert strip_bot_mention("@balambot2 and mail@balambot", "balambot") == (
+        "@balambot2 and mail@balambot"
+    )
+    assert strip_bot_mention("@balambot", "balambot") == ""
+    assert strip_bot_mention("@balambot hi", None) == "@balambot hi"
+
+
+def _chat_router(*, default: str = "balam") -> Router:
+    """A router whose ``team`` context is mention-only; ``balam`` answers everything."""
+    contexts = ContextsConfig(
+        default_context=default,
+        contexts={
+            "balam": ContextConfig(directory="/work/balam", description="Balam"),
+            "team": ContextConfig(
+                directory="/work/team", description="Team chat", respond_to="mentions"
+            ),
+        },
+    )
+    return Router(SessionStore(":memory:"), _FakeOpenCode(), contexts)
+
+
+def _team_msg(text: str, *, thread_id: int = 5) -> _FakeMessage:
+    """A message in a mention-only ``team`` topic, with the entity a real client
+    would attach when the text carries the bot's handle."""
+    msg = _text_msg(SUPERGROUP, thread_id, text)
+    msg.entities = [_mention_entity(text)] if "@balambot" in text else []
+    msg.caption_entities = None
+    return msg
+
+
+def _capture_turns(monkeypatch) -> list[dict[str, object]]:
+    """Replace the streamer with one that records each turn's kwargs."""
+    turns_seen: list[dict[str, object]] = []
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        turns_seen.append(kwargs)
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+    return turns_seen
+
+
+async def test_mention_only_topic_ignores_untagged_chatter(monkeypatch) -> None:
+    seen = _capture_turns(monkeypatch)
+    router = _chat_router()
+    await router.create_topic_session(SUPERGROUP, 5, "team", "team")
+    message = _team_msg("lunch at 12?")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+
+    # No turn, no queue, no reply, no reaction: the bot stays out of the way.
+    assert turns.get(SUPERGROUP, 5) is None
+    assert turns.queue_len(SUPERGROUP, 5) == 0
+    assert seen == []
+    assert message.replies == []
+    assert message.reactions == []
+
+
+async def test_mention_only_topic_runs_a_tagged_message_without_the_handle(monkeypatch) -> None:
+    seen = _capture_turns(monkeypatch)
+    router = _chat_router()
+    await router.create_topic_session(SUPERGROUP, 5, "team", "team")
+    message = _team_msg("@balambot what's the deploy status?")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task
+
+    assert [t["prompt"] for t in seen] == ["what's the deploy status?"]
+
+
+async def test_mention_only_topic_runs_a_reply_to_the_bot(monkeypatch) -> None:
+    seen = _capture_turns(monkeypatch)
+    router = _chat_router()
+    await router.create_topic_session(SUPERGROUP, 5, "team", "team")
+    message = _team_msg("yes, go ahead")
+    message.reply_to_message = SimpleNamespace(
+        message_id=42,
+        from_user=SimpleNamespace(id=BOT_ID, full_name="Balam", username="balambot"),
+        text="Shall I deploy?",
+    )
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 5)
+    assert turn is not None
+    await turn.task
+
+    # The reply gesture reaches the agent as usual, with the person's words last.
+    assert seen[0]["prompt"] == '[Replying to Balam (@balambot): "Shall I deploy?"]\nyes, go ahead'
+
+
+async def test_mention_only_topic_answers_a_bare_mention_with_a_hint(monkeypatch) -> None:
+    seen = _capture_turns(monkeypatch)
+    router = _chat_router()
+    await router.create_topic_session(SUPERGROUP, 5, "team", "team")
+    message = _team_msg("@balambot")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+
+    assert turns.get(SUPERGROUP, 5) is None
+    assert seen == []
+    assert any("Mention me" in r for r in message.replies)
+
+
+async def test_mention_only_chatter_never_joins_a_running_turn(monkeypatch) -> None:
+    prompts: list[str] = []
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    async def fake_stream_reply(*, prompt: str, **_: object) -> None:
+        prompts.append(prompt)
+        started.set()
+        await gate.wait()
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+
+    router = _chat_router()
+    await router.create_topic_session(SUPERGROUP, 5, "team", "team")
+    message = _team_msg("@balambot first")
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+    context.application.bot_data["backend"] = SimpleNamespace(supports_streaming_input=True)
+
+    await _handle_message(update, context)
+    await asyncio.wait_for(started.wait(), 1)
+    running = turns.get(SUPERGROUP, 5)
+
+    # People keep talking while the bot works: nothing is queued or folded in.
+    chatter = _team_msg("anyone seen the keys?")
+    await _handle_message(SimpleNamespace(message=chatter), context)
+    assert turns.queue_len(SUPERGROUP, 5) == 0
+    assert chatter.replies == []
+    assert chatter.reactions == []
+
+    gate.set()
+    await running.task
+    while (turn := turns.get(SUPERGROUP, 5)) is not None:
+        await turn.task
+    assert prompts == ["first"]
+
+
+async def test_a_normal_topic_is_unchanged_by_a_mention_only_context_elsewhere(
+    monkeypatch,
+) -> None:
+    seen = _capture_turns(monkeypatch)
+    router = _chat_router()
+    await router.create_topic_session(SUPERGROUP, 6, "balam", "balam")
+    message = _team_msg("plain message, no handle", thread_id=6)
+    update, context, turns = _message_env(message, _FakeBot(), router=router)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 6)
+    assert turn is not None
+    await turn.task
+
+    assert [t["prompt"] for t in seen] == ["plain message, no handle"]
+
+
+async def test_general_still_opens_a_topic_when_the_default_context_is_mention_only(
+    monkeypatch,
+) -> None:
+    # A message in General is an explicit ask (it opens a topic), so the gate
+    # does not apply there even when default_context is mention-only.
+    seen = _capture_turns(monkeypatch)
+    router = _chat_router(default="team")
+    bot = _FakeBot(new_thread_id=901)
+    message = _team_msg("what's on today?", thread_id=None)
+    update, context, turns = _message_env(message, bot, router=router)
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 901)
+    assert turn is not None
+    await turn.task
+
+    assert bot.created_topics == [(SUPERGROUP, "team: what's on today?")]
+    assert [t["prompt"] for t in seen] == ["what's on today?"]
+
+
+async def test_opening_a_mention_only_topic_states_the_rule_and_keeps_its_name(
+    monkeypatch,
+) -> None:
+    _capture_turns(monkeypatch)
+    router = _chat_router()
+    bot = _FakeBot(new_thread_id=777)
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context = _update_context(bot, router, message, ["team"])
+
+    await handle_context(update, context)
+
+    greeting = next(text for _chat, text, thread in bot.sent if thread == 777)
+    assert MENTION_ONLY_RULE in greeting
+    assert "Send a message to start" not in greeting
+    # The topic keeps the name it was given: the first tagged message is not
+    # its subject, so it is marked auto-named up front and never renamed.
+    assert router.topic_auto_named(TopicRef(SUPERGROUP, 777, "t")) is True
+    first = _team_msg("@balambot hello there", thread_id=777)
+    update, context, turns = _message_env(first, bot, router=router)
+    await _handle_message(update, context)
+    await turns.get(SUPERGROUP, 777).task
+    assert bot.edited_topics == []
+
+
+async def test_status_reports_the_reply_policy() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, *_ = _session_cmd_env(message)
+    await handle_status(update, context)
+    assert "Replies to: all" in message.replies[-1]
+
+    router.contexts.contexts["team"] = ContextConfig(
+        directory="/work/team", description="Team chat", respond_to="mentions"
+    )
+    await router.create_topic_session(SUPERGROUP, 5, "team", "team")
+    await handle_status(update, context)
+    assert "Replies to: mentions" in message.replies[-1]

@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -114,6 +114,14 @@ class ContextConfig(BaseModel):
     #: environment. Registered with OpenCode before each session is created
     #: (:meth:`balam.opencode.OpenCode.register_mcp`).
     mcp: dict[str, Any] = Field(default_factory=dict)
+    #: When the agent answers in this context's topics. ``all`` (the default):
+    #: every message is a turn. ``mentions``: only a message aimed at the bot — an
+    #: ``@mention``, a reply to one of its messages, or a slash command — becomes a
+    #: turn, and everything else is dropped before it reaches the agent
+    #: (:func:`balam.message_text.addresses_bot`). That turns a topic into a place
+    #: where people talk among themselves and call the agent in when they want it.
+    #: Only allowlisted users are ever heard either way (ADR-0008).
+    respond_to: Literal["all", "mentions"] = "all"
 
     @field_validator("mcp", mode="after")
     @classmethod
