@@ -8,6 +8,47 @@ Status legend: 🔴 open · 🟡 in progress · 🟢 done
 
 ---
 
+## 2026-09-06 — every table the bot ever sent rendered as literal pipes
+
+**Status:** 🟢 done — normalized on the way out: `separate_glued_tables` in
+`rich_messages.py`, applied in `_rich_payload` so send, edit and draft all get
+it. Tests cover the glued case, idempotence, the fenced-code exclusion, and the
+`---` (setext heading) false positive.
+
+The agent writes tables GitHub-style, with the header row on the line right
+after the sentence that introduces it and no blank line between:
+
+```
+Here are the results:
+| Metric | Value |
+|---|---|
+| Speed | 42 |
+```
+
+GitHub's GFM lets a table interrupt a paragraph — the paragraph's last line
+becomes the header row — so the agent never learns to leave the gap. mistune
+does the same, so the MarkdownV2 fallback was never affected. Telegram's
+rich-message parser does not: the header row stays paragraph text, the rows
+below follow it, and the user sees pipes and dashes where a table should be.
+Nothing failed — the payload was accepted — which is how it went unnoticed
+since rich messages became the only path (2026-08-10).
+
+**Fix:** a delimiter row (`|---|---|`) whose previous line has pipes and whose
+line before that is non-blank gets a blank line inserted before the header row.
+Fenced code is skipped, using the same segmentation as the math-delimiter
+escaping. A line of only dashes is not a delimiter row, so setext headings and
+thematic breaks are left alone.
+
+**Rejected:** telling the agent to always leave a blank line before a table.
+It works until the model drifts back, and nothing would tell us when it did.
+
+**Known gap, left alone:** a caption glued *after* a table
+(`| 1 | 2 |` then `**Next:**` on the next line) becomes a table row. That is
+the same on GitHub — the table runs until a blank line — so it is the agent
+writing invalid GFM, not a dialect gap for this layer to paper over.
+
+---
+
 ## 2026-08-01 — the chaska cron brief cannot be retired yet
 
 **Status:** 🔴 open — blocked, not forgotten.
