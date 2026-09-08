@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import string
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,6 +51,37 @@ _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _CONTEXT_NAME = re.compile(r"[A-Za-z0-9_-]+")
 _CONTENT_ID_MARKER = re.compile(r"c_[0-9a-f]{6,}")
 _CONTEXT_NAME_MAX = 64 - len("markdown__")
+
+#: How an auto-named topic is titled: the context name, then the first message
+#: (:func:`balam.topics.topic_name` renders it). Overridable per context, so a
+#: workspace whose topics all live in one place can drop the prefix with
+#: ``topic_title: "{summary}"``.
+DEFAULT_TOPIC_TITLE = "{context}: {summary}"
+
+#: The only placeholders a ``topic_title`` may use.
+_TOPIC_TITLE_FIELDS = ("context", "summary")
+
+
+def _validated_topic_title(value: str) -> str:
+    """Check a ``topic_title`` template at load time, so a typo is a boot error
+    rather than a literal ``{summry}`` in every topic name from then on."""
+    try:
+        parsed = list(string.Formatter().parse(value))
+    except ValueError as exc:
+        raise ValueError(f"topic_title {value!r} is not a valid format string ({exc})") from None
+    for _literal, field, _spec, _conv in parsed:
+        if field is None:
+            continue
+        name = field.split(".")[0].split("[")[0]
+        if name not in _TOPIC_TITLE_FIELDS:
+            allowed = ", ".join(f"{{{f}}}" for f in _TOPIC_TITLE_FIELDS)
+            raise ValueError(
+                f"topic_title {value!r} uses unknown placeholder {{{field}}} "
+                f"(only {allowed} are available)"
+            )
+    if not value.strip():
+        raise ValueError("topic_title must not be blank (Telegram rejects an empty topic name)")
+    return value
 
 
 def _expand_env(value: Any, *, where: str) -> Any:
@@ -122,6 +154,16 @@ class ContextConfig(BaseModel):
     #: where people talk among themselves and call the agent in when they want it.
     #: Only allowlisted users are ever heard either way (ADR-0008).
     respond_to: Literal["all", "mentions"] = "all"
+    #: How this context's topics are auto-named, overriding the file-level
+    #: ``topic_title``. ``{context}`` and ``{summary}`` (the first message) are
+    #: filled in; ``"{summary}"`` drops the context prefix entirely. ``None``
+    #: means "use the file-level default".
+    topic_title: str | None = None
+
+    @field_validator("topic_title")
+    @classmethod
+    def _topic_title_is_renderable(cls, value: str | None) -> str | None:
+        return None if value is None else _validated_topic_title(value)
 
     @field_validator("mcp", mode="after")
     @classmethod
@@ -160,6 +202,13 @@ class ContextsConfig(BaseModel):
 
     default_context: str
     contexts: dict[str, ContextConfig]
+    #: Default topic-name template for every context that doesn't set its own.
+    topic_title: str = DEFAULT_TOPIC_TITLE
+
+    @field_validator("topic_title")
+    @classmethod
+    def _topic_title_is_renderable(cls, value: str) -> str:
+        return _validated_topic_title(value)
 
     @field_validator("contexts")
     @classmethod
@@ -207,6 +256,12 @@ class ContextsConfig(BaseModel):
         if name and name in self.contexts:
             return self.contexts[name]
         return self.contexts[self.default_context]
+
+    def topic_title_template(self, name: str | None) -> str:
+        """The topic-name template for context ``name``: its own ``topic_title``
+        if it sets one, else the file-level default. Unknown names resolve the
+        way :meth:`get` does — through ``default_context``."""
+        return self.get(name).topic_title or self.topic_title
 
     def resolve_name(self, name: str | None) -> str:
         """The context name :meth:`get` would use — for persisting the binding."""

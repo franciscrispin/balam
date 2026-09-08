@@ -606,6 +606,32 @@ What this is, and what it is deliberately not:
 - **Telegram's privacy mode stays off.** It is bot-wide with no per-topic form
   (`startup_checks.py` still warns when it is on), so the gate lives in Balam.
 
+### Amendment (2026-09-08): `topic_title` — how a context names its topics
+
+An auto-named topic used to be `context: first message`, hardcoded. The prefix
+answers "which workspace is this?" when one chat holds topics from fifteen
+contexts, but it is pure noise for a chat that only ever uses one. So the format
+is now a template, `topic_title`, set at the top level of `config.yaml` (the
+default for every context, itself defaulting to `{context}: {summary}`) and
+overridable per context. `topic_title: "{summary}"` drops the prefix.
+
+- **Two placeholders only**, `{context}` and `{summary}` (the whitespace-collapsed
+  first message, or `message`/`attachment` when there is none). The template is
+  validated at load time, so a typo like `{summry}` is a boot error rather than a
+  literal brace in every topic name from then on.
+- **Rendering stays in one place.** `topics.py:topic_name` renders the template
+  and budgets the summary against it, so Telegram's 128-char cap eats the message
+  and not the template; a template whose fixed parts alone overflow is still
+  clamped. Callers ask `ContextsConfig.topic_title_template(name)` for the
+  template rather than assembling a name themselves.
+- **Cosmetic only.** Nothing reads the prefix back — a topic's context binding
+  lives in the store (ADR-0009), never in its title — so no migration, and
+  existing topics keep the names they have. The one thing lost with the prefix is
+  that the `/delete` and `/schedule cancel` pickers list topics by title, so rows
+  from different contexts look alike; that is the trade the setting exists to make.
+- **A promptless `/context <name>` topic is still just `<name>`.** There is no
+  message to summarize, so there is no template to render.
+
 ---
 
 ## ADR-0013: Expose the Mini App through an authenticated Cloudflare tunnel

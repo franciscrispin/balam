@@ -1,6 +1,7 @@
 import pytest
 
 from balam.contexts import (
+    DEFAULT_TOPIC_TITLE,
     ContextsConfig,
     ContextsConfigError,
     load_contexts,
@@ -237,3 +238,64 @@ def test_respond_to_mentions_accepted(tmp_path) -> None:
 def test_respond_to_unknown_value_rejected(tmp_path) -> None:
     with pytest.raises(ContextsConfigError, match="respond_to"):
         load_contexts(_write(tmp_path, CONFIG + TEAM_CONTEXT + "    respond_to: sometimes\n"))
+
+
+JAMBO_CONTEXT = "  jambo:\n    directory: /home/me/jambo\n    description: Jambo\n"
+
+
+def test_topic_title_defaults_to_the_context_prefix(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG))
+    assert cfg.topic_title == DEFAULT_TOPIC_TITLE
+    assert cfg.get("balam").topic_title is None
+    assert cfg.topic_title_template("balam") == "{context}: {summary}"
+
+
+def test_topic_title_per_context_override(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG + JAMBO_CONTEXT + '    topic_title: "{summary}"\n'))
+    # Only the overriding context drops the prefix; everything else is untouched.
+    assert cfg.topic_title_template("jambo") == "{summary}"
+    assert cfg.topic_title_template("balam") == "{context}: {summary}"
+    # An unknown name resolves through default_context, like get() does.
+    assert cfg.topic_title_template("nope") == "{context}: {summary}"
+    assert cfg.topic_title_template(None) == "{context}: {summary}"
+
+
+def test_topic_title_file_level_default_applies_to_every_context(tmp_path) -> None:
+    cfg = load_contexts(
+        _write(tmp_path, 'topic_title: "[{context}] {summary}"\n' + CONFIG + JAMBO_CONTEXT)
+    )
+    assert cfg.topic_title_template("balam") == "[{context}] {summary}"
+    assert cfg.topic_title_template("jambo") == "[{context}] {summary}"
+
+
+def test_topic_title_per_context_beats_the_file_default(tmp_path) -> None:
+    cfg = load_contexts(
+        _write(
+            tmp_path,
+            'topic_title: "[{context}] {summary}"\n'
+            + CONFIG
+            + JAMBO_CONTEXT
+            + '    topic_title: "{summary}"\n',
+        )
+    )
+    assert cfg.topic_title_template("jambo") == "{summary}"
+    assert cfg.topic_title_template("balam") == "[{context}] {summary}"
+
+
+def test_topic_title_unknown_placeholder_rejected(tmp_path) -> None:
+    # A typo would otherwise be baked into every topic name from then on.
+    with pytest.raises(ContextsConfigError, match="topic_title"):
+        load_contexts(_write(tmp_path, CONFIG + JAMBO_CONTEXT + '    topic_title: "{summry}"\n'))
+    with pytest.raises(ContextsConfigError, match="topic_title"):
+        load_contexts(_write(tmp_path, 'topic_title: "{directory}"\n' + CONFIG))
+
+
+def test_topic_title_blank_rejected(tmp_path) -> None:
+    # Telegram rejects an empty forum topic name.
+    with pytest.raises(ContextsConfigError, match="topic_title"):
+        load_contexts(_write(tmp_path, CONFIG + JAMBO_CONTEXT + '    topic_title: "  "\n'))
+
+
+def test_topic_title_malformed_format_string_rejected(tmp_path) -> None:
+    with pytest.raises(ContextsConfigError, match="topic_title"):
+        load_contexts(_write(tmp_path, CONFIG + JAMBO_CONTEXT + '    topic_title: "{summary"\n'))
