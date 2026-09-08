@@ -19,6 +19,7 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from balam.contexts import DEFAULT_TOPIC_TITLE
 from balam.router import Router, TopicRef
 
 logger = logging.getLogger(__name__)
@@ -46,20 +47,39 @@ def is_forum_general_message(message: Any) -> bool:
     return message.message_thread_id is None and bool(getattr(chat, "is_forum", False))
 
 
-def topic_name(context_name: str, first_message: str, *, has_files: bool = False) -> str:
-    """Build a Bot-API-safe topic name: ``context: truncated first message``."""
+#: Telegram's cap on a forum topic name.
+TOPIC_NAME_MAX = 128
+
+
+def topic_name(
+    context_name: str,
+    first_message: str,
+    *,
+    has_files: bool = False,
+    template: str = DEFAULT_TOPIC_TITLE,
+) -> str:
+    """Build a Bot-API-safe topic name from a context's ``topic_title`` template.
+
+    The template is ``{context}: {summary}`` unless the context (or the file)
+    overrides it (:meth:`balam.contexts.ContextsConfig.topic_title_template`);
+    ``summary`` is the whitespace-collapsed first message. It has already been
+    validated at load time, so the placeholders here always render.
+    """
     summary = " ".join(first_message.split())
     if not summary:
         summary = "attachment" if has_files else "message"
 
-    prefix = f"{context_name}: "
-    max_len = 128
-    available = max_len - len(prefix)
-    if available < 4:
-        return f"{prefix}{summary}"[: max_len - 3] + "..."
-    if len(summary) > available:
+    # Budget the summary against whatever the template puts around it, so the
+    # ellipsis eats the message rather than the template.
+    available = TOPIC_NAME_MAX - len(template.format(context=context_name, summary=""))
+    if available >= 4 and len(summary) > available:
         summary = summary[: available - 3].rstrip() + "..."
-    return f"{prefix}{summary}"
+    name = template.format(context=context_name, summary=summary)
+    # A template whose fixed parts alone overflow (a very long context name, or
+    # {summary} twice) still has to fit.
+    if len(name) > TOPIC_NAME_MAX:
+        name = name[: TOPIC_NAME_MAX - 3] + "..."
+    return name
 
 
 async def rename_forum_topic(bot: Any, chat_id: int, thread_id: int, name: str) -> None:
@@ -78,7 +98,12 @@ async def auto_name_topic(
 ) -> None:
     if ref.thread_id is None or router.topic_auto_named(ref):
         return
-    name = topic_name(context_name, first_message, has_files=has_files)
+    name = topic_name(
+        context_name,
+        first_message,
+        has_files=has_files,
+        template=router.contexts.topic_title_template(context_name),
+    )
     try:
         await rename_forum_topic(bot, ref.chat_id, ref.thread_id, name)
     except Exception:
@@ -103,7 +128,12 @@ async def create_topic_from_general(
         title=topic_title(message, None),
     )
     context_name = router.current_context_name(general_ref)
-    name = topic_name(context_name, text, has_files=has_files)
+    name = topic_name(
+        context_name,
+        text,
+        has_files=has_files,
+        template=router.contexts.topic_title_template(context_name),
+    )
     try:
         topic = await bot.create_forum_topic(chat_id=message.chat_id, name=name)
     except Exception as exc:
@@ -192,15 +222,21 @@ async def open_topic_in_context(
     link to tap. Requires a forum supergroup with the bot an admin holding "Manage
     Topics"; duplicate topic names are fine (many topics may share one context).
 
-    With a ``prompt`` the topic is named after it (``context: prompt``, as a
-    General message would), and marked auto-named so the first turn doesn't
-    rename it again. A ``respond_to: mentions`` topic is marked auto-named too:
+    With a ``prompt`` the topic is named after it through the context's
+    ``topic_title`` template (as a General message would), and marked auto-named
+    so the first turn doesn't rename it again. Without one the topic is simply
+    the context's name — no message to summarize, so no template to render.
+    A ``respond_to: mentions`` topic is marked auto-named too:
     it is a place people talk, so it keeps the name it was given — the first
     message that happens to tag the bot is not its subject.
     """
     ctx = router.contexts.contexts[name]
     mention_only = ctx.respond_to == "mentions"
-    title = topic_name(name, prompt) if prompt else name
+    title = (
+        topic_name(name, prompt, template=router.contexts.topic_title_template(name))
+        if prompt
+        else name
+    )
     try:
         topic = await bot.create_forum_topic(chat_id=chat_id, name=title)
     except Exception as exc:

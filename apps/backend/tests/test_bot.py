@@ -60,7 +60,13 @@ from balam.message_text import (
 )
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
-from balam.topics import MENTION_ONLY_RULE, topic_link, topic_name
+from balam.topics import (
+    MENTION_ONLY_RULE,
+    auto_name_topic,
+    open_topic_in_context,
+    topic_link,
+    topic_name,
+)
 from balam.turns import FOLLOW_UP_REACTION, TurnJob, TurnRegistry
 
 OWNER = 424242
@@ -683,6 +689,94 @@ def test_topic_name_truncates_to_telegram_limit() -> None:
     assert len(name) == 128
     assert name.startswith("balam: ")
     assert name.endswith("...")
+
+
+def test_topic_name_renders_the_contexts_template() -> None:
+    assert topic_name("jambo", "fix the login bug", template="{summary}") == "fix the login bug"
+    assert (
+        topic_name("jambo", "fix the login bug", template="[{context}] {summary}")
+        == "[jambo] fix the login bug"
+    )
+    # The empty-message fallbacks still apply.
+    assert topic_name("jambo", "   ", template="{summary}") == "message"
+    assert topic_name("jambo", "", has_files=True, template="{summary}") == "attachment"
+
+
+def test_topic_name_truncates_a_custom_template_to_the_limit() -> None:
+    # The ellipsis eats the message, not the template around it.
+    name = topic_name("jambo", "x" * 200, template="{summary}")
+    assert len(name) == 128
+    assert name == "x" * 125 + "..."
+
+    wrapped = topic_name("jambo", "x" * 200, template="[{context}] {summary} ★")
+    assert len(wrapped) == 128
+    assert wrapped.startswith("[jambo] x")
+    assert wrapped.endswith("... ★")
+
+    # Even a template whose fixed parts alone overflow stays inside the cap.
+    assert len(topic_name("j" * 200, "hello", template="{context}: {summary}")) == 128
+
+
+def _jambo_router() -> Router:
+    """A router whose ``jambo`` context titles its topics with the message alone."""
+    contexts = ContextsConfig(
+        default_context="balam",
+        contexts={
+            "balam": ContextConfig(directory="/work/balam", description="Balam"),
+            "jambo": ContextConfig(
+                directory="/work/jambo",
+                description="Jambo",
+                topic_title="{summary}",
+            ),
+        },
+    )
+    return Router(SessionStore(":memory:"), _FakeOpenCode(), contexts)
+
+
+async def test_auto_naming_uses_the_bound_contexts_template() -> None:
+    router = _jambo_router()
+    bot = _FakeBot()
+    await router.create_topic_session(SUPERGROUP, 11, "jambo", "jambo")
+    ref = TopicRef(SUPERGROUP, 11, "t")
+
+    await auto_name_topic(bot, router, ref, "jambo", "fix the login bug")
+
+    # No "jambo: " prefix — this context asked for the message alone.
+    assert bot.edited_topics == [(SUPERGROUP, 11, "fix the login bug")]
+    assert router.list_topics(SUPERGROUP) == [(11, "fix the login bug", "jambo")]
+
+
+async def test_auto_naming_leaves_other_contexts_prefixed() -> None:
+    router = _jambo_router()
+    bot = _FakeBot()
+    await router.create_topic_session(SUPERGROUP, 12, "balam", "balam")
+
+    await auto_name_topic(bot, router, TopicRef(SUPERGROUP, 12, "t"), "balam", "fix the login bug")
+
+    assert bot.edited_topics == [(SUPERGROUP, 12, "balam: fix the login bug")]
+
+
+async def test_open_topic_in_context_applies_the_template_to_a_prompt() -> None:
+    router = _jambo_router()
+    bot = _FakeBot(new_thread_id=913)
+
+    thread_id, title = await open_topic_in_context(
+        bot, router, SUPERGROUP, "jambo", prompt="fix the login bug"
+    )
+
+    assert (thread_id, title) == (913, "fix the login bug")
+    assert bot.created_topics == [(SUPERGROUP, "fix the login bug")]
+
+
+async def test_open_topic_in_context_without_a_prompt_is_still_the_context_name() -> None:
+    # No message to summarize, so no template to render: the topic is the context.
+    router = _jambo_router()
+    bot = _FakeBot(new_thread_id=914)
+
+    _, title = await open_topic_in_context(bot, router, SUPERGROUP, "jambo")
+
+    assert title == "jambo"
+    assert bot.created_topics == [(SUPERGROUP, "jambo")]
 
 
 async def test_new_with_arg_opens_topic_in_named_context() -> None:

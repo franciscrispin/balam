@@ -10,6 +10,11 @@
 
 default_context: balam
 
+# How topics are auto-named from their first message. {context} is the context
+# name, {summary} the truncated first message. This is the default for every
+# context; a context can override it with its own `topic_title` below.
+# topic_title: "{context}: {summary}"
+
 contexts:
   balam:
     directory: /home/ubuntu/projects/balam
@@ -28,6 +33,11 @@ contexts:
       # the per-edit approval prompt.
     # additional_directories:            # extra dirs the agent may read/edit
     #   - /home/ubuntu/projects/open-shrimp
+    # topic_title: "{summary}"           # optional: how THIS context's topics are
+    #                                    # named, overriding the file-level default
+    #                                    # above. "{summary}" drops the "balam: "
+    #                                    # prefix and uses the first message alone.
+    #                                    # Only {context} and {summary} are available.
     # respond_to: mentions               # optional: all (default) | mentions.
     #                                    # "mentions" makes this context's topics
     #                                    # places people can talk among themselves:
