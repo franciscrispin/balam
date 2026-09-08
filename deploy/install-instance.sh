@@ -11,6 +11,7 @@
 #
 #   checkout   <instance root>/<prefix>-<name>   own .env, config.yaml, balam.sqlite
 #   Claude     <home>/.claude-<name>             own login, settings, skills, sessions
+#   GitHub     <home>/.config/gh-<name>          own gh login, and so own git push identity
 #   units      balam@<name>.service              + cloudflared-balam@<name>.service
 #
 # By default <instance root>/<prefix> is the parent directory and basename of THIS
@@ -98,6 +99,7 @@ fi
 
 REPO="$BALAM_INSTANCE_ROOT/$BALAM_INSTANCE_PREFIX-$NAME"
 CFG="$USER_HOME/.claude-$NAME"
+GH_CFG="$USER_HOME/.config/gh-$NAME"
 ENV_FILE="$REPO/.env"
 OVERLAY="$REPO/deploy/balam.env"
 
@@ -196,6 +198,9 @@ for f in "$ENV_FILE" "$OVERLAY"; do
   if balam_env_has "$f" CLAUDE_CONFIG_DIR; then
     problem "$f sets CLAUDE_CONFIG_DIR. systemd lets an EnvironmentFile override the unit's Environment=, so that line would silently point this instance at another account's Claude login. Remove it — balam@.service owns this variable and sets it to $CFG."
   fi
+  if balam_env_has "$f" GH_CONFIG_DIR; then
+    problem "$f sets GH_CONFIG_DIR. Same override: that line would point this instance's gh — and its git push, since gh is the credential helper — at another account's GitHub login. Remove it — balam@.service owns this variable and sets it to $GH_CFG."
+  fi
 done
 
 db=$(balam_env_get "$ENV_FILE" BALAM_DB_PATH)
@@ -256,6 +261,30 @@ if [ "$AUTH_CHECK" -eq 1 ] && [ -z "$(balam_env_get "$ENV_FILE" ANTHROPIC_API_KE
   if [ "$email" = "$(claude_email "${BALAM_PRIMARY_CLAUDE_CONFIG_DIR:-$USER_HOME/.claude}")" ]; then
     warn "that is the same account the first instance uses — both bots will draw on one subscription."
   fi
+fi
+
+# --- the GitHub login for this instance -------------------------------------
+
+# The unit pins GH_CONFIG_DIR, so this instance's gh — and its git push, since
+# gh is the credential helper — uses whatever account lives here, independent of
+# the shared ~/.config/gh that a terminal `gh auth switch` would otherwise move
+# for every instance at once.
+mkdir -p "$GH_CFG"
+chmod 0700 "$GH_CFG"
+
+# config.yml is preferences (git_protocol, aliases), not credentials: worth
+# copying so the instance behaves like the operator's gh. hosts.yml holds the
+# tokens and is never copied — each instance logs its own account in.
+if [ ! -f "$GH_CFG/config.yml" ] && [ -f "$BALAM_GH_SEED_FROM/config.yml" ]; then
+  install -m 0600 "$BALAM_GH_SEED_FROM/config.yml" "$GH_CFG/config.yml"
+  echo "    gh config.yml copied from $BALAM_GH_SEED_FROM (no tokens)"
+fi
+
+gh_account=$(grep -sE '^[[:space:]]+user:[[:space:]]' "$GH_CFG/hosts.yml" | tail -1 | sed -e 's/.*user:[[:space:]]*//' -e 's/[[:space:]]*$//')
+if [ -n "$gh_account" ]; then
+  echo "    GitHub account for this instance: $gh_account"
+else
+  warn "no GitHub login in $GH_CFG — this instance's gh and git push will fail with 'not logged in'. Fix with: GH_CONFIG_DIR=$GH_CFG gh auth login"
 fi
 
 # --- build ------------------------------------------------------------------
@@ -333,4 +362,5 @@ Instance '$NAME' is installed.
   logs      journalctl -u balam@$NAME -f          ("Application started" = polling Telegram)
   restart   sudo systemctl restart balam@$NAME    (after editing code or $ENV_FILE)
   claude    CLAUDE_CONFIG_DIR=$CFG claude auth status
+  github    GH_CONFIG_DIR=$GH_CFG gh auth status
 EOF

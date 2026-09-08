@@ -33,6 +33,20 @@ WorkingDirectory=@INSTANCE_ROOT@/@INSTANCE_PREFIX@-%i/apps/backend
 # therefore win, and this instance would silently run as the first instance's
 # Claude account. install-instance.sh refuses that line for exactly this reason.
 Environment=CLAUDE_CONFIG_DIR=@HOME@/.claude-%i
+
+# The same isolation for GitHub. gh keeps ONE active account per config
+# directory, in $GH_CONFIG_DIR/hosts.yml, and the default ~/.config/gh is shared
+# by every instance on this OS user — so without this line `gh auth switch` in
+# any instance repoints all of them, and the account is simply whoever logged in
+# last. gh knows nothing about CLAUDE_CONFIG_DIR, so that separation does not
+# imply this one. It reaches `git push` as well: the credential helper is
+# `gh auth git-credential`, which reads this same variable.
+#
+# Seed the directory once, with the account this instance should be:
+#   GH_CONFIG_DIR=@HOME@/.config/gh-%i gh auth login
+# install-instance.sh creates it and copies the shared config.yml (aliases,
+# git_protocol) if it is missing.
+Environment=GH_CONFIG_DIR=@HOME@/.config/gh-%i
 Environment=HOME=@HOME@
 
 # Secrets + config from this instance's own checkout. Same layering as

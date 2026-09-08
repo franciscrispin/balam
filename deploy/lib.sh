@@ -54,6 +54,18 @@ balam_deploy_init() {
   # login — so the bot's account and the operator's account stay separate.
   BALAM_PRIMARY_CLAUDE_CONFIG_DIR=${BALAM_PRIMARY_CLAUDE_CONFIG_DIR:-}
 
+  # Optional: same idea for GitHub. gh keeps one active account per config
+  # directory and the default ~/.config/gh is shared by every instance on this OS
+  # user, so unset means the first instance's `gh` (and its `git push`, via gh's
+  # credential helper) is whichever account last ran `gh auth login`/`switch`
+  # anywhere on the machine. Set it to pin the first bot to its own account.
+  BALAM_PRIMARY_GH_CONFIG_DIR=${BALAM_PRIMARY_GH_CONFIG_DIR:-}
+
+  # Where a NEW instance's gh config dir is seeded from — only the non-secret
+  # config.yml (git_protocol, aliases); tokens are never copied, each instance
+  # gets its own `gh auth login`.
+  BALAM_GH_SEED_FROM=${BALAM_GH_SEED_FROM:-$BALAM_HOME/.config/gh}
+
   # Where a NEW instance's Claude config dir is seeded from: the global skills and
   # settings a fresh directory would otherwise lack. Defaults to the operator's
   # own ~/.claude, which is where machine-wide skills live even when no bot uses
