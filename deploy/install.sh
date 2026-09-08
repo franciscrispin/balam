@@ -116,6 +116,13 @@ if [ -n "$BALAM_PRIMARY_CLAUDE_CONFIG_DIR" ] && balam_env_has "$ENV_FILE" CLAUDE
   exit 1
 fi
 
+# Same trap for the GitHub account the agent's gh and git push run as.
+if [ -n "$BALAM_PRIMARY_GH_CONFIG_DIR" ] && balam_env_has "$ENV_FILE" GH_CONFIG_DIR; then
+  echo "ERROR: $ENV_FILE sets GH_CONFIG_DIR, which overrides the unit's" >&2
+  echo "       BALAM_PRIMARY_GH_CONFIG_DIR=$BALAM_PRIMARY_GH_CONFIG_DIR. Remove that line." >&2
+  exit 1
+fi
+
 # AGENT_BACKEND decides whether there is an OpenCode server at all (ADR-0014).
 # In claude_sdk mode the agent runs in-process, so installing and ordering after
 # balam-opencode.service would leave a unit that fails on every boot.
@@ -138,6 +145,21 @@ if [ -n "$BALAM_PRIMARY_CLAUDE_CONFIG_DIR" ]; then
   primary_claude="Environment=CLAUDE_CONFIG_DIR=$BALAM_PRIMARY_CLAUDE_CONFIG_DIR"
 fi
 
+primary_gh=""
+if [ -n "$BALAM_PRIMARY_GH_CONFIG_DIR" ]; then
+  primary_gh="Environment=GH_CONFIG_DIR=$BALAM_PRIMARY_GH_CONFIG_DIR"
+  # A directory with no hosts.yml is not an error — gh just has no account and
+  # every call fails with "not logged in", which is a confusing way to find out.
+  mkdir -p "$BALAM_PRIMARY_GH_CONFIG_DIR"
+  if [ ! -f "$BALAM_PRIMARY_GH_CONFIG_DIR/hosts.yml" ]; then
+    echo "WARNING: no GitHub login in $BALAM_PRIMARY_GH_CONFIG_DIR." >&2
+    echo "         Log this bot's account in:  GH_CONFIG_DIR=$BALAM_PRIMARY_GH_CONFIG_DIR gh auth login" >&2
+  fi
+  if [ ! -f "$BALAM_PRIMARY_GH_CONFIG_DIR/config.yml" ] && [ -f "$BALAM_GH_SEED_FROM/config.yml" ]; then
+    install -m 0600 "$BALAM_GH_SEED_FROM/config.yml" "$BALAM_PRIMARY_GH_CONFIG_DIR/config.yml"
+  fi
+fi
+
 # --- the tunnel is this host's alone ----------------------------------------
 
 if [ "$TUNNEL" -eq 1 ]; then
@@ -152,13 +174,15 @@ tunnel_label=none
 if [ "$TUNNEL" -eq 1 ]; then
   tunnel_label=$BALAM_TUNNEL_NAME
 fi
+
 echo "==> Rendering unit files into /etc/systemd/system"
 echo "    user=$BALAM_USER  repo=$BALAM_REPO  backend=$backend  tunnel=$tunnel_label"
 for u in "${UNITS[@]}"; do
   balam_render "$DEPLOY/$u.in" "/etc/systemd/system/$u" \
     "OPENCODE_AFTER=$OPENCODE_AFTER" \
     "OPENCODE_REQUIRES=$OPENCODE_REQUIRES" \
-    "PRIMARY_CLAUDE_ENV=$primary_claude"
+    "PRIMARY_CLAUDE_ENV=$primary_claude" \
+    "PRIMARY_GH_ENV=$primary_gh"
 done
 
 if [ "$TUNNEL" -eq 1 ]; then
