@@ -51,7 +51,9 @@ alphabetically — the groups are the shape of the system.
   `additional_directories` + `mcp` servers + `respond_to` (`all`, or
   `mentions` for topics where the bot answers only when @mentioned, replied
   to, or sent a slash command — the gate is in `bot.py`, the detection in
-  `message_text.addresses_bot`).
+  `message_text.addresses_bot`) + `topic_title` (how its topics are auto-named;
+  `{context}` and `{summary}`, defaulting to the file-level `topic_title`, which
+  itself defaults to `{context}: {summary}` — rendered in `topics.topic_name`).
 - **`auth.py`** — the ADR-0008 trust boundary: `is_allowed_user` and
   `callback_authorized`, both gating on `Config.allowed_user_ids` (the owner plus
   `ADDITIONAL_TELEGRAM_USER_IDS` — one trust boundary, several people). Message
@@ -78,7 +80,8 @@ alphabetically — the groups are the shape of the system.
   `/schedule cancel`.
 - **`topics.py`** — naming, opening and linking forum topics. Takes no
   originating message, so `/context`, a General message and a `/schedule` timer
-  all open topics the same way.
+  all open topics the same way. `topic_name` renders the bound context's
+  `topic_title` template and fits the result into Telegram's 128-char cap.
 - **`message_text.py`** — turns a Telegram message into the text the agent sees,
   rendering back the forward/reply/quote gestures Telegram otherwise drops, plus
   `sender_prefix` (`[From Bob Lee (@bob)]`) when the sender is not the owner.
