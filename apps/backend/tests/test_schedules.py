@@ -68,7 +68,7 @@ def test_parse_accepts_a_single_digit_hour() -> None:
         ["someday", "07:30"],
     ],
 )
-def test_parse_rejects_junk_with_the_three_examples(tokens: list[str]) -> None:
+def test_parse_rejects_junk_with_the_examples(tokens: list[str]) -> None:
     with pytest.raises(S.ScheduleError) as exc:
         S.parse_when(tokens)
     # The error shows the accepted forms rather than a grammar dump.
@@ -276,6 +276,87 @@ def test_registered_job_carries_the_configured_timezone() -> None:
     queue = JobQueue()
     S.register_one(queue, _schedule(id=7), SGT)
     (job,) = queue.get_jobs_by_name("schedule:7")
+    assert job.job.trigger.timezone.key == "Asia/Singapore"
+
+
+# --- monthly -------------------------------------------------------------------
+
+
+def test_parse_monthly_takes_a_day_then_a_time() -> None:
+    when = S.parse_when(["monthly", "15", "09:00"])
+    assert (when.kind, when.hour, when.minute, when.month_day) == ("monthly", 9, 0, 15)
+    assert when.days == ()
+    assert when.days_csv == "15"
+    assert when.token_count == 3
+    assert S.parse_when(["daily", "07:30"]).token_count == 2
+
+
+def test_parse_monthly_accepts_ordinals_and_last() -> None:
+    assert S.parse_when(["monthly", "1st", "09:00"]).month_day == 1
+    assert S.parse_when(["Monthly", "LAST", "09:00"]).month_day == S.LAST_DAY
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ["monthly", "09:00"],
+        ["monthly", "0", "09:00"],
+        ["monthly", "29", "09:00"],
+        ["monthly", "31", "09:00"],
+        ["monthly", "first", "09:00"],
+        ["monthly", "15", "9am"],
+    ],
+)
+def test_parse_monthly_rejects_days_not_in_every_month(tokens: list[str]) -> None:
+    # 29-31 would be silently skipped by PTB in shorter months.
+    with pytest.raises(S.ScheduleError):
+        S.parse_when(tokens)
+
+
+def test_describe_monthly() -> None:
+    assert S.describe(S.parse_when(["monthly", "1", "09:00"])) == "monthly on the 1st at 09:00"
+    assert S.describe(S.parse_when(["monthly", "22", "09:00"])) == "monthly on the 22nd at 09:00"
+    assert S.describe(S.parse_when(["monthly", "12", "09:00"])) == "monthly on the 12th at 09:00"
+    assert (
+        S.describe(S.parse_when(["monthly", "last", "18:00"])) == "monthly on the last day at 18:00"
+    )
+
+
+def test_monthly_round_trips_through_the_store() -> None:
+    when = S.parse_when(["monthly", "last", "18:00"])
+    store = _store_with({"kind": when.kind, "hour": 18, "minute": 0, "days": when.days_csv})
+    (row,) = store.all_schedules()
+    assert S.Schedule.from_row(row).when == when
+
+
+def test_previous_due_monthly_this_month_or_last() -> None:
+    when = S.parse_when(["monthly", "15", "09:00"])
+    assert S.previous_due(when, _at(2026, 7, 20, 12)) == _at(2026, 7, 15, 9)
+    assert S.previous_due(when, _at(2026, 7, 15, 8)) == _at(2026, 6, 15, 9)
+    # January wraps back to the previous December.
+    assert S.previous_due(when, _at(2026, 1, 10, 12)) == _at(2025, 12, 15, 9)
+
+
+def test_previous_due_monthly_last_day_follows_month_length() -> None:
+    when = S.parse_when(["monthly", "last", "18:00"])
+    assert S.previous_due(when, _at(2026, 3, 10, 12)) == _at(2026, 2, 28, 18)
+    assert S.previous_due(when, _at(2028, 3, 10, 12)) == _at(2028, 2, 29, 18)  # leap year
+    assert S.previous_due(when, _at(2026, 4, 30, 18)) == _at(2026, 4, 30, 18)
+
+
+def test_catch_up_fires_a_missed_monthly_run() -> None:
+    schedule = _schedule(kind="monthly", hour=9, minute=0, month_day=1)
+    assert S.due_catch_up(schedule, _at(2026, 8, 1, 10)) == _at(2026, 8, 1, 9)
+    assert S.due_catch_up(schedule, _at(2026, 8, 2, 10)) is None
+
+
+def test_register_one_uses_a_monthly_trigger_on_that_day() -> None:
+    queue = JobQueue()
+    S.register_one(queue, _schedule(id=7, kind="monthly", month_day=S.LAST_DAY), SGT)
+    (job,) = queue.get_jobs_by_name("schedule:7")
+    fields = {f.name: str(f) for f in job.job.trigger.fields}
+    assert fields["day"] == "last"
+    assert (fields["hour"], fields["minute"]) == ("7", "30")
     assert job.job.trigger.timezone.key == "Asia/Singapore"
 
 

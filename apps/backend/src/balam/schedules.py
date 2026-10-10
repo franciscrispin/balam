@@ -28,6 +28,7 @@ Three things here are load-bearing and easy to get wrong:
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import logging
 import time
@@ -46,6 +47,16 @@ logger = logging.getLogger(__name__)
 KIND_DAILY = "daily"
 KIND_WEEKDAYS = "weekdays"
 KIND_DOW = "dow"
+KIND_MONTHLY = "monthly"
+
+#: ``schedules.days`` for a monthly schedule on the last day of the month — PTB's
+#: own spelling for it in :meth:`telegram.ext.JobQueue.run_monthly`.
+LAST_DAY = -1
+
+#: The highest fixed day of the month accepted. PTB *skips* a month that has no
+#: such day, so "monthly 31" would silently not run in Feb, Apr, Jun, Sep or Nov;
+#: past 28 the owner is pointed at ``last`` instead.
+MAX_MONTH_DAY = 28
 
 #: Monday–Friday in Python's weekday numbering.
 WORKWEEK = (0, 1, 2, 3, 4)
@@ -78,12 +89,13 @@ _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 #: and a VM that was off for a week would otherwise produce seven topics at boot.
 CATCH_UP_WINDOW = dt.timedelta(hours=6)
 
-#: The three accepted forms, quoted back verbatim when parsing fails. A grammar
-#: dump would be worse than three examples.
+#: The accepted forms, quoted back verbatim when parsing fails. A grammar dump
+#: would be worse than four examples.
 WHEN_EXAMPLES = (
     "/schedule daily 07:30 <context> <prompt>",
     "/schedule weekdays 09:00 <context> <prompt>",
     "/schedule fri 17:00 <context> <prompt>",
+    "/schedule monthly 1 09:00 <context> <prompt> (day 1-28 or last)",
 )
 
 
@@ -94,17 +106,29 @@ class ScheduleError(ValueError):
 @dataclass(frozen=True)
 class When:
     """A parsed schedule time: what kind of recurrence, at what hour/minute, on
-    which weekdays (Python numbering; empty for daily)."""
+    which weekdays (Python numbering; empty for daily and monthly), or on which
+    day of the month (monthly only; :data:`LAST_DAY` for the last)."""
 
     kind: str
     hour: int
     minute: int
     days: tuple[int, ...] = ()
+    month_day: int | None = None
 
     @property
     def days_csv(self) -> str | None:
-        """The ``schedules.days`` column value for this recurrence."""
+        """The ``schedules.days`` column value for this recurrence. A monthly
+        schedule stores its day of the month there — the column is otherwise
+        unused by that kind, and reusing it needs no migration."""
+        if self.month_day is not None:
+            return str(self.month_day)
         return ",".join(str(d) for d in self.days) if self.days else None
+
+    @property
+    def token_count(self) -> int:
+        """How many ``/schedule`` arguments this recurrence was spelled with, so
+        the caller knows where the context name starts."""
+        return 3 if self.kind == KIND_MONTHLY else 2
 
     @property
     def at(self) -> str:
@@ -127,10 +151,15 @@ class Schedule:
     enabled: bool
     created_at: int
     last_run_at: int | None
+    month_day: int | None = None
 
     @classmethod
     def from_row(cls, row: ScheduleRow) -> Schedule:
         days = tuple(int(part) for part in row.days.split(",") if part.strip()) if row.days else ()
+        month_day = None
+        if row.kind == KIND_MONTHLY:
+            # The days column holds the day of the month for this kind.
+            (month_day,), days = days, ()
         return cls(
             id=row.id,
             chat_id=row.chat_id,
@@ -143,30 +172,46 @@ class Schedule:
             enabled=bool(row.enabled),
             created_at=row.created_at,
             last_run_at=row.last_run_at,
+            month_day=month_day,
         )
 
     @property
     def when(self) -> When:
-        return When(kind=self.kind, hour=self.hour, minute=self.minute, days=self.days)
+        return When(
+            kind=self.kind,
+            hour=self.hour,
+            minute=self.minute,
+            days=self.days,
+            month_day=self.month_day,
+        )
 
 
 def parse_when(tokens: Sequence[str]) -> When:
-    """Parse the two leading ``/schedule`` tokens into a :class:`When`.
+    """Parse the leading ``/schedule`` tokens into a :class:`When`.
 
-    Three forms, all of which :meth:`telegram.ext.JobQueue.run_daily` covers
-    directly — which is why v1 has no cron parser and no APScheduler API surface
-    of its own::
+    Four forms, each of which PTB's ``run_daily`` or ``run_monthly`` covers
+    directly — which is why there is no cron parser and no APScheduler API
+    surface of our own::
 
-        daily 07:30       every day
-        weekdays 09:00    Mon–Fri
-        fri 17:00         one weekday
+        daily 07:30          every day
+        weekdays 09:00       Mon–Fri
+        fri 17:00            one weekday
+        monthly 15 09:00     one day of the month (1-28, or ``last``)
 
-    Raises :class:`ScheduleError` with the three examples for anything else.
+    The monthly form takes three tokens, the others two; :attr:`When.token_count`
+    says which. Raises :class:`ScheduleError` with the examples for anything else.
     """
     if len(tokens) < 2:
         raise ScheduleError(_when_help("I need a time, like " + WHEN_EXAMPLES[0] + "."))
 
     kind_token = tokens[0].strip().lower()
+    if kind_token == KIND_MONTHLY:
+        if len(tokens) < 3:
+            raise ScheduleError(_when_help("I need a day and a time, like monthly 1 09:00."))
+        month_day = parse_month_day(tokens[1])
+        hour, minute = parse_time(tokens[2])
+        return When(kind=KIND_MONTHLY, hour=hour, minute=minute, month_day=month_day)
+
     hour, minute = parse_time(tokens[1])
 
     if kind_token == KIND_DAILY:
@@ -196,6 +241,34 @@ def parse_time(token: str) -> tuple[int, int]:
     return hour, minute
 
 
+def parse_month_day(token: str) -> int:
+    """A day of the month: ``1``–``28`` (``1st``/``15th`` spellings too), or
+    ``last`` → :data:`LAST_DAY`. See :data:`MAX_MONTH_DAY` for why not 29–31."""
+    text = token.strip().lower()
+    if text == "last":
+        return LAST_DAY
+    digits = text.removesuffix("st").removesuffix("nd").removesuffix("rd").removesuffix("th")
+    try:
+        day = int(digits)
+    except ValueError:
+        raise ScheduleError(_when_help(f"{token!r} isn't a day of the month.")) from None
+    if 29 <= day <= 31:
+        raise ScheduleError(
+            _when_help(
+                f"Day {day} doesn't exist in every month, and those months would be "
+                "skipped — use last for the end of the month."
+            )
+        )
+    if not 1 <= day <= MAX_MONTH_DAY:
+        raise ScheduleError(_when_help(f"{token!r} isn't a day of the month."))
+    return day
+
+
+def _ordinal(day: int) -> str:
+    suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
 def _when_help(problem: str) -> str:
     examples = "\n".join(WHEN_EXAMPLES)
     return f"{problem}\n\nUse one of:\n{examples}"
@@ -207,6 +280,10 @@ def describe(when: When) -> str:
         return f"every day at {when.at}"
     if when.kind == KIND_WEEKDAYS:
         return f"Mon–Fri at {when.at}"
+    if when.kind == KIND_MONTHLY:
+        assert when.month_day is not None
+        day = "last day" if when.month_day == LAST_DAY else _ordinal(when.month_day)
+        return f"monthly on the {day} at {when.at}"
     names = ", ".join(_WEEKDAY_NAMES[d] for d in when.days)
     return f"every {names} at {when.at}"
 
@@ -236,6 +313,16 @@ def register_one(job_queue: Any, schedule: Schedule, tz: ZoneInfo) -> None:
     if not schedule.enabled:
         return
     when = schedule.when
+    if when.kind == KIND_MONTHLY:
+        assert when.month_day is not None
+        job_queue.run_monthly(
+            fire,
+            when=dt.time(hour=when.hour, minute=when.minute, tzinfo=tz),
+            day=when.month_day,
+            data=schedule.id,
+            name=job_name(schedule.id),
+        )
+        return
     job_queue.run_daily(
         fire,
         time=dt.time(hour=when.hour, minute=when.minute, tzinfo=tz),
@@ -277,6 +364,8 @@ def previous_due(when: When, now: dt.datetime) -> dt.datetime:
     because that stays obvious across weekday sets and needs no DST reasoning of
     its own.
     """
+    if when.kind == KIND_MONTHLY:
+        return _previous_monthly_due(when, now)
     days = set(when.days) if when.days else set(range(7))
     for back in range(8):
         day = (now - dt.timedelta(days=back)).date()
@@ -289,6 +378,21 @@ def previous_due(when: When, now: dt.datetime) -> dt.datetime:
             return candidate
     # Unreachable: with any non-empty day set one of the last 8 days matches and
     # its time-of-day is at or before ``now`` on the earliest of them.
+    raise AssertionError(f"no previous due time for {when!r} before {now!r}")
+
+
+def _previous_monthly_due(when: When, now: dt.datetime) -> dt.datetime:
+    """:func:`previous_due` for a monthly recurrence: this month's occurrence if
+    it has passed, else last month's."""
+    assert when.month_day is not None
+    year, month = now.year, now.month
+    for _ in range(2):
+        last = calendar.monthrange(year, month)[1]
+        day = last if when.month_day == LAST_DAY else when.month_day
+        candidate = dt.datetime(year, month, day, when.hour, when.minute, tzinfo=now.tzinfo)
+        if candidate <= now:
+            return candidate
+        year, month = (year, month - 1) if month > 1 else (year - 1, 12)
     raise AssertionError(f"no previous due time for {when!r} before {now!r}")
 
 

@@ -41,14 +41,15 @@ logger = logging.getLogger(__name__)
 
 
 #: Words that lead a ``/schedule`` sub-command rather than a recurrence. A create
-#: always starts with a when-token (``daily`` / ``weekdays`` / a weekday), so the
-#: two can never be confused.
+#: always starts with a when-token (``daily`` / ``weekdays`` / a weekday /
+#: ``monthly``), so the two can never be confused.
 _SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off", "retime")
 
 _SCHEDULE_USAGE = (
     "Usage:\n"
     "/schedule — list\n"
     "/schedule daily 07:30 <context> <prompt> — create\n"
+    "/schedule monthly 1 09:00 <context> <prompt> — monthly (day 1-28 or last)\n"
     "/schedule cancel — pick schedules to remove\n"
     "/schedule run <id> — fire one now\n"
     "/schedule retime <id> <HH:MM> — change the time\n"
@@ -134,18 +135,19 @@ async def _schedule_create(
         await message.reply_text(str(exc))
         return
 
-    if len(args) < 3:
+    context_at = when.token_count
+    if len(args) <= context_at:
         await message.reply_text(f"I also need a context and a prompt.\n\n{_SCHEDULE_USAGE}")
         return
-    name = router.contexts.match_name(args[2])
+    name = router.contexts.match_name(args[context_at])
     if name is None:
         available = ", ".join(sorted(router.contexts.contexts))
-        await message.reply_text(f"Unknown context {args[2]!r}. Available: {available}")
+        await message.reply_text(f"Unknown context {args[context_at]!r}. Available: {available}")
         return
 
     # The prompt comes from the raw text, not context.args: that is a whitespace
     # split and would collapse a multi-line prompt onto one line.
-    prompt = command_remainder(message.text or "", args_consumed=3)
+    prompt = command_remainder(message.text or "", args_consumed=context_at + 1)
     if not prompt:
         await message.reply_text(f"I need a prompt to run.\n\n{_SCHEDULE_USAGE}")
         return

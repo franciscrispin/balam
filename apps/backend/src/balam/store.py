@@ -35,6 +35,7 @@ class ScheduleRow(NamedTuple):
     hour: int
     minute: int
     #: CSV of Python weekday numbers (``Mon=0`` … ``Sun=6``), or ``None`` for daily.
+    #: For ``kind='monthly'`` it is instead the day of the month (``-1`` = last).
     days: str | None
     enabled: int
     created_at: int
@@ -394,7 +395,8 @@ class SessionStore:
     ) -> int:
         """Save a new schedule; return its id. ``days`` is a CSV of Python
         weekday numbers (``Mon=0`` … ``Sun=6``, i.e. :meth:`datetime.date.weekday`)
-        or ``None`` for a daily schedule."""
+        or ``None`` for a daily schedule — or, for a monthly one, the day of the
+        month (``-1`` for the last day)."""
         cursor = self._db.execute(
             """
             INSERT INTO schedules
