@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 
 
 #: Words that lead a ``/schedule`` sub-command rather than a recurrence. A create
-#: always starts with a when-token (``daily`` / ``weekdays`` / a weekday), so the
-#: two can never be confused.
+#: always starts with a when-token (``daily`` / ``weekdays`` / a weekday /
+#: ``monthly``), so the two can never be confused.
 _SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off", "headless", "topic", "retime")
 
 #: Optional token between the time and the context that makes a schedule run
@@ -57,6 +57,7 @@ _SCHEDULE_USAGE = (
     "/schedule daily 07:30 <context> <prompt> — create\n"
     "/schedule daily 07:30 headless <context> <prompt> — create, no topic; "
     "reports only failures\n"
+    "/schedule monthly 1 09:00 <context> <prompt> — monthly (day 1-28 or last)\n"
     "/schedule cancel — pick schedules to remove\n"
     "/schedule run <id> — fire one now\n"
     "/schedule retime <id> <HH:MM> — change the time\n"
@@ -148,11 +149,11 @@ async def _schedule_create(
     # ``headless`` may sit between the time and the context. A context of that
     # name keeps working: the keyword only counts when it isn't one.
     headless = (
-        len(args) > 2
-        and args[2].strip().lower() == _HEADLESS_TOKEN
-        and router.contexts.match_name(args[2]) is None
+        len(args) > when.token_count
+        and args[when.token_count].strip().lower() == _HEADLESS_TOKEN
+        and router.contexts.match_name(args[when.token_count]) is None
     )
-    context_index = 3 if headless else 2
+    context_index = when.token_count + 1 if headless else when.token_count
 
     if len(args) <= context_index:
         await message.reply_text(f"I also need a context and a prompt.\n\n{_SCHEDULE_USAGE}")
