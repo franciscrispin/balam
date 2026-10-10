@@ -861,6 +861,16 @@ not when its turn ends, so a crash mid-turn cannot re-fire the whole thing.
   became `PendingPicks`, a paged multi-select over `(id, label)` pairs, rather
   than growing a second picker idiom.
 
+### Amendment (2026-10-10): monthly schedules
+
+`when` gains a fourth form, `monthly <day> HH:MM`, where `<day>` is `1`–`28` or
+`last`. It maps onto PTB's `run_monthly` the way the other three map onto
+`run_daily`, so there is still no cron parser. Days 29–31 are refused rather than
+accepted: `run_monthly` *skips* a month without that day, so "monthly 31" would
+silently not run five months a year — `last` is the honest spelling of "end of
+the month". The day of the month is stored in the existing `schedules.days`
+column (`-1` for last), which that kind otherwise leaves empty, so no migration.
+
 ---
 
 ## ADR-0017: A held turn stays answerable, and holds are bounded by count
