@@ -75,6 +75,31 @@ balam_deploy_init() {
   # The tunnel name, and so the unit's `tunnel run <name>` argument and the
   # ingress file at /etc/cloudflared/<name>.yml.
   BALAM_TUNNEL_NAME=${BALAM_TUNNEL_NAME:-balam}
+
+  # Which systemd manager the units go to: "system" (/etc/systemd/system, sudo)
+  # or "user" (~/.config/systemd/user, no sudo — install.sh --user). User mode is
+  # for a Balam that has an OS account of its own: nothing it installs lands in
+  # /etc, so it cannot overwrite the units another account's Balam owns there.
+  BALAM_SYSTEMD_SCOPE=${BALAM_SYSTEMD_SCOPE:-system}
+}
+
+# systemctl/journalctl for the chosen manager. A user manager is reached over
+# $XDG_RUNTIME_DIR, which `sudo -iu <user>` and `su - <user>` do not set; with
+# lingering enabled the manager is running anyway, so point at it.
+balam_systemctl() {
+  if [ "$BALAM_SYSTEMD_SCOPE" = user ]; then
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} systemctl --user "$@"
+  else
+    sudo systemctl "$@"
+  fi
+}
+
+balam_journalctl() {
+  if [ "$BALAM_SYSTEMD_SCOPE" = user ]; then
+    journalctl --user "$@"
+  else
+    sudo journalctl "$@"
+  fi
 }
 
 # The agent subprocess (the `claude` CLI, or opencode) is spawned by the unit, so
@@ -181,7 +206,15 @@ balam_render() {
     return 1
   fi
 
-  sudo install -m 0644 -o root -g root "$tmp" "$dest"
+  if [ "$BALAM_SYSTEMD_SCOPE" = user ]; then
+    # A user manager runs everything as its own user and has no
+    # multi-user.target; User= there is at best redundant.
+    sed -i -e '/^User=/d' -e 's/^WantedBy=multi-user\.target$/WantedBy=default.target/' "$tmp"
+    mkdir -p "$(dirname "$dest")"
+    install -m 0644 "$tmp" "$dest"
+  else
+    sudo install -m 0644 -o root -g root "$tmp" "$dest"
+  fi
   rm -f "$tmp"
   echo "    $(basename "$dest")"
 }
@@ -256,7 +289,7 @@ balam_tunnel_check() {
   local ours foreign
   # `|| true`: grep exits 1 when the unit has never run here, which is the
   # normal first-install case, and the callers run under `set -e`.
-  ours=$(sudo journalctl -u "$unit" -o cat --no-pager 2>/dev/null |
+  ours=$(balam_journalctl -u "$unit" -o cat --no-pager 2>/dev/null |
     grep -o 'Connector ID: [0-9a-f-]\{36\}' | awk '{print $3}' | sort -u | tr '\n' ' ' || true)
   # The JSON travels in the environment: stdin is taken by the heredoc.
   if ! foreign=$(BALAM_TUNNEL_INFO="$info" "$py" - "$ours" <<'PY'

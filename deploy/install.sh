@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install + (re)start the Balam systemd stack and the Cloudflare named tunnel (ADR-0013).
 #
-#   deploy/install.sh [--allow-shared-tunnel]
+#   deploy/install.sh [--user] [--allow-shared-tunnel]
 #
 # Idempotent: renders the unit templates + copies the tunnel ingress config,
 # reloads systemd, builds the Mini App, then starts opencode → bot → tunnel.
@@ -39,6 +39,12 @@
 #
 # This installs THE first instance. For a second bot on a second Claude account,
 # use install-instance.sh instead (see "A second instance" in README.md).
+#
+# --user installs into the invoking OS user's own systemd manager
+# (~/.config/systemd/user) instead of /etc/systemd/system, with no sudo. That is
+# how a Balam on a SEPARATE OS ACCOUNT is installed (README.md, "A Balam on its
+# own OS account"): the system unit names are global, so a second account running
+# the plain installer would overwrite the first account's balam.service.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -50,8 +56,11 @@ usage() {
   cat <<'USAGE'
 Install (or re-install) the first Balam instance under systemd.
 
-  deploy/install.sh [--allow-shared-tunnel]
+  deploy/install.sh [--user] [--allow-shared-tunnel]
 
+  --user                  install into this OS user's own systemd manager
+                          (~/.config/systemd/user, no sudo) instead of
+                          /etc/systemd/system. Needs `loginctl enable-linger`.
   --allow-shared-tunnel   start the tunnel even though another machine is already
                           serving the same tunnel name (Cloudflare then balances
                           the Mini App between the two).
@@ -64,6 +73,7 @@ ALLOW_SHARED_TUNNEL=${BALAM_ALLOW_SHARED_TUNNEL:-0}
 for arg in "$@"; do
   case "$arg" in
     --allow-shared-tunnel) ALLOW_SHARED_TUNNEL=1 ;;
+    --user) BALAM_SYSTEMD_SCOPE=user ;;
     -h | --help)
       usage
       exit 0
@@ -78,6 +88,47 @@ done
 
 DEPLOY="$BALAM_REPO/deploy"
 ENV_FILE="$BALAM_REPO/.env"
+
+if [ "$BALAM_SYSTEMD_SCOPE" = user ]; then
+  UNIT_DIR="$BALAM_HOME/.config/systemd/user"
+  # Next to the tunnel credentials `cloudflared tunnel create` wrote, not in /etc.
+  TUNNEL_CONFIG="$BALAM_HOME/.cloudflared/$BALAM_TUNNEL_NAME.yml"
+  STATUS=(systemctl --user)
+else
+  UNIT_DIR=/etc/systemd/system
+  TUNNEL_CONFIG="/etc/cloudflared/$BALAM_TUNNEL_NAME.yml"
+  STATUS=(systemctl)
+fi
+
+# --- the units are this account's to write ----------------------------------
+
+if [ "$BALAM_SYSTEMD_SCOPE" = system ] && [ -f /etc/systemd/system/balam.service ]; then
+  # Unit names in /etc/systemd/system are machine-wide. A second OS account
+  # running this installer would silently take over the first account's bot.
+  owner=$(sed -n 's/^User=//p' /etc/systemd/system/balam.service | tail -1)
+  if [ -n "$owner" ] && [ "$owner" != "$BALAM_USER" ]; then
+    echo "ERROR: /etc/systemd/system/balam.service belongs to user '$owner', not '$BALAM_USER'." >&2
+    echo "       Installing here would replace that account's bot. To run a Balam on this" >&2
+    echo "       account alongside it, use: deploy/install.sh --user" >&2
+    exit 1
+  fi
+fi
+
+if [ "$BALAM_SYSTEMD_SCOPE" = user ]; then
+  # Without lingering the user manager starts at login and stops at logout, so the
+  # bot would die with the last SSH session and not come back after a reboot.
+  if [ "$(loginctl show-user "$BALAM_USER" -p Linger --value 2>/dev/null)" != yes ]; then
+    echo "ERROR: lingering is off for '$BALAM_USER', so its services stop at logout and do" >&2
+    echo "       not start at boot. Have an admin run:  sudo loginctl enable-linger $BALAM_USER" >&2
+    exit 1
+  fi
+  if ! balam_systemctl show-environment >/dev/null 2>&1; then
+    echo "ERROR: cannot reach the systemd user manager for '$BALAM_USER'." >&2
+    echo "       Log in as this user directly (ssh, or 'sudo machinectl shell $BALAM_USER@')," >&2
+    echo "       or export XDG_RUNTIME_DIR=/run/user/$(id -u) and re-run." >&2
+    exit 1
+  fi
+fi
 
 # --- what to install --------------------------------------------------------
 
@@ -129,6 +180,23 @@ fi
 backend=$(balam_env_get "$ENV_FILE" AGENT_BACKEND)
 backend=${backend:-opencode}
 UNITS=(balam.service)
+if [ "$BALAM_SYSTEMD_SCOPE" = user ] && [ "$backend" = "opencode" ]; then
+  # balam-opencode.service binds a fixed port that another account's Balam may
+  # already own, and nothing here gives it its own one.
+  echo "ERROR: --user supports AGENT_BACKEND=claude_sdk only; $ENV_FILE has '$backend'." >&2
+  exit 1
+fi
+
+# BALAM_PORT is one machine-wide namespace, shared with every other account's
+# Balam. Something else on it means this bot would crash-loop on bind.
+port=$(balam_env_get "$ENV_FILE" BALAM_PORT)
+port=${port:-3000}
+if ! balam_systemctl is-active --quiet balam.service 2>/dev/null &&
+  ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+  echo "ERROR: 127.0.0.1:$port (BALAM_PORT) is already in use by another process —" >&2
+  echo "       probably another Balam on this machine. Pick a free BALAM_PORT in $ENV_FILE." >&2
+  exit 1
+fi
 if [ "$TUNNEL" -eq 1 ]; then
   UNITS+=(cloudflared-balam.service)
 fi
@@ -175,10 +243,11 @@ if [ "$TUNNEL" -eq 1 ]; then
   tunnel_label=$BALAM_TUNNEL_NAME
 fi
 
-echo "==> Rendering unit files into /etc/systemd/system"
+echo "==> Rendering unit files into $UNIT_DIR"
 echo "    user=$BALAM_USER  repo=$BALAM_REPO  backend=$backend  tunnel=$tunnel_label"
 for u in "${UNITS[@]}"; do
-  balam_render "$DEPLOY/$u.in" "/etc/systemd/system/$u" \
+  balam_render "$DEPLOY/$u.in" "$UNIT_DIR/$u" \
+    "TUNNEL_CONFIG=$TUNNEL_CONFIG" \
     "OPENCODE_AFTER=$OPENCODE_AFTER" \
     "OPENCODE_REQUIRES=$OPENCODE_REQUIRES" \
     "PRIMARY_CLAUDE_ENV=$primary_claude" \
@@ -186,22 +255,26 @@ for u in "${UNITS[@]}"; do
 done
 
 if [ "$TUNNEL" -eq 1 ]; then
-  echo "==> Installing tunnel ingress config to /etc/cloudflared/$BALAM_TUNNEL_NAME.yml"
-  sudo mkdir -p /etc/cloudflared
-  sudo install -m 0644 "$DEPLOY/cloudflared-balam.yml" "/etc/cloudflared/$BALAM_TUNNEL_NAME.yml"
+  echo "==> Installing tunnel ingress config to $TUNNEL_CONFIG"
+  if [ "$BALAM_SYSTEMD_SCOPE" = user ]; then
+    mkdir -p "$(dirname "$TUNNEL_CONFIG")"
+    install -m 0644 "$DEPLOY/cloudflared-balam.yml" "$TUNNEL_CONFIG"
+  else
+    sudo mkdir -p /etc/cloudflared
+    sudo install -m 0644 "$DEPLOY/cloudflared-balam.yml" "$TUNNEL_CONFIG"
+  fi
 else
-  port=$(balam_env_get "$ENV_FILE" BALAM_PORT)
   echo "==> No $DEPLOY/cloudflared-balam.yml — installing without a tunnel."
   echo "    The Mini App is reachable at http://127.0.0.1:${port:-3000} only, and /diff replies"
   echo "    with that URL instead of an in-Telegram button. To add the tunnel later, create the"
   echo "    ingress file + balam.env and re-run (README.md, 'One-time setup')."
-  if [ -f /etc/systemd/system/cloudflared-balam.service ]; then
+  if [ -f "$UNIT_DIR/cloudflared-balam.service" ]; then
     echo "  ! cloudflared-balam.service is still installed from an earlier run and is left as is."
-    echo "    To retire it: sudo systemctl disable --now cloudflared-balam"
+    echo "    To retire it: ${STATUS[*]} disable --now cloudflared-balam"
   fi
 fi
 
-sudo systemctl daemon-reload
+balam_systemctl daemon-reload
 
 echo "==> Building the Mini App (served by FastAPI from dist/)"
 balam_build_miniapp "$BALAM_REPO"
@@ -213,9 +286,10 @@ echo "==> Enabling + (re)starting the units"
 # CLAUDE_CONFIG_DIR) kept running. Restart explicitly; this script is documented
 # as the way to apply an edit, so it has to actually apply it.
 for u in "${UNITS[@]}"; do
-  sudo systemctl enable --quiet "$u"
-  sudo systemctl restart "$u"
+  balam_systemctl enable --quiet "$u"
+  balam_systemctl restart "$u"
 done
 
 echo "==> Done. Status:"
-systemctl --no-pager --lines=0 status "${UNITS[@]}" || true
+XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
+  "${STATUS[@]}" --no-pager --lines=0 status "${UNITS[@]}" || true

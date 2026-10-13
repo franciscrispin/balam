@@ -327,7 +327,60 @@ If the two accounts belong to two different people, give the second instance its
 own OS user instead. A different `HOME` gives it a different `~/.claude` with no
 environment variable at all, and real file separation. The cost is that the
 second user needs its own skills, its own git and `gh` credentials, and its own
-uv environment.
+uv environment. The next section is how.
+
+## A Balam on its own OS account
+
+For a bot that must not see the first one's files and logins — another person's,
+or one you want walled off — create a separate OS user and install a plain,
+first-instance Balam in it with:
+
+```sh
+deploy/install.sh --user
+```
+
+`--user` renders the units into that account's own systemd manager
+(`~/.config/systemd/user`) and runs everything with `systemctl --user`: no sudo,
+and nothing in `/etc`. That last part is the point. System unit names are
+machine-wide, so the plain installer run from a second account would overwrite
+the first account's `balam.service` — and it now refuses to, naming `--user`.
+The tunnel ingress goes to `~/.cloudflared/<tunnel>.yml` instead of
+`/etc/cloudflared/`.
+
+Inside that account nothing is pinned: its `~/.claude` and `~/.config/gh` are its
+own already, so `BALAM_PRIMARY_CLAUDE_CONFIG_DIR` and friends stay unset.
+
+One-time, by an admin (sudo):
+
+```sh
+sudo adduser --disabled-password --comment "" <user>   # not in sudo/docker/adm
+sudo loginctl enable-linger <user>   # services run at boot, survive logout
+```
+
+Without lingering the user manager stops at logout, taking the bot with it, so
+`--user` refuses to install until it is on. `sudo -iu <user>` does not set
+`XDG_RUNTIME_DIR`; the installer fills it in, but for your own `systemctl --user`
+calls in such a shell, `export XDG_RUNTIME_DIR=/run/user/$(id -u)` first.
+
+Then, as the new user: install uv, bun and the `claude` CLI; clone; fill `.env`
+(its **own** bot token, a **free** `BALAM_PORT` and `BALAM_VNC_PORT`,
+`AGENT_BACKEND=claude_sdk` — `--user` supports nothing else) and `config.yaml`;
+`claude auth login`; `gh auth login`; then `deploy/install.sh --user`. The
+installer refuses a `BALAM_PORT` something else is already listening on.
+
+Operate it from that account:
+
+```sh
+systemctl --user status balam
+journalctl --user -u balam -f
+systemctl --user restart balam
+```
+
+Still shared between the accounts: the CPU, memory and network, the
+system-wide tools (`cloudflared`, `chromium`, `Xvfb`), and **every localhost
+port** — ports are not per-user. In particular a VNC server started with no
+password (`x11vnc -nopw`) or an X display started with `-ac` can be watched and
+driven by any account on the machine.
 
 ## Alternative: quick (ephemeral) tunnel
 

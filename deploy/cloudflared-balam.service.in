@@ -10,7 +10,7 @@ User=@USER@
 # BotFather Web App URL never churns. Ingress maps ONLY that host → 127.0.0.1:3000
 # (the FastAPI server). OpenCode (:4096) and VNC are never tunneled. The explicit
 # --config avoids cloudflared auto-loading ~/.cloudflared/config.yml (another app).
-ExecStart=@CLOUDFLARED@ --no-autoupdate --config /etc/cloudflared/@TUNNEL_NAME@.yml tunnel run @TUNNEL_NAME@
+ExecStart=@CLOUDFLARED@ --no-autoupdate --config @TUNNEL_CONFIG@ tunnel run @TUNNEL_NAME@
 Restart=on-failure
 RestartSec=6s
 
