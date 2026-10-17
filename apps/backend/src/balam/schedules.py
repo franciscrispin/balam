@@ -7,6 +7,12 @@ up to a topic holding the answer and replies in it to keep working. One topic pe
 fire is deliberate — it keeps each run's session history separate, which is
 ADR-0009's reasoning applied to time.
 
+A **headless** schedule opens no topic at all (:mod:`balam.headless`). It is for
+jobs whose result lands somewhere else, like a sync that writes a sheet and a log
+another schedule reports. The chat hears about a headless run only when it
+fails, or when its answer starts with ``ALERT:``, in General, so a broken job is
+never silent and a check can still raise what it found.
+
 Schedules are **user data**, not infrastructure: they live in SQLite
 (:class:`balam.store.SessionStore`) and are created, listed and cancelled from
 the phone with ``/schedule``. Contexts stay in ``config.yaml`` (ADR-0012) because
@@ -28,6 +34,7 @@ Three things here are load-bearing and easy to get wrong:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import time
@@ -36,6 +43,7 @@ from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from balam.headless import HeadlessResult, run_headless
 from balam.store import ScheduleRow, SessionStore
 from balam.topics import TopicOpenError, open_topic_in_context
 from balam.turns import start_prompt
@@ -46,6 +54,13 @@ logger = logging.getLogger(__name__)
 KIND_DAILY = "daily"
 KIND_WEEKDAYS = "weekdays"
 KIND_DOW = "dow"
+
+#: Schedule run modes, as stored in ``schedules.mode``.
+MODE_TOPIC = "topic"
+MODE_HEADLESS = "headless"
+
+#: How much of a headless run's answer a report quotes.
+_REPORT_TAIL = 800
 
 #: Monday–Friday in Python's weekday numbering.
 WORKWEEK = (0, 1, 2, 3, 4)
@@ -127,6 +142,11 @@ class Schedule:
     enabled: bool
     created_at: int
     last_run_at: int | None
+    mode: str = MODE_TOPIC
+
+    @property
+    def headless(self) -> bool:
+        return self.mode == MODE_HEADLESS
 
     @classmethod
     def from_row(cls, row: ScheduleRow) -> Schedule:
@@ -143,6 +163,7 @@ class Schedule:
             enabled=bool(row.enabled),
             created_at=row.created_at,
             last_run_at=row.last_run_at,
+            mode=row.mode,
         )
 
     @property
@@ -341,13 +362,24 @@ async def fire(context: Any) -> None:
 
 
 async def run_schedule(
-    context: Any, schedule: Schedule, *, late_for: dt.datetime | None = None
+    context: Any,
+    schedule: Schedule,
+    *,
+    late_for: dt.datetime | None = None,
+    report_thread: int | None = None,
+    announce: bool = False,
 ) -> bool:
-    """Open a topic for ``schedule`` and start its prompt there unattended.
+    """Open a topic for ``schedule`` and start its prompt there unattended, or,
+    for a headless schedule, start it with no topic at all.
 
-    Returns whether a turn started. ``late_for`` marks a catch-up run and is the
+    Returns whether a run started. ``late_for`` marks a catch-up run and is the
     due time it missed, noted in the topic so a brief that shows up at 09:12 does
     not read as a 09:12 brief.
+
+    ``report_thread`` and ``announce`` only affect a headless run: where its
+    report goes (General when ``None``), and whether a *successful* run is
+    reported too. ``/schedule run`` sets both, so a manual test shows its result
+    where it was asked for; the timer sets neither, so success stays silent.
     """
     router = context.application.bot_data["router"]
     store: SessionStore = context.application.bot_data["store"]
@@ -369,6 +401,11 @@ async def run_schedule(
     # Stamp before running, not after (see the module docstring).
     store.mark_schedule_run(schedule.id, int(time.time() * 1000))
 
+    if schedule.headless:
+        return await _start_headless(
+            context, schedule, late_for=late_for, report_thread=report_thread, announce=announce
+        )
+
     try:
         thread_id, title = await open_topic_in_context(
             context.bot, router, schedule.chat_id, schedule.context, prompt=schedule.prompt
@@ -389,6 +426,85 @@ async def run_schedule(
     return await start_prompt(
         context, schedule.chat_id, thread_id, schedule.prompt, title=title, unattended=True
     )
+
+
+async def _start_headless(
+    context: Any,
+    schedule: Schedule,
+    *,
+    late_for: dt.datetime | None,
+    report_thread: int | None,
+    announce: bool,
+) -> bool:
+    """Resolve a topic-less session and run the prompt in a background task.
+
+    Returns once the run has *started*, like a topic run: the JobQueue callback
+    must not sit on a turn that can take many minutes."""
+    router = context.application.bot_data["router"]
+    backend = context.application.bot_data["backend"]
+    try:
+        resolved = await router.resolve_headless(
+            schedule.chat_id, schedule.context, f"Schedule #{schedule.id}"
+        )
+    except Exception as exc:
+        logger.exception("schedule %s could not start its headless session", schedule.id)
+        await _notify_chat(
+            context.bot,
+            schedule.chat_id,
+            f"⚠️ Headless schedule #{schedule.id} could not start: {exc}",
+            thread_id=report_thread,
+        )
+        return False
+
+    async def finish() -> None:
+        result = await run_headless(backend, resolved, schedule.prompt)
+        logger.info(
+            "headless schedule %s finished ok=%s error=%r blocked=%s",
+            schedule.id,
+            result.ok,
+            result.error,
+            result.blocked,
+        )
+        if result.ok and not result.alert and not announce:
+            return
+        await _notify_chat(
+            context.bot,
+            schedule.chat_id,
+            headless_report(schedule, result, late_for=late_for),
+            thread_id=report_thread,
+        )
+
+    # Anchored, because the event loop holds only a weak reference to a task: an
+    # unanchored run could be garbage-collected halfway through a sync.
+    tasks: set[asyncio.Task[None]] = context.application.bot_data.setdefault(
+        "headless_tasks", set()
+    )
+    task = asyncio.create_task(finish())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return True
+
+
+def headless_report(
+    schedule: Schedule, result: HeadlessResult, *, late_for: dt.datetime | None = None
+) -> str:
+    """The one message a headless run posts: always on failure or an alert, on
+    plain success only for a manual ``/schedule run``."""
+    late = f" (late run, due {late_for:%H:%M})" if late_for is not None else ""
+    if result.ok and result.alert:
+        lines = [f"🚨 Headless schedule #{schedule.id} raised an alert{late}."]
+    elif result.ok:
+        lines = [f"✅ Headless schedule #{schedule.id} finished{late}."]
+    else:
+        lines = [f"⚠️ Headless schedule #{schedule.id} failed{late}: {summarize(schedule.prompt)}"]
+        if result.error:
+            lines.append(f"Error: {result.error}")
+        if result.blocked:
+            lines.append("Refused: " + ", ".join(result.blocked))
+    if result.answer:
+        tail = result.answer[-_REPORT_TAIL:]
+        lines.append(("…" if len(result.answer) > _REPORT_TAIL else "") + tail)
+    return "\n".join(lines)
 
 
 async def catch_up(

@@ -5,6 +5,7 @@ wrong: the Python↔PTB weekday conversion, the timezone the times are read in, 
 the missed-run catch-up window.
 """
 
+import asyncio
 import datetime as dt
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -16,6 +17,7 @@ from balam import schedules as S
 from balam.agent.opencode_backend import OpenCodeBackend
 from balam.approvals import PendingApprovals
 from balam.contexts import ContextConfig, ContextsConfig
+from balam.headless import HeadlessResult
 from balam.router import Router, TopicRef
 from balam.store import SessionStore
 from balam.turns import TurnRegistry
@@ -526,3 +528,80 @@ async def test_catch_up_survives_one_broken_schedule(monkeypatch) -> None:
 def test_summarize_collapses_and_truncates() -> None:
     assert S.summarize("plan  my\nday") == "plan my day"
     assert S.summarize("x" * 100, limit=10) == "x" * 9 + "…"
+
+
+# --- headless schedules (ADR-0016 amendment) -----------------------------------
+
+
+async def _run_headless_schedule(monkeypatch, result, **kwargs):
+    """Run schedule #1 headless, with ``run_headless`` stubbed to ``result``."""
+    seen: dict[str, object] = {}
+
+    async def fake_run_headless(backend, resolved, prompt, **_):
+        seen.update(resolved=resolved, prompt=prompt)
+        return result
+
+    monkeypatch.setattr("balam.schedules.run_headless", fake_run_headless)
+    context, store, bot, turns = _fire_env()
+    store.set_schedule_mode(1, "headless")
+    started = await S.run_schedule(context, S.Schedule.from_row(store.get_schedule(1)), **kwargs)
+    await asyncio.gather(*context.application.bot_data.get("headless_tasks", set()))
+    return started, seen, store, bot, turns
+
+
+async def test_headless_schedule_opens_no_topic_and_is_silent_when_it_works(monkeypatch) -> None:
+    started, seen, store, bot, turns = await _run_headless_schedule(
+        monkeypatch, HeadlessResult(answer="filled 4")
+    )
+    assert started is True
+    assert bot.created_topics == []
+    assert bot.sent == []
+    assert turns.get(SUPERGROUP, 555) is None
+    # It ran the prompt in the schedule's context, and was stamped like any run.
+    assert seen["prompt"] == "plan my day"
+    assert seen["resolved"].directory == "/work/chaska"  # type: ignore[attr-defined]
+    assert store.get_schedule(1).last_run_at is not None  # type: ignore[union-attr]
+
+
+async def test_headless_failure_is_reported_in_general(monkeypatch) -> None:
+    result = HeadlessResult(answer="got halfway", error="rate limited", blocked=["denied write"])
+    _started, _seen, _store, bot, _turns = await _run_headless_schedule(monkeypatch, result)
+    assert len(bot.sent) == 1
+    chat, text, thread = bot.sent[0]
+    assert (chat, thread) == (SUPERGROUP, None)
+    assert "#1 failed" in text and "rate limited" in text and "denied write" in text
+    assert "got halfway" in text
+
+
+async def test_headless_alert_is_reported_in_general(monkeypatch) -> None:
+    result = HeadlessResult(answer="ALERT: WhatsApp bridge is logged out")
+    _started, _seen, _store, bot, _turns = await _run_headless_schedule(monkeypatch, result)
+    assert len(bot.sent) == 1
+    chat, text, thread = bot.sent[0]
+    assert (chat, thread) == (SUPERGROUP, None)
+    assert "#1 raised an alert" in text and "logged out" in text
+
+
+async def test_headless_alert_prefix_only_counts_at_the_start(monkeypatch) -> None:
+    result = HeadlessResult(answer="All healthy, no ALERT: needed")
+    _started, _seen, _store, bot, _turns = await _run_headless_schedule(monkeypatch, result)
+    assert bot.sent == []
+
+
+async def test_manual_headless_run_reports_success_where_it_was_asked(monkeypatch) -> None:
+    _started, _seen, _store, bot, _turns = await _run_headless_schedule(
+        monkeypatch, HeadlessResult(answer="filled 4"), report_thread=42, announce=True
+    )
+    assert len(bot.sent) == 1
+    _chat, text, thread = bot.sent[0]
+    assert thread == 42
+    assert "finished" in text and "filled 4" in text
+
+
+def test_headless_report_marks_a_late_run_and_trims_a_long_answer() -> None:
+    schedule = S.Schedule.from_row(_store_with({}).get_schedule(1))  # type: ignore[arg-type]
+    text = S.headless_report(
+        schedule, HeadlessResult(answer="x" * 5000, error="boom"), late_for=_at(2026, 7, 31, 7, 30)
+    )
+    assert "late run, due 07:30" in text
+    assert len(text) < 1200

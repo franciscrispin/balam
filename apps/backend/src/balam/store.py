@@ -40,6 +40,9 @@ class ScheduleRow(NamedTuple):
     created_at: int
     #: Epoch ms of the last run's *start*, or ``None`` until it first fires.
     last_run_at: int | None
+    #: ``"topic"`` (a fresh forum topic per run) or ``"headless"`` (no topic; the
+    #: chat hears about a run only on a failure or an alert). ADR-0016 amendment.
+    mode: str = "topic"
 
 
 _SCHEDULE_COLUMNS = ", ".join(ScheduleRow._fields)
@@ -113,13 +116,15 @@ class SessionStore:
                 days        TEXT,
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 created_at  INTEGER NOT NULL,
-                last_run_at INTEGER
+                last_run_at INTEGER,
+                mode        TEXT    NOT NULL DEFAULT 'topic'
             );
             """
         )
         self._migrate_auto_named()
         self._migrate_title()
         self._migrate_schedules()
+        self._migrate_schedule_mode()
         self._db.commit()
 
     def _migrate_auto_named(self) -> None:
@@ -171,6 +176,16 @@ class SessionStore:
         if self._db.execute("PRAGMA user_version").fetchone()[0] >= 3:
             return
         self._db.execute("PRAGMA user_version = 3")
+
+    def _migrate_schedule_mode(self) -> None:
+        """Add ``schedules.mode`` (v4) to a table that predates headless runs.
+        Existing schedules keep opening a topic: the default is ``'topic'``."""
+        if self._db.execute("PRAGMA user_version").fetchone()[0] >= 4:
+            return
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(schedules)").fetchall()}
+        if "mode" not in columns:
+            self._db.execute("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT 'topic'")
+        self._db.execute("PRAGMA user_version = 4")
 
     @staticmethod
     def thread_key(thread_id: int | None) -> int:
@@ -391,6 +406,7 @@ class SessionStore:
         minute: int,
         days: str | None,
         created_at: int,
+        mode: str = "topic",
     ) -> int:
         """Save a new schedule; return its id. ``days`` is a CSV of Python
         weekday numbers (``Mon=0`` … ``Sun=6``, i.e. :meth:`datetime.date.weekday`)
@@ -398,10 +414,10 @@ class SessionStore:
         cursor = self._db.execute(
             """
             INSERT INTO schedules
-                (chat_id, context, prompt, kind, hour, minute, days, enabled, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                (chat_id, context, prompt, kind, hour, minute, days, enabled, created_at, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
-            (chat_id, context, prompt, kind, hour, minute, days, created_at),
+            (chat_id, context, prompt, kind, hour, minute, days, created_at, mode),
         )
         self._db.commit()
         return int(cursor.lastrowid or 0)
@@ -443,6 +459,13 @@ class SessionStore:
             "UPDATE schedules SET enabled = ? WHERE id = ?",
             (1 if enabled else 0, schedule_id),
         )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def set_schedule_mode(self, schedule_id: int, mode: str) -> bool:
+        """Switch a schedule between ``"topic"`` and ``"headless"`` runs;
+        ``False`` if unknown."""
+        cursor = self._db.execute("UPDATE schedules SET mode = ? WHERE id = ?", (mode, schedule_id))
         self._db.commit()
         return cursor.rowcount > 0
 

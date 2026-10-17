@@ -2617,6 +2617,62 @@ async def test_schedule_list_shows_saved_schedules() -> None:
     assert "Asia/Singapore" in reply
 
 
+async def test_schedule_create_headless_keyword_sets_the_mode() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 headless chaska sync it")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["daily", "07:30", "headless", "chaska", "sync", "it"]
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.list_schedules(SUPERGROUP)[0]
+    # The keyword is consumed: it is neither the context nor part of the prompt.
+    assert (row.context, row.prompt, row.mode) == ("chaska", "sync it", "headless")
+    assert "Headless" in message.replies[-1]
+
+
+async def test_schedule_create_opens_topics_by_default() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 chaska headless please")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["daily", "07:30", "chaska", "headless", "please"]
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.list_schedules(SUPERGROUP)[0]
+    assert (row.prompt, row.mode) == ("headless please", "topic")
+
+
+async def test_schedule_headless_and_topic_switch_the_mode() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule headless 1")
+    update, context, store, _bot, _turns = _schedule_env(message, ["headless", "1"])
+    store.add_schedule(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="p",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=1,
+    )
+
+    await handle_schedule(update, context)
+    assert store.get_schedule(1).mode == "headless"  # type: ignore[union-attr]
+
+    context.args = ["headless", "1"]
+    await handle_schedule(update, context)
+    assert "already runs headless" in message.replies[-1]
+
+    context.args = []
+    await handle_schedule(update, context)
+    assert "#1 · every day at 07:30 · chaska · headless" in message.replies[-1]
+
+    context.args = ["topic", "1"]
+    await handle_schedule(update, context)
+    assert store.get_schedule(1).mode == "topic"  # type: ignore[union-attr]
+
+
 async def test_schedule_list_is_empty_with_usage() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule")
     update, context, _store, _bot, _turns = _schedule_env(message, [])
