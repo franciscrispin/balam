@@ -210,6 +210,23 @@ open-shrimp reference (ADR-0011):
   backend never starts the VNC stack: `GET /api/browser/status` probes it and
   the view shows an offline state when it is down.
 
+
+### Amendment (2026-10-15): the viewer can take control
+
+The live view stays **view-only by default**, but a **Control** toggle in the
+browser view hands mouse/touch and keyboard to the viewer, so the user can do
+what the agent cannot — sign in to an account, clear a CAPTCHA, fix a stuck
+page — straight from Telegram. A phone never opens its on-screen keyboard for
+the RFB canvas, so a keyboard button focuses a hidden text input and the view
+forwards each edit as X11 keysyms (`rfb.sendKey`; `apps/frontend/src/lib/vnc-keys.ts`).
+
+This changes no trust boundary. View-only was only ever enforced in the client:
+the `/api/vnc/ws` bridge relays client bytes to x11vnc unfiltered, so anyone who
+passed its allowlist check could already send input. The gate remains the
+ADR-0008 allowlist — which means every `ADDITIONAL_TELEGRAM_USER_IDS` user can
+also drive the agent's browser, including any session logged in there.
+Default-off keeps a tap on the picture from clicking the agent's page by
+accident.
 ---
 
 ## ADR-0007: Local, single-user deployment on the VM

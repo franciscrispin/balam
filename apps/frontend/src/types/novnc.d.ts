@@ -16,5 +16,7 @@ declare module "@novnc/novnc" {
     clipViewport: boolean;
     background: string;
     disconnect(): void;
+    /** Press and release `keysym`; a no-op while `viewOnly`. */
+    sendKey(keysym: number, code: string | null, down?: boolean): void;
   }
 }
