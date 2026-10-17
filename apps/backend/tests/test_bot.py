@@ -1278,6 +1278,7 @@ def _config(*, chat_id: int | None, user_ids: tuple[int, ...] = (OWNER,)) -> Sim
         allowed_user_ids=user_ids,
         allowed_telegram_chat_id=chat_id,
         tool_stream="collapsed",
+        voice_transcription_enabled=False,
     )
 
 
@@ -2025,6 +2026,104 @@ async def test_message_with_photo_forwards_file_part_and_caption(monkeypatch) ->
     files = captured["files"]
     assert [f.mime for f in files] == ["image/jpeg"]
     assert files[0].url.startswith("data:image/jpeg;base64,")
+
+
+class _FakeTranscriber:
+    def __init__(self, text: str = "", *, fail: bool = False) -> None:
+        self.text = text
+        self.fail = fail
+        self.heard: list[bytes] = []
+
+    async def transcribe(self, audio: bytes) -> str:
+        self.heard.append(audio)
+        if self.fail:
+            raise RuntimeError("model exploded")
+        return self.text
+
+
+class _VoiceBot(_AttachmentBot):
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.actions: list[str] = []
+
+    async def send_chat_action(self, *, chat_id: int, action: str, **_: object) -> None:
+        self.actions.append(action)
+
+
+def _voice_msg(caption: str | None = None) -> _FakeMessage:
+    msg = _FakeMessage(SUPERGROUP, 5, is_forum=True)
+    msg.photo = []
+    msg.document = None
+    msg.voice = SimpleNamespace(file_id="v1", mime_type="audio/ogg")
+    msg.caption = caption
+    return msg
+
+
+async def _run_voice(monkeypatch, message, transcriber) -> tuple[dict[str, object], _VoiceBot]:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_reply(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+    bot = _VoiceBot(b"OggS-opus")
+    update, context, turns = _message_env(message, bot)
+    context.application.bot_data["transcriber"] = transcriber
+
+    await _handle_message(update, context)
+    turn = turns.get(SUPERGROUP, 5)
+    if turn is not None:
+        await turn.task
+    return captured, bot
+
+
+async def test_voice_note_becomes_a_text_prompt_and_is_echoed(monkeypatch) -> None:
+    transcriber = _FakeTranscriber("fix the failing tests")
+    message = _voice_msg()
+
+    captured, bot = await _run_voice(monkeypatch, message, transcriber)
+
+    assert transcriber.heard == [b"OggS-opus"]
+    assert captured["prompt"] == "[Transcribed from voice note] fix the failing tests"
+    assert captured["files"] == []  # the recording itself is not passed on
+    assert message.replies == ["🎙️ fix the failing tests"]
+    assert bot.actions == ["typing"]
+
+
+async def test_voice_note_caption_comes_before_the_transcript(monkeypatch) -> None:
+    captured, _ = await _run_voice(
+        monkeypatch, _voice_msg(caption="see below"), _FakeTranscriber("deploy it")
+    )
+
+    assert captured["prompt"] == "see below\n\n[Transcribed from voice note] deploy it"
+
+
+async def test_failed_transcription_falls_back_to_the_audio_file(monkeypatch) -> None:
+    message = _voice_msg()
+
+    captured, _ = await _run_voice(monkeypatch, message, _FakeTranscriber(fail=True))
+
+    assert [f.mime for f in captured["files"]] == ["audio/ogg"]
+    assert message.replies[0].startswith("⚠️ Couldn't transcribe")
+
+
+async def test_silent_voice_note_starts_no_turn(monkeypatch) -> None:
+    message = _voice_msg()
+
+    captured, _ = await _run_voice(monkeypatch, message, _FakeTranscriber(""))
+
+    assert captured == {}
+    assert message.replies == ["🎙️ No speech heard in this voice note."]
+
+
+async def test_voice_note_is_an_attachment_when_transcription_is_off(monkeypatch) -> None:
+    message = _voice_msg()
+
+    captured, bot = await _run_voice(monkeypatch, message, None)
+
+    assert [f.mime for f in captured["files"]] == ["audio/ogg"]
+    assert message.replies == []
+    assert bot.actions == []
 
 
 async def test_second_users_message_is_attributed_in_the_prompt(monkeypatch) -> None:
