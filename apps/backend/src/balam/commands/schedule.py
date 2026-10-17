@@ -6,7 +6,9 @@ existing schedules, and the inline picker for cancelling them. The timer itself
 :mod:`balam.schedules`, which this module drives but does not reimplement.
 
 A scheduled run opens a *new* topic each time (:func:`~balam.topics.open_topic_in_context`),
-so it never collides with a turn already running somewhere.
+so it never collides with a turn already running somewhere. A *headless* schedule
+opens none and reports to General only on a failure or an ``ALERT:`` answer
+(:mod:`balam.headless`).
 """
 
 from __future__ import annotations
@@ -43,16 +45,23 @@ logger = logging.getLogger(__name__)
 #: Words that lead a ``/schedule`` sub-command rather than a recurrence. A create
 #: always starts with a when-token (``daily`` / ``weekdays`` / a weekday), so the
 #: two can never be confused.
-_SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off", "retime")
+_SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off", "headless", "topic", "retime")
+
+#: Optional token between the time and the context that makes a schedule run
+#: with no topic: ``/schedule daily 07:30 headless <context> <prompt>``.
+_HEADLESS_TOKEN = schedules.MODE_HEADLESS
 
 _SCHEDULE_USAGE = (
     "Usage:\n"
     "/schedule — list\n"
     "/schedule daily 07:30 <context> <prompt> — create\n"
+    "/schedule daily 07:30 headless <context> <prompt> — create, no topic; "
+    "reports only failures\n"
     "/schedule cancel — pick schedules to remove\n"
     "/schedule run <id> — fire one now\n"
     "/schedule retime <id> <HH:MM> — change the time\n"
-    "/schedule off <id> · /schedule on <id> — pause / resume"
+    "/schedule off <id> · /schedule on <id> — pause / resume\n"
+    "/schedule headless <id> · /schedule topic <id> — run without / with a topic"
 )
 
 
@@ -65,6 +74,8 @@ def _schedule_label(schedule: schedules.Schedule) -> str:
 def _format_schedule(schedule: schedules.Schedule, tz: ZoneInfo) -> str:
     """One schedule as three list lines: when/where, prompt, last run."""
     state = "" if schedule.enabled else " ⏸ paused"
+    if schedule.headless:
+        state += " · headless"
     lines = [
         f"#{schedule.id} · {describe(schedule.when)} · {schedule.context}{state}",
         f"   {schedules.summarize(schedule.prompt, 120)}",
@@ -102,7 +113,7 @@ async def handle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if head == "cancel":
         await _schedule_cancel(message, context)
         return
-    if head in ("run", "on", "off"):
+    if head in ("run", "on", "off", "headless", "topic"):
         await _schedule_by_id(message, context, head, args[1:])
         return
     if head == "retime":
@@ -134,18 +145,27 @@ async def _schedule_create(
         await message.reply_text(str(exc))
         return
 
-    if len(args) < 3:
+    # ``headless`` may sit between the time and the context. A context of that
+    # name keeps working: the keyword only counts when it isn't one.
+    headless = (
+        len(args) > 2
+        and args[2].strip().lower() == _HEADLESS_TOKEN
+        and router.contexts.match_name(args[2]) is None
+    )
+    context_index = 3 if headless else 2
+
+    if len(args) <= context_index:
         await message.reply_text(f"I also need a context and a prompt.\n\n{_SCHEDULE_USAGE}")
         return
-    name = router.contexts.match_name(args[2])
+    name = router.contexts.match_name(args[context_index])
     if name is None:
         available = ", ".join(sorted(router.contexts.contexts))
-        await message.reply_text(f"Unknown context {args[2]!r}. Available: {available}")
+        await message.reply_text(f"Unknown context {args[context_index]!r}. Available: {available}")
         return
 
     # The prompt comes from the raw text, not context.args: that is a whitespace
     # split and would collapse a multi-line prompt onto one line.
-    prompt = command_remainder(message.text or "", args_consumed=3)
+    prompt = command_remainder(message.text or "", args_consumed=context_index + 1)
     if not prompt:
         await message.reply_text(f"I need a prompt to run.\n\n{_SCHEDULE_USAGE}")
         return
@@ -159,6 +179,7 @@ async def _schedule_create(
         minute=when.minute,
         days=when.days_csv,
         created_at=int(time.time() * 1000),
+        mode=schedules.MODE_HEADLESS if headless else schedules.MODE_TOPIC,
     )
     tz = _schedule_timezone(context)
     job_queue = getattr(context.application, "job_queue", None)
@@ -173,8 +194,11 @@ async def _schedule_create(
     row = store.get_schedule(schedule_id)
     assert row is not None  # just inserted
     schedules.register_one(job_queue, schedules.Schedule.from_row(row), tz)
+    headless_note = (
+        " Headless: no topic, and only failures and alerts are reported." if headless else ""
+    )
     await message.reply_text(
-        f"🗓 Schedule #{schedule_id} saved — {describe(when)} ({tz.key}) in {name}.\n"
+        f"🗓 Schedule #{schedule_id} saved — {describe(when)} ({tz.key}) in {name}.{headless_note}\n"
         f"{schedules.summarize(prompt, 120)}\n\n"
         f"Test it now with /schedule run {schedule_id}."
     )
@@ -183,7 +207,7 @@ async def _schedule_create(
 async def _schedule_by_id(
     message: Any, context: ContextTypes.DEFAULT_TYPE, action: str, rest: list[str]
 ) -> None:
-    """``/schedule run|on|off <id>``."""
+    """``/schedule run|on|off|headless|topic <id>``."""
     store: SessionStore = context.application.bot_data["store"]
     if not rest:
         await message.reply_text(f"Which schedule? /schedule {action} <id>")
@@ -205,7 +229,23 @@ async def _schedule_by_id(
         # The whole point of this sub-command: a 24-hour feedback loop becomes a
         # 5-second one. It runs unattended, exactly as the timer would.
         await message.reply_text(f"▶️ Running schedule #{schedule_id} now…")
-        await schedules.run_schedule(context, schedule)
+        # A headless run reports here, success included: this is a test, and
+        # the person who asked is waiting to see how it went.
+        await schedules.run_schedule(
+            context,
+            schedule,
+            report_thread=getattr(message, "message_thread_id", None),
+            announce=True,
+        )
+        return
+
+    if action in ("headless", "topic"):
+        if schedule.mode == action:
+            await message.reply_text(f"Schedule #{schedule_id} already runs {_mode_text(action)}.")
+            return
+        # No timer to touch: the mode is read from the row each time it fires.
+        store.set_schedule_mode(schedule_id, action)
+        await message.reply_text(f"Schedule #{schedule_id} now runs {_mode_text(action)}.")
         return
 
     enable = action == "on"
@@ -222,6 +262,12 @@ async def _schedule_by_id(
         f"{'▶️ Resumed' if enable else '⏸ Paused'} schedule #{schedule_id} — "
         f"{describe(schedule.when)}."
     )
+
+
+def _mode_text(mode: str) -> str:
+    if mode == schedules.MODE_HEADLESS:
+        return "headless: no topic, and only failures and alerts are reported"
+    return "in a new topic each time"
 
 
 async def _schedule_retime(

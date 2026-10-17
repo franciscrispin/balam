@@ -388,9 +388,9 @@ def test_mark_schedule_run_stamps_the_row() -> None:
     assert store.get_schedule(schedule_id).last_run_at == 1_700_000_123_000  # type: ignore[union-attr]
 
 
-def test_fresh_db_lands_on_schema_version_3() -> None:
+def test_fresh_db_lands_on_schema_version_4() -> None:
     store = fresh_store()
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_migrates_v2_database_to_schedules(tmp_path) -> None:
@@ -412,8 +412,58 @@ def test_migrates_v2_database_to_schedules(tmp_path) -> None:
     db.close()
 
     store = SessionStore(path)
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4
     assert store.list_topics(100) == [(5, "Old", "balam")]
     assert store.all_schedules() == []
     schedule_id = _add(store)
     assert store.get_schedule(schedule_id) is not None
+
+
+def test_migrates_v3_schedules_to_modes(tmp_path) -> None:
+    # The live DB: a v3 schedules table holding the briefing, and no mode column.
+    # The row survives and keeps opening topics, so an upgrade changes nothing.
+    path = str(tmp_path / "v3.db")
+    db = sqlite3.connect(path)
+    db.execute(
+        """
+        CREATE TABLE schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            context TEXT NOT NULL, prompt TEXT NOT NULL, kind TEXT NOT NULL,
+            hour INTEGER NOT NULL, minute INTEGER NOT NULL, days TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+            last_run_at INTEGER
+        )
+        """
+    )
+    db.execute(
+        "INSERT INTO schedules (chat_id, context, prompt, kind, hour, minute, created_at)"
+        " VALUES (100, 'jambo', 'brief', 'daily', 8, 0, 1)"
+    )
+    db.execute("PRAGMA user_version = 3")
+    db.commit()
+    db.close()
+
+    store = SessionStore(path)
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4
+    row = store.get_schedule(1)
+    assert row is not None
+    assert (row.prompt, row.mode) == ("brief", "topic")
+    assert store.set_schedule_mode(1, "headless")
+    assert store.get_schedule(1).mode == "headless"  # type: ignore[union-attr]
+
+
+def test_add_schedule_stores_its_mode() -> None:
+    store = SessionStore(":memory:")
+    schedule_id = store.add_schedule(
+        chat_id=100,
+        context="jambo",
+        prompt="sync",
+        kind="daily",
+        hour=7,
+        minute=30,
+        days=None,
+        created_at=0,
+        mode="headless",
+    )
+    assert store.get_schedule(schedule_id).mode == "headless"  # type: ignore[union-attr]
+    assert store.set_schedule_mode(999, "headless") is False

@@ -275,6 +275,38 @@ class Router:
             mcp=dict(ctx.mcp),
         )
 
+    async def resolve_headless(self, chat_id: int, name: str, title: str) -> ResolvedSession:
+        """A fresh session in context ``name`` that belongs to no topic, for a
+        headless scheduled run (ADR-0016 amendment).
+
+        Nothing is written to the store: the session is used once and forgotten.
+        Balam's ``send_file`` server is deliberately left out, since there is no
+        topic to send into. Model/effort overrides still come from the chat, as
+        for any topic in it. The caller validates that ``name`` exists.
+        """
+        ctx = self._contexts.contexts[name]
+        session_id: str | None = None
+        if self._eager:
+            assert self._opencode is not None
+            session_id = await self._opencode.create_session(
+                title, directory=ctx.directory, permission=build_ruleset(ctx), mcp=ctx.mcp
+            )
+        provider, model = ctx.provider_model
+        override_provider, override_model, override_effort = self._store.get_overrides(
+            chat_id, _GLOBAL_THREAD
+        )
+        return ResolvedSession(
+            session_id=session_id,
+            context_name=name,
+            directory=ctx.directory,
+            provider=override_provider or provider,
+            model=override_model or model,
+            effort=override_effort or ctx.effort,
+            additional_directories=list(ctx.additional_directories),
+            allowed_tools=list(ctx.allowed_tools),
+            mcp=dict(ctx.mcp),
+        )
+
     async def _resolve_opencode(
         self, ref: TopicRef, ctx: Any, context_name: str, existing: str | None
     ) -> str:
