@@ -887,6 +887,38 @@ not when its turn ends, so a crash mid-turn cannot re-fire the whole thing.
   became `PendingPicks`, a paged multi-select over `(id, label)` pairs, rather
   than growing a second picker idiom.
 
+### Amendment (2026-10-09): headless schedules run with no topic
+
+Some scheduled jobs report somewhere else. Jambo's daily profile sync writes the
+trip sheets and one log line, and the 08:00 briefing reports that line, so a
+topic of its own every morning is noise. `/schedule daily 07:30 headless
+<context> <prompt>` (or `/schedule headless <id>`, back with `/schedule topic
+<id>`) sets `schedules.mode` (schema v4) to `headless`.
+
+A headless run resolves a session that belongs to no topic
+(`Router.resolve_headless`: nothing stored, no `send_file`) and drives the same
+`AgentBackend` a topic turn does, but `balam.headless` consumes the event stream
+instead of the streamer. The permission policy is the unattended one,
+unchanged: the context's `allowed_tools` pre-approve, an in-workspace read is
+allowed, everything else is refused, and questions are rejected. A run is `ok`
+only if it finished with no error and **no refusal**, because a refused run did
+not do its whole job. Runs are capped at an hour and aborted past it.
+
+**Quiet must not mean silent.** A failed headless run posts one message to
+General: the error, what was refused, and the tail of the answer. A successful
+one posts nothing, except from `/schedule run <id>`, which reports either way in
+the topic it was sent from, since someone is waiting on the test. A run whose
+answer starts with `ALERT:` is reported in General too (as an alert, not a
+failure), so a health check can finish cleanly and still raise what it found.
+
+**Rejected alternatives.** Writing the crontab (`python-crontab`) or systemd
+timers from Balam would let jobs run while Balam is down, but at the cost of a
+second copy of every schedule outside SQLite that can drift from it, no catch-up
+under cron, and per-job wrapper scripts to get failures back to Telegram. Catch-up
+already covers most downtime. A quiet topic deleted after a clean run was also
+tried, and dropped: it still flashed a topic each morning and needed turn-level
+plumbing that headless runs do not.
+
 ---
 
 ## ADR-0017: A held turn stays answerable, and holds are bounded by count
