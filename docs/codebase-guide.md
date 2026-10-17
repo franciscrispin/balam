@@ -138,6 +138,16 @@ alphabetically — the groups are the shape of the system.
   Two limits are the platform's, not ours: the Bot API refuses `getFile` above
   **20 MB** (carried as `PromptFile.error`, not raised, so the caption survives),
   and an album arrives as one message per item, i.e. one turn each.
+- **`voice.py`** — transcribes a voice note or video note to text with
+  faster-whisper (CPU, int8) *before* the turn starts, so everything downstream
+  sees an ordinary typed message — the approach OpenShrimp uses. The transcript
+  is echoed back as a reply (so a mis-hearing is visible) and becomes
+  `[Transcribed from voice note] …` in the prompt; the recording is dropped. If
+  transcription fails, the note falls back to being a plain audio attachment.
+  The model loads lazily on the first note and stays resident; transcriptions
+  run one at a time. `VOICE_TRANSCRIPTION_MODEL` (`small`; `off` disables) and
+  `VOICE_TRANSCRIPTION_LANGUAGE` configure it. Plain `audio` files are not
+  transcribed — they are material to work on, not speech to the bot.
 
 ### The agent seam (ADR-0014)
 

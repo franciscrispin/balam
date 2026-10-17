@@ -48,6 +48,23 @@ def test_tool_stream_rejects_unknown_value() -> None:
         Config(**_BASE, tool_stream="verbose")  # type: ignore[arg-type]
 
 
+# --- Voice notes ----------------------------------------------------------------
+
+
+def test_voice_transcription_defaults_to_small_with_detected_language() -> None:
+    cfg = Config(**_BASE)  # type: ignore[arg-type]
+    assert cfg.voice_transcription_model == "small"
+    assert cfg.voice_transcription_enabled is True
+    assert cfg.voice_transcription_language is None
+
+
+def test_voice_transcription_blank_means_default_and_off_disables() -> None:
+    blank = Config(**_BASE, voice_transcription_model=" ", voice_transcription_language="")  # type: ignore[arg-type]
+    assert blank.voice_transcription_model == "small"
+    assert blank.voice_transcription_language is None
+    assert Config(**_BASE, voice_transcription_model="OFF").voice_transcription_enabled is False  # type: ignore[arg-type]
+
+
 # --- BALAM_TIMEZONE: what a /schedule time means (ADR-0016) -------------------
 
 

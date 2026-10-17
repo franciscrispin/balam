@@ -4,7 +4,8 @@ Two things live here, and only these two:
 
   1. **The plain-message path.** A message that is not one of Balam's own
      commands maps to its topic's session (ADR-0009), picks up any image or
-     document attachments, and becomes a turn. This is the round-trip the whole
+     document attachments (a voice note is transcribed to text), and becomes a
+     turn. This is the round-trip the whole
      system exists for, so it stays in the entry point rather than hiding in a
      command module. An album is several messages that have to become *one*
      turn, so it is buffered first (:mod:`balam.media_groups`).
@@ -102,6 +103,7 @@ from balam.topics import (
     is_forum_general_message,
 )
 from balam.turns import TurnRegistry, notify_error, submit_turn
+from balam.voice import Transcriber, transcribe_voice_note
 
 logger = logging.getLogger(__name__)
 
@@ -196,15 +198,29 @@ async def _dispatch_messages(messages: list[Message], context: ContextTypes.DEFA
         text = strip_bot_mention(text, bot_username)
 
     # Download any image/document attachments as native file parts (tier-1 plan §4);
-    # the text is the message text or an attachment's caption.
+    # the text is the message text or an attachment's caption. A voice note is
+    # transcribed instead and its words join the text, so the agent hears it like
+    # a typed message (balam.voice); its recording is kept only if that fails.
+    transcriber: Transcriber | None = context.application.bot_data.get("transcriber")
     try:
         files: list[PromptFile] = []
+        transcripts: list[str] = []
         for item in messages:
-            files.extend(await collect_attachments(item, context.bot))
+            collected = await collect_attachments(item, context.bot)
+            transcript = await transcribe_voice_note(
+                item, collected, transcriber, context.bot, thread_id
+            )
+            if transcript is None:
+                files.extend(collected)
+            elif transcript:
+                transcripts.append(transcript)
     except Exception as exc:
         logger.exception("failed to download attachment")
         await notify_error(context.bot, chat_id, thread_id, exc)
         return
+    if transcripts:
+        voiced = [f"[Transcribed from voice note] {t}" for t in transcripts]
+        text = "\n\n".join([text, *voiced] if text else voiced)
     if not text and not files:
         if mention_only:
             # A bare "@balambot" got the bot's attention and nothing else; say so
@@ -342,6 +358,12 @@ def build_application(
     app.bot_data["background_tasks"] = set()
     # Photos of an album, held until the group is complete enough to run as one turn.
     app.bot_data["media_groups"] = MediaGroupBuffer()
+    # Speech-to-text for voice notes; the model loads on the first one (balam.voice).
+    app.bot_data["transcriber"] = (
+        Transcriber(config.voice_transcription_model, language=config.voice_transcription_language)
+        if config.voice_transcription_enabled
+        else None
+    )
 
     # Trust boundary (ADR-0008): filters.User gates by sender id, so only an
     # allowed user's messages reach the handlers; everyone else is dropped
@@ -369,7 +391,8 @@ def build_application(
     app.add_handler(CommandHandler("schedule", handle_schedule, filters=allowed))
     # ``ATTACHMENT`` is every kind Telegram models as an attachment, not just the
     # photo/document pair Balam used to accept — voice notes, video, audio, video
-    # notes, animations and stickers reach the agent through the same path now.
+    # notes, animations and stickers reach the agent through the same path now
+    # (voice and video notes as a transcript, when transcription is on).
     # It also admits the non-file attachments (polls, contacts, locations, dice);
     # those download to nothing and fall out at the empty-message check below.
     app.add_handler(

@@ -128,6 +128,16 @@ class Config(BaseSettings):
     # the legacy one-line-per-call stream. Mirrors TOOL_STREAM in .env.example.
     tool_stream: Literal["collapsed", "full"] = "collapsed"
 
+    # --- Voice notes ---
+    # The faster-whisper model voice notes are transcribed with, locally on the
+    # CPU ("tiny", "base", "small", "medium", "large-v3-turbo", …). "off" turns
+    # transcription off, and voice notes then reach the agent as audio files.
+    # Weights download from Hugging Face on the first voice note.
+    voice_transcription_model: str = "small"
+    # Spoken language as an ISO code ("en", "id", …). Unset → Whisper detects it
+    # per note, which is less reliable on very short notes.
+    voice_transcription_language: str | None = None
+
     # --- noVNC live browser view (ADR-0006) ---
     # The x11vnc server exposing the agent's headed Chrome (started on demand by
     # the browser-use skill, .claude/skills/browser-use/headed-browser/). The
@@ -145,6 +155,7 @@ class Config(BaseSettings):
         "allowed_telegram_chat_id",
         "balam_public_url",
         "balam_miniapp_shortname",
+        "voice_transcription_language",
         mode="before",
     )
     @classmethod
@@ -161,6 +172,14 @@ class Config(BaseSettings):
         # generic blank→None validator above would fail its Literal check.
         if isinstance(value, str) and value.strip() == "":
             return "collapsed"
+        return value
+
+    @field_validator("voice_transcription_model", mode="before")
+    @classmethod
+    def _blank_voice_model_to_default(cls, value: object) -> object:
+        # Blank means "unset", not "off" — turning it off is an explicit "off".
+        if isinstance(value, str) and value.strip() == "":
+            return "small"
         return value
 
     @field_validator("balam_timezone", mode="before")
@@ -237,6 +256,11 @@ class Config(BaseSettings):
     def db_path(self) -> str:
         """SQLite file backing the topic→session map (ADR-0009)."""
         return self.balam_db_path or "balam.sqlite"
+
+    @property
+    def voice_transcription_enabled(self) -> bool:
+        """Whether voice notes are transcribed (any model other than "off")."""
+        return self.voice_transcription_model.strip().lower() != "off"
 
     @property
     def timezone(self) -> ZoneInfo:
