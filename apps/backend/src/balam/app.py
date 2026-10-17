@@ -53,6 +53,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
+    # httpx logs every request URL at INFO, and Telegram's URLs carry the bot
+    # token, so INFO would write the token into the journal on every poll.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     try:
         config = load_config()
