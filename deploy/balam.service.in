@@ -29,6 +29,17 @@ Environment=HOME=@HOME@
 # order in this file, so a CLAUDE_CONFIG_DIR line in the repo .env would win over
 # this. The install scripts refuse that line for exactly that reason.
 @PRIMARY_CLAUDE_ENV@
+# Which GitHub account the agent's `gh` runs as — and, because the git
+# credential helper is `gh auth git-credential`, which account its `git push`
+# authenticates as too. gh keeps ONE active account per config directory, in
+# $GH_CONFIG_DIR/hosts.yml; the default is ~/.config/gh, which every instance on
+# this OS user shares, so `gh auth switch` in any of them silently repoints all
+# the others. CLAUDE_CONFIG_DIR does not scope this — gh knows nothing about it.
+# Empty by default. Set BALAM_PRIMARY_GH_CONFIG_DIR in deploy/deploy.env to give
+# this bot its own; extra instances always get one (balam@.service). Same
+# EnvironmentFile CAUTION as above — the install script refuses a GH_CONFIG_DIR
+# line in the repo .env.
+@PRIMARY_GH_ENV@
 # Rendered by deploy/lib.sh from the toolchains actually present in @HOME@
 # (bun, nvm's node, cargo, go), so it does not drift from the machine. In
 # claude_sdk mode (AGENT_BACKEND=claude_sdk) the agent subprocess
