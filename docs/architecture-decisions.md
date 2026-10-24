@@ -1038,6 +1038,84 @@ turn ending for another reason.
 
 ---
 
+## ADR-0018: Integrations are config-driven buttons relayed by Balam
+
+Status: Accepted Date: 2026-10-24
+
+### Context
+
+A service on the same VM (the first is a payments checker) needs to ask the team
+something in Telegram with buttons, say "Approve this payment?", and act when
+one of them taps. It cannot listen for the tap itself: Telegram gives each bot's
+updates to exactly one consumer, by long polling or one webhook, and for this
+bot that is Balam. A second bot would split the workspace into two identities
+and two allowlists.
+
+Routing the tap through the agent was the other obvious path, and the wrong one.
+An Approve that records a payment must run once and exactly as offered. Putting
+an LLM turn between the tap and the action adds latency, cost and a way to do
+something other than what the button said.
+
+### Decision
+
+**Balam relays, configured in `config.yaml`, with no plugin code.** A block
+under `integrations:` names the service: a loopback `url` for taps, a `secret`
+that must be a `${VAR}` from `.env`, optional `tappers` (a subset of the
+allowlist, checked at boot) and an optional default `topic`. Balam stays the
+single consumer of updates and other installs get the same feature by adding a
+block.
+
+- **Post.** The service calls `POST /integrations/<name>/messages` on Balam's
+  existing loopback server with the secret as a bearer token: text, an optional
+  image (sent just above it), buttons as `[{label, action, data}]`, an optional
+  topic (made the first time, remembered in SQLite, made again if someone
+  deletes it, and never auto-renamed by a first message typed in it). Balam stores `{message_id, integration, text}` and each button,
+  and puts only `int:<token>` in the callback data, so `data` is never limited
+  by Telegram's 64 bytes. The same call with a `message_id` edits a message
+  that integration posted; its old buttons die first. The route is out of the
+  OpenAPI schema like `/mcp`, and answers 404 to anything that did not come from
+  this machine, including requests through the ADR-0013 tunnel.
+- **Tap.** The `int:` handler runs the same check as every callback (allowlist
+  and chat, ADR-0008), then `tappers`. It then deletes every button row of the
+  message in one synchronous SQLite step with no `await` inside, which is what
+  makes a second tap impossible however fast it arrives, and edits the message
+  to "Working..." with no keyboard. Only then is the tap POSTed to `url` as
+  `{action, data, user: {id, name}, message_id}`, with an HMAC-SHA256 of the
+  body in `X-Balam-Signature`. The service answers `{text, buttons?, toast?}`
+  and Balam puts it on the message. The toast only shows for an answer within
+  10 seconds; after that Balam answers the tap blank so Telegram's spinner
+  stops, and the edited message alone carries the outcome.
+- **Failure restores nothing.** If the service errors, times out (30 seconds)
+  or answers something unreadable, the message says so and gets no buttons:
+  the service may already have acted, and offering the button again is how a
+  payment is recorded twice. The service can put buttons back itself with an
+  edit once it knows the state.
+- **Delivery runs off the update loop.** PTB handles updates one at a time, so
+  the POST runs as a task once "Working..." is showing; a slow service never
+  stalls messages to the agent. When Balam stops, it waits up to 10 seconds
+  for taps still in flight before the bot goes.
+
+### Consequences
+
+- **A second way into Telegram that is not the agent.** It is local only: the
+  `url` must be loopback (checked at load), the post route refuses other peers,
+  and the delivery client ignores proxy settings from the environment. Anyone
+  who can run code on the VM could already drive the bot token, so this widens
+  nothing; the secret keeps one local service from posting as another.
+- **Taps never reach the agent, and the agent never sees integration messages
+  as turns.** Text typed into an integration's topic is still an ordinary
+  message, so it reaches the agent like any other topic (bound to
+  `default_context`), and starts a session there; only the topic's name is
+  kept.
+- **The service owns its state.** Balam keeps only what it needs to edit the
+  message and spend its buttons; what a button means lives in the service.
+- **Later, not now:** remote integration URLs over HTTPS with signed,
+  timestamped deliveries and replay protection; free-text replies routed to an
+  integration; per-integration rate limits. Each would extend this block rather
+  than replace it.
+
+---
+
 ## Summary
 
 | ADR  | Decision                                                                    | Core reason                                                     |
@@ -1058,3 +1136,4 @@ turn ending for another reason.
 | 0015 | Hold an SDK turn open while its background work runs (amends 0014)          | Closing stdin kills background tasks; holding also delivers their report |
 | 0016 | Scheduled prompts are stored in SQLite (`/schedule`), not `config.yaml`     | Schedules are user data; unattended turns deny, missed runs catch up |
 | 0017 | A held turn stays answerable; holds bounded by count, not time (amends 0015) | Messages must not stall behind background work; memory is the real bound |
+| 0018 | Integrations: config-driven buttons, posted and tapped through Balam | Balam is the bot's one update consumer; a tap must run once, not via the agent |

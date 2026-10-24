@@ -87,6 +87,7 @@ from balam.commands.session import (
 from balam.commands.tasks import handle_tasks
 from balam.commands.views import handle_artifacts, handle_browser, handle_diff
 from balam.config import Config
+from balam.integrations import handle_integration_callback
 from balam.media_groups import DEBOUNCE_SECONDS, MediaGroupBuffer
 from balam.message_text import (
     addresses_bot,
@@ -320,6 +321,7 @@ def build_application(
     *,
     store: SessionStore | None = None,
     post_init: Any = None,
+    post_stop: Any = None,
     post_shutdown: Any = None,
 ) -> Application:
     # Live-edit streaming, the todo checklist, and command handlers all share
@@ -333,6 +335,8 @@ def build_application(
     )
     if post_init is not None:
         builder = builder.post_init(post_init)
+    if post_stop is not None:
+        builder = builder.post_stop(post_stop)
     if post_shutdown is not None:
         builder = builder.post_shutdown(post_shutdown)
     app = builder.build()
@@ -426,5 +430,8 @@ def build_application(
     app.add_handler(CallbackQueryHandler(handle_schedule_dismiss_callback, pattern=r"^schx:"))
     app.add_handler(CallbackQueryHandler(handle_schedule_page_callback, pattern=r"^schp:"))
     app.add_handler(CallbackQueryHandler(handle_schedule_toggle_callback, pattern=r"^sch:"))
+    # Taps on a configured integration's buttons (ADR-0018); the handler checks
+    # the trust boundary plus the integration's own ``tappers``.
+    app.add_handler(CallbackQueryHandler(handle_integration_callback, pattern=r"^int:"))
 
     return app

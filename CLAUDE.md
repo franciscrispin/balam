@@ -112,7 +112,8 @@ full map; the load-bearing ones:
   `schedule.py`, `tasks.py`), `callbacks.py` (approval/question taps), `pickers.py` (the
   paged multi-select shared by `/delete` and `/schedule cancel`), `topics.py`
   (naming/opening/linking topics), `message_text.py` (forward/reply/quote
-  gestures → agent-visible text), `voice.py` (voice/video notes → text with
+  gestures → agent-visible text), `integrations.py` (config-driven buttons for
+  local services, relayed by `int:` taps; ADR-0018), `voice.py` (voice/video notes → text with
   faster-whisper, before the turn starts). **Nothing imports `bot.py`** — keep it that way.
 - **Running a turn:** `router.py` (topic→context→session, lazy create),
   `store.py` (sqlite3 map + `schedules` table), `turns.py` (turn data *and*
