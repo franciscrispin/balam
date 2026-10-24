@@ -76,6 +76,12 @@ alphabetically — the groups are the shape of the system.
   `/browser` `/artifacts`), `delete.py`, `schedule.py`, `tasks.py` (`/tasks`).
 - **`callbacks.py`** — the other end of the agent's questions: approval and
   question keyboard taps, resolving the future the turn is parked on.
+- **`integrations.py`** (ADR-0018): local services named under `integrations:`
+  in `config.yaml` post messages with buttons through Balam's loopback
+  `POST /integrations/<name>/messages` (in `server.py`), and `int:<token>` taps
+  are relayed back to them, signed, after the ADR-0008 check plus the
+  integration's `tappers`. Buttons are spent in SQLite on the first tap, so a
+  second one is impossible. A tap never reaches the agent.
 - **`pickers.py`** — the paged multi-select shared by `/delete` and
   `/schedule cancel`.
 - **`topics.py`** — naming, opening and linking forum topics. Takes no
@@ -93,7 +99,8 @@ alphabetically — the groups are the shape of the system.
 - **`router.py`** — `TopicRef` → `ResolvedSession`. Maps a topic to its session
   within its bound context, lazily creating one and recreating one that vanished.
 - **`store.py`** — the persistence behind the router: dependency-free `sqlite3`
-  holding the topic→session map and the `schedules` table.
+  holding the topic→session map, the `schedules` table, and the integrations'
+  topics, messages and live buttons (ADR-0018).
 - **`turns.py`** — both the data (`TurnJob`, `TurnRegistry`: one in-flight turn
   per topic) and the act of running one — resolving the session, starting the
   background task, handing the slot to the next queued message, aborting on

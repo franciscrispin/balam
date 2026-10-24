@@ -39,6 +39,7 @@ from balam.bot import build_application, register_commands
 from balam.config import ConfigError, load_config
 from balam.content_store import ContentStore
 from balam.contexts import ContextsConfigError, load_contexts
+from balam.integrations import DRAIN_ON_STOP_S, Integrations, tapper_problems
 from balam.opencode import OpenCode
 from balam.router import Router
 from balam.server import create_app
@@ -68,6 +69,13 @@ def main() -> None:
     except ContextsConfigError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
+    # Integrations (ADR-0018) need both files: a tapper must be on the allowlist.
+    if problems := tapper_problems(contexts.integrations, config.allowed_user_ids):
+        print(
+            "Invalid integrations config:\n" + "\n".join(f"  - {p}" for p in problems),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     store = SessionStore(config.db_path)
     # The viewer snapshots + per-topic tool scopes feed both the bot (buttons,
@@ -150,6 +158,19 @@ def main() -> None:
         # for t.me Mini App links; bot_data carries the store to the streamer's
         # plan-view button.
         application.bot_data["content_store"] = content_store
+        # Local services posting buttons through Balam (ADR-0018). Their messages
+        # go to the workspace supergroup, or the owner's DM when there is none.
+        integrations = None
+        if contexts.integrations:
+            integrations = Integrations(
+                contexts.integrations,
+                store,
+                application.bot,
+                config.allowed_telegram_chat_id or config.allowed_telegram_user_id,
+                forum=config.allowed_telegram_chat_id is not None,
+            )
+            application.bot_data["integrations"] = integrations
+            logger.info("integrations: %s", ", ".join(sorted(contexts.integrations)))
         api = create_app(
             config,
             router,
@@ -157,6 +178,7 @@ def main() -> None:
             tool_scopes=tool_scopes,
             bot=application.bot,
             bot_username=application.bot.username,
+            integrations=integrations,
         )
         server = uvicorn.Server(
             uvicorn.Config(api, host="127.0.0.1", port=config.balam_port, log_level="info")
@@ -194,6 +216,14 @@ def main() -> None:
         if caught_up:
             logger.info("caught up %s missed schedule(s)", caught_up)
 
+    async def _post_stop(application: Application) -> None:
+        # Updates have stopped but the bot can still talk to Telegram: let taps
+        # already with their service finish, so their messages get an outcome
+        # rather than staying on "Working..." (ADR-0018).
+        integrations = application.bot_data.get("integrations")
+        if integrations is not None:
+            await integrations.drain(timeout_s=DRAIN_ON_STOP_S)
+
     async def _post_shutdown(application: Application) -> None:
         try:
             if server is not None:
@@ -214,6 +244,7 @@ def main() -> None:
         router,
         store=store,
         post_init=_post_init,
+        post_stop=_post_stop,
         post_shutdown=_post_shutdown,
     )
 

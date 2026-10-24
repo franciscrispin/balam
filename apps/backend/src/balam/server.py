@@ -25,13 +25,14 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from balam.agent_tools import ToolScopes, create_send_file_tool, handle_rpc
 from balam.config import Config
 from balam.content_store import ContentStore
 from balam.contexts import ContextConfig, ContextsConfig
 from balam.git_diff import DiffHunk, NotAGitRepo, get_hunks
+from balam.integrations import IntegrationError, IntegrationPost, Integrations
 from balam.router import Router
 from balam.store import SessionStore
 from balam.vnc import probe_vnc, vnc_websocket
@@ -43,6 +44,9 @@ logger = logging.getLogger(__name__)
 # matching balam.config (the built Mini App lives at apps/frontend/dist).
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _DIST_DIR = _REPO_ROOT / "apps" / "frontend" / "dist"
+
+#: Peers allowed to reach the integrations endpoint (ADR-0018).
+_LOOPBACK_PEERS = {"127.0.0.1", "::1"}
 
 
 def _app_version() -> str:
@@ -87,6 +91,7 @@ def create_app(
     tool_scopes: ToolScopes | None = None,
     bot: Any | None = None,
     bot_username: str | None = None,
+    integrations: Integrations | None = None,
 ) -> FastAPI:
     """Build the FastAPI app: auth-gated API routes plus the static Mini App."""
     # The app is reachable over the internet (ADR-0013), so don't serve the
@@ -195,6 +200,33 @@ def create_app(
             if reply is None:
                 return Response(status_code=202)
             return JSONResponse(reply)
+
+    if integrations is not None:
+        # Local services post buttons through Balam (ADR-0018). Server-to-server,
+        # so out of the schema like /mcp. The tunnel (ADR-0013) reaches this same
+        # port, so a request that crossed it, or came from anywhere but this
+        # machine, is told the route does not exist.
+        @app.post("/integrations/{name}/messages", include_in_schema=False)
+        async def integration_message(name: str, request: Request) -> JSONResponse:
+            peer = request.client.host if request.client else None
+            if "cf-connecting-ip" in request.headers or peer not in _LOOPBACK_PEERS:
+                raise HTTPException(status_code=404, detail="not found")
+            if integrations.get(name) is None:
+                raise HTTPException(status_code=404, detail=f"unknown integration {name!r}")
+            scheme, _, token = request.headers.get("authorization", "").partition(" ")
+            if scheme.lower() != "bearer" or not integrations.secret_matches(name, token):
+                raise HTTPException(status_code=401, detail="bad or missing bearer secret")
+            try:
+                msg = IntegrationPost.model_validate(await request.json())
+            except ValidationError as exc:
+                detail = [{"loc": e["loc"], "msg": e["msg"]} for e in exc.errors()]
+                return JSONResponse({"detail": detail}, status_code=422)
+            except ValueError:
+                return JSONResponse({"detail": "body must be JSON"}, status_code=422)
+            try:
+                return JSONResponse(await integrations.post(name, msg))
+            except IntegrationError as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
 
     # Serve the built SPA last so the API routes above win. html=True serves
     # index.html for "/" and 404s unknown asset paths.

@@ -26,9 +26,18 @@ import re
 import string
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from balam.mcp_config import parse_mcp_config
 
@@ -195,6 +204,82 @@ class ContextConfig(BaseModel):
         return split_provider_model(self.model)
 
 
+#: Integration names appear in a URL path (``/integrations/<name>/messages``) and
+#: in log lines, so they keep to a plain charset.
+_INTEGRATION_NAME = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+#: Integrations are local services only for now (ADR-0018): a tap is delivered
+#: over plain HTTP, which is only acceptable on the loopback interface.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+#: A shared secret short enough to guess defeats the point of having one.
+_INTEGRATION_SECRET_MIN = 16
+
+#: Telegram caps a forum topic name at 128 characters.
+_TOPIC_NAME_MAX = 128
+
+
+class IntegrationConfig(BaseModel):
+    """A local service that posts messages with buttons through Balam and is told
+    when an allowed person taps one (ADR-0018). Nothing about the service is
+    loaded into Balam; this block is all Balam knows of it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Where taps are delivered, e.g. ``http://127.0.0.1:8770/balam``. Loopback only.
+    url: str
+    #: Shared with the service: it presents this as a bearer token when posting,
+    #: and Balam signs every tap delivery with it. Must be a ``${VAR}`` from .env.
+    secret: SecretStr
+    #: Optional: the Telegram user ids who may tap this integration's buttons. A
+    #: subset of the allowlist (checked at boot); empty means everyone on it.
+    tappers: list[int] = Field(default_factory=list)
+    #: Optional: the forum topic messages go to when a post names none. Balam
+    #: makes it the first time it is needed. Unset means General.
+    topic: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _url_is_local(cls, value: str) -> str:
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or parts.hostname not in _LOOPBACK_HOSTS:
+            raise ValueError(
+                f"url {value!r} must be an http(s) address on this machine "
+                "(127.0.0.1, localhost or ::1); remote integrations are not supported yet"
+            )
+        return value
+
+    @field_validator("secret", mode="before")
+    @classmethod
+    def _secret_from_env(cls, value: object) -> object:
+        # The secret is the whole trust between Balam and the service, so it
+        # lives in .env like every other secret, never in this file.
+        if not isinstance(value, str) or not _ENV_REF.fullmatch(value.strip()):
+            raise ValueError("secret must come from .env as a single ${VAR} reference")
+        expanded = _expand_env(value.strip(), where="secret")
+        if len(expanded) < _INTEGRATION_SECRET_MIN:
+            raise ValueError(
+                f"secret must be at least {_INTEGRATION_SECRET_MIN} characters "
+                "(e.g. `openssl rand -hex 32`)"
+            )
+        return expanded
+
+    @field_validator("tappers")
+    @classmethod
+    def _tappers_are_user_ids(cls, value: list[int]) -> list[int]:
+        for uid in value:
+            if uid <= 0:
+                raise ValueError(f"tapper {uid} must be a positive Telegram user id")
+        return value
+
+    @field_validator("topic")
+    @classmethod
+    def _topic_is_a_name(cls, value: str | None) -> str | None:
+        if value is not None and not (0 < len(value.strip()) <= _TOPIC_NAME_MAX):
+            raise ValueError(f"topic must be 1 to {_TOPIC_NAME_MAX} characters")
+        return value
+
+
 class ContextsConfig(BaseModel):
     """The whole ``config.yaml``: a set of contexts plus the default."""
 
@@ -204,6 +289,21 @@ class ContextsConfig(BaseModel):
     contexts: dict[str, ContextConfig]
     #: Default topic-name template for every context that doesn't set its own.
     topic_title: str = DEFAULT_TOPIC_TITLE
+    #: Local services that post buttons through Balam (ADR-0018), keyed by name.
+    integrations: dict[str, IntegrationConfig] = Field(default_factory=dict)
+
+    @field_validator("integrations")
+    @classmethod
+    def _integration_names(
+        cls, value: dict[str, IntegrationConfig]
+    ) -> dict[str, IntegrationConfig]:
+        for name in value:
+            if not _INTEGRATION_NAME.fullmatch(name):
+                raise ValueError(
+                    f"integration name {name!r} must be 1 to 32 letters, digits, '-' or '_' "
+                    "(it is part of the URL the service posts to)"
+                )
+        return value
 
     @field_validator("topic_title")
     @classmethod

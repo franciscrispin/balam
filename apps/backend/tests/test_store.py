@@ -388,9 +388,9 @@ def test_mark_schedule_run_stamps_the_row() -> None:
     assert store.get_schedule(schedule_id).last_run_at == 1_700_000_123_000  # type: ignore[union-attr]
 
 
-def test_fresh_db_lands_on_schema_version_4() -> None:
+def test_fresh_db_lands_on_schema_version_5() -> None:
     store = fresh_store()
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_migrates_v2_database_to_schedules(tmp_path) -> None:
@@ -412,7 +412,7 @@ def test_migrates_v2_database_to_schedules(tmp_path) -> None:
     db.close()
 
     store = SessionStore(path)
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
     assert store.list_topics(100) == [(5, "Old", "balam")]
     assert store.all_schedules() == []
     schedule_id = _add(store)
@@ -444,7 +444,7 @@ def test_migrates_v3_schedules_to_modes(tmp_path) -> None:
     db.close()
 
     store = SessionStore(path)
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
     row = store.get_schedule(1)
     assert row is not None
     assert (row.prompt, row.mode) == ("brief", "topic")
@@ -467,3 +467,22 @@ def test_add_schedule_stores_its_mode() -> None:
     )
     assert store.get_schedule(schedule_id).mode == "headless"  # type: ignore[union-attr]
     assert store.set_schedule_mode(999, "headless") is False
+
+
+def test_migrates_v4_database_to_integrations(tmp_path) -> None:
+    # The live DB before integrations (ADR-0018): it gains the three tables and
+    # keeps its schedules.
+    path = str(tmp_path / "v4.db")
+    SessionStore(path).close()
+    db = sqlite3.connect(path)
+    for table in ("integration_topics", "integration_messages", "integration_buttons"):
+        db.execute(f"DROP TABLE {table}")
+    db.execute("PRAGMA user_version = 4")
+    db.commit()
+    db.close()
+
+    store = SessionStore(path)
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    store.set_integration_topic(100, "Payments", 7)
+    assert store.integration_topic(100, "Payments") == 7
+    assert store.claim_integration_button("missing") is None
