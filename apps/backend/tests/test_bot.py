@@ -2563,6 +2563,23 @@ async def test_schedule_create_stores_weekdays_in_python_numbering() -> None:
     assert store.list_schedules(SUPERGROUP)[0].days == "0,1,2,3,4"
 
 
+async def test_schedule_create_monthly_reads_the_context_after_the_day() -> None:
+    message = _FakeMessage(
+        SUPERGROUP, 5, text="/schedule monthly last 18:00 chaska close the books"
+    )
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["monthly", "last", "18:00", "chaska", "close", "the", "books"]
+    )
+
+    await handle_schedule(update, context)
+
+    (row,) = store.list_schedules(SUPERGROUP)
+    assert (row.context, row.prompt, row.kind) == ("chaska", "close the books", "monthly")
+    assert (row.hour, row.minute, row.days) == (18, 0, "-1")
+    assert len(context.application.job_queue.get_jobs_by_name(f"schedule:{row.id}")) == 1
+    assert "monthly on the last day at 18:00" in message.replies[-1]
+
+
 async def test_schedule_create_rejects_an_unknown_context_without_saving() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 nope do a thing")
     update, context, store, _bot, _turns = _schedule_env(
@@ -2629,6 +2646,24 @@ async def test_schedule_create_headless_keyword_sets_the_mode() -> None:
     # The keyword is consumed: it is neither the context nor part of the prompt.
     assert (row.context, row.prompt, row.mode) == ("chaska", "sync it", "headless")
     assert "Headless" in message.replies[-1]
+
+
+async def test_schedule_create_headless_keyword_follows_a_monthly_day() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule monthly 1 09:00 headless chaska sync it")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["monthly", "1", "09:00", "headless", "chaska", "sync", "it"]
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.list_schedules(SUPERGROUP)[0]
+    # The monthly form takes three tokens, so the keyword sits one further along.
+    assert (row.context, row.prompt, row.kind, row.mode) == (
+        "chaska",
+        "sync it",
+        "monthly",
+        "headless",
+    )
 
 
 async def test_schedule_create_opens_topics_by_default() -> None:
