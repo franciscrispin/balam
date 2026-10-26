@@ -2648,6 +2648,24 @@ async def test_schedule_create_headless_keyword_sets_the_mode() -> None:
     assert "Headless" in message.replies[-1]
 
 
+async def test_schedule_create_headless_keyword_follows_a_monthly_day() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule monthly 1 09:00 headless chaska sync it")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["monthly", "1", "09:00", "headless", "chaska", "sync", "it"]
+    )
+
+    await handle_schedule(update, context)
+
+    row = store.list_schedules(SUPERGROUP)[0]
+    # The monthly form takes three tokens, so the keyword sits one further along.
+    assert (row.context, row.prompt, row.kind, row.mode) == (
+        "chaska",
+        "sync it",
+        "monthly",
+        "headless",
+    )
+
+
 async def test_schedule_create_opens_topics_by_default() -> None:
     message = _FakeMessage(SUPERGROUP, 5, text="/schedule daily 07:30 chaska headless please")
     update, context, store, _bot, _turns = _schedule_env(
