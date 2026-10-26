@@ -65,3 +65,26 @@ contexts:
   #   directory: /home/ubuntu/projects/zog
   #   description: "AI assistant"
   #   allowed_tools: []
+
+# Integrations (optional, ADR-0018): local services that post Telegram messages
+# with buttons through Balam and are told when an allowed person taps one. No
+# plugin code is loaded; this block is all Balam knows of a service.
+#
+# The service posts to Balam's loopback server (BALAM_PORT):
+#   POST http://127.0.0.1:<BALAM_PORT>/integrations/<name>/messages
+#   Authorization: Bearer <secret>
+#   {"text": "...", "image": "<base64, optional>", "topic": "<optional>",
+#    "buttons": [{"label": "Approve", "action": "approve", "data": {...}}],
+#    "message_id": <optional: edit a message this integration posted>}
+# A tap is POSTed to `url` as {"action", "data", "user": {"id", "name"},
+# "message_id"}, signed in the X-Balam-Signature header (sha256=<HMAC of the
+# body with the secret>). The service answers {"text", "buttons"?, "toast"?}.
+# README.md has the details.
+#
+# integrations:
+#   payments:
+#     url: http://127.0.0.1:8770/balam        # where taps are delivered (this machine only)
+#     secret: ${PAYMENTS_INTEGRATION_SECRET}  # from .env, shared with the service (16+ chars)
+#     tappers: [123456789, 987654321]         # optional: who may tap (a subset of the
+#     #                                       # allowlist); unset means everyone on it
+#     topic: "Payments"                       # optional: default topic, made if missing

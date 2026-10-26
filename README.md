@@ -27,6 +27,11 @@ The design and the reasons behind it live in
   read inside its workspace, and runs missed while Balam was down are caught up
   within six hours of when they were due.
 
+- **Integrations** (optional): a local service, such as a payments checker,
+  can post a Telegram message with buttons through Balam and be told when an
+  allowed person taps one, by adding a block to `config.yaml`. No plugin code is
+  loaded and a tap never goes through the agent. See [Integrations](#integrations).
+
 ## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) — the Python backend's runtime and package
@@ -69,6 +74,83 @@ Workspace contexts (per-directory agent workspaces) live in `config.yaml` — co
 | `bun run build` | Build the Mini App. |
 | `bun run typecheck` | Type-check `packages/*` + the frontend. |
 | `bun run lint` | Lint and check formatting with Biome. |
+
+## Integrations
+
+An integration is a service on the same machine that wants to ask the team
+something with buttons and hear back when someone taps. Telegram gives a bot's
+updates to one consumer, which is Balam, so Balam relays. The design and its
+limits are in ADR-0018.
+
+**Set it up** with a block in `config.yaml` (see `config.example.yaml`) and the
+secret in `.env`:
+
+```yaml
+integrations:
+  payments:
+    url: http://127.0.0.1:8770/balam        # where taps are delivered (loopback only)
+    secret: ${PAYMENTS_INTEGRATION_SECRET}  # from .env, 16+ characters
+    tappers: [123456789]                    # optional: who may tap; default everyone allowed
+    topic: "Payments"                       # optional: default topic, made if missing
+```
+
+Every `tappers` id must also be on the allowlist; Balam refuses to boot
+otherwise. Messages go to `ALLOWED_TELEGRAM_CHAT_ID`, or the owner's private
+chat (no topics) when it is unset.
+
+**Post a message** to Balam's loopback server, with the secret as a bearer token:
+
+```http
+POST http://127.0.0.1:<BALAM_PORT>/integrations/payments/messages
+Authorization: Bearer <secret>
+Content-Type: application/json
+
+{
+  "text": "Record S$1,500 deposit on INV900?",
+  "image": "<optional base64 photo, sent just above the text>",
+  "buttons": [
+    {"label": "Approve", "action": "approve", "data": {"match": 7}},
+    {"label": "Not this one", "action": "reject", "data": {"match": 7}}
+  ],
+  "topic": "Payments",
+  "parse_mode": "HTML"
+}
+```
+
+Only `text` is required (up to 3,800 characters; `parse_mode` is `HTML`,
+`MarkdownV2` or absent for plain text). Up to 8 buttons, one per row; `data` is
+any JSON up to 2 KB and stays in Balam's SQLite, so the callback data on the
+button is only `int:<token>`. The answer is
+`{"message_id", "chat_id", "thread_id", "image_message_id"}`. To **edit** a
+message the integration posted, send the same call with its `message_id` (no
+`image`): the text and buttons are replaced and the old buttons stop working.
+
+Errors: `401` bad secret, `404` unknown integration or message (and any request
+that did not come from this machine, including through the tunnel), `422` bad
+body, `502` Telegram refused it.
+
+**A tap.** When an allowed person taps, Balam removes every button on the
+message and shows "Working..." at once, so a second tap is impossible. It then
+POSTs to the integration's `url`:
+
+```json
+{"action": "approve", "data": {"match": 7}, "user": {"id": 123456789, "name": "Ana"}, "message_id": 101}
+```
+
+with `X-Balam-Signature: sha256=<hex HMAC-SHA256 of the raw body, keyed by the
+secret>`. Check it with a constant-time compare before acting. Answer within
+30 seconds with:
+
+```json
+{"text": "Recorded.", "buttons": [], "toast": "Done", "parse_mode": null}
+```
+
+Balam puts `text` and `buttons` on the message and shows `toast` to whoever
+tapped, if the answer came within 10 seconds (Telegram stops taking toasts
+soon after a tap). Work that takes longer should answer at once ("Recording...") and edit
+the message later through the post call. If the service fails, times out or
+answers something unreadable, the message says so and gets **no** buttons back,
+since the service may already have acted.
 
 ## Repository structure
 

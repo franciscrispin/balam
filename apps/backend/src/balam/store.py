@@ -49,6 +49,42 @@ class ScheduleRow(NamedTuple):
 _SCHEDULE_COLUMNS = ", ".join(ScheduleRow._fields)
 
 
+class IntegrationMessageRow(NamedTuple):
+    """A message an integration posted through Balam (ADR-0018), kept so it can
+    be edited later and so a tap knows which integration to tell."""
+
+    chat_id: int
+    message_id: int
+    integration: str
+    thread_id: int | None
+    #: The text as last sent, so a tap can show "Working..." under it without
+    #: reading the message back from Telegram.
+    text: str
+    parse_mode: str | None
+    #: The photo sent just before the text, when the post carried an image.
+    image_message_id: int | None
+    created_at: int
+
+
+class IntegrationButtonRow(NamedTuple):
+    """One live button on an integration's message. ``token`` is what travels in
+    the callback data (``int:<token>``); everything else stays here, so the
+    payload is never limited by Telegram's 64 bytes."""
+
+    token: str
+    chat_id: int
+    message_id: int
+    position: int
+    label: str
+    action: str
+    #: The button's ``data``, as JSON text.
+    data: str
+
+
+_INTEGRATION_MESSAGE_COLUMNS = ", ".join(IntegrationMessageRow._fields)
+_INTEGRATION_BUTTON_COLUMNS = ", ".join(IntegrationButtonRow._fields)
+
+
 def _schedule_row(row: tuple) -> ScheduleRow:
     return ScheduleRow(*row)
 
@@ -122,10 +158,59 @@ class SessionStore:
             );
             """
         )
+        # Integrations (ADR-0018): the topics they post into, the messages they
+        # posted, and each message's live buttons. A button row is deleted the
+        # moment it is tapped, along with its siblings, which is what makes a
+        # second tap impossible.
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS integration_topics (
+                chat_id   INTEGER NOT NULL,
+                name      TEXT    NOT NULL,
+                thread_id INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, name)
+            );
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS integration_messages (
+                chat_id          INTEGER NOT NULL,
+                message_id       INTEGER NOT NULL,
+                integration      TEXT    NOT NULL,
+                thread_id        INTEGER,
+                text             TEXT    NOT NULL,
+                parse_mode       TEXT,
+                image_message_id INTEGER,
+                created_at       INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            );
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS integration_buttons (
+                token      TEXT    PRIMARY KEY,
+                chat_id    INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                position   INTEGER NOT NULL,
+                label      TEXT    NOT NULL,
+                action     TEXT    NOT NULL,
+                data       TEXT    NOT NULL
+            );
+            """
+        )
+        self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS integration_buttons_by_message
+                ON integration_buttons (chat_id, message_id);
+            """
+        )
         self._migrate_auto_named()
         self._migrate_title()
         self._migrate_schedules()
         self._migrate_schedule_mode()
+        self._migrate_integrations()
         self._db.commit()
 
     def _migrate_auto_named(self) -> None:
@@ -187,6 +272,14 @@ class SessionStore:
         if "mode" not in columns:
             self._db.execute("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT 'topic'")
         self._db.execute("PRAGMA user_version = 4")
+
+    def _migrate_integrations(self) -> None:
+        """Record that the schema has reached the integrations level (v5). The
+        three tables are new and created idempotently above, so, as with v3,
+        there is nothing to backfill."""
+        if self._db.execute("PRAGMA user_version").fetchone()[0] >= 5:
+            return
+        self._db.execute("PRAGMA user_version = 5")
 
     @staticmethod
     def thread_key(thread_id: int | None) -> int:
@@ -489,6 +582,105 @@ class SessionStore:
             "UPDATE schedules SET last_run_at = ? WHERE id = ?", (when_ms, schedule_id)
         )
         self._db.commit()
+
+    # --- integrations (ADR-0018) ---------------------------------------------
+
+    def integration_topic(self, chat_id: int, name: str) -> int | None:
+        """The thread id of the integration topic called ``name``, if Balam made one."""
+        row = self._db.execute(
+            "SELECT thread_id FROM integration_topics WHERE chat_id = ? AND name = ?",
+            (chat_id, name),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def set_integration_topic(self, chat_id: int, name: str, thread_id: int) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO integration_topics (chat_id, name, thread_id) VALUES (?, ?, ?)",
+            (chat_id, name, thread_id),
+        )
+        self._db.commit()
+
+    def forget_integration_topic(self, chat_id: int, name: str) -> None:
+        """Drop a topic someone deleted, so the next post makes a fresh one."""
+        self._db.execute(
+            "DELETE FROM integration_topics WHERE chat_id = ? AND name = ?", (chat_id, name)
+        )
+        self._db.commit()
+
+    def add_integration_message(self, row: IntegrationMessageRow) -> None:
+        self._db.execute(
+            f"INSERT OR REPLACE INTO integration_messages ({_INTEGRATION_MESSAGE_COLUMNS}) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(row),
+        )
+        self._db.commit()
+
+    def get_integration_message(
+        self, chat_id: int, message_id: int
+    ) -> IntegrationMessageRow | None:
+        row = self._db.execute(
+            f"SELECT {_INTEGRATION_MESSAGE_COLUMNS} FROM integration_messages "
+            "WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        ).fetchone()
+        return IntegrationMessageRow(*row) if row else None
+
+    def set_integration_message_text(
+        self, chat_id: int, message_id: int, text: str, parse_mode: str | None
+    ) -> None:
+        self._db.execute(
+            "UPDATE integration_messages SET text = ?, parse_mode = ? "
+            "WHERE chat_id = ? AND message_id = ?",
+            (text, parse_mode, chat_id, message_id),
+        )
+        self._db.commit()
+
+    def replace_integration_buttons(
+        self, chat_id: int, message_id: int, buttons: list[IntegrationButtonRow]
+    ) -> None:
+        """Make ``buttons`` the message's only live buttons. Old tokens die here,
+        so a stale keyboard still on screen can no longer be tapped."""
+        self._db.execute(
+            "DELETE FROM integration_buttons WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        )
+        self._db.executemany(
+            f"INSERT INTO integration_buttons ({_INTEGRATION_BUTTON_COLUMNS}) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [tuple(button) for button in buttons],
+        )
+        self._db.commit()
+
+    def integration_buttons(self, chat_id: int, message_id: int) -> list[IntegrationButtonRow]:
+        return [
+            IntegrationButtonRow(*row)
+            for row in self._db.execute(
+                f"SELECT {_INTEGRATION_BUTTON_COLUMNS} FROM integration_buttons "
+                "WHERE chat_id = ? AND message_id = ? ORDER BY position",
+                (chat_id, message_id),
+            ).fetchall()
+        ]
+
+    def get_integration_button(self, token: str) -> IntegrationButtonRow | None:
+        row = self._db.execute(
+            f"SELECT {_INTEGRATION_BUTTON_COLUMNS} FROM integration_buttons WHERE token = ?",
+            (token,),
+        ).fetchone()
+        return IntegrationButtonRow(*row) if row else None
+
+    def claim_integration_button(self, token: str) -> IntegrationButtonRow | None:
+        """Spend a tapped button: return it and delete every button on its
+        message, or ``None`` if it was already spent. One synchronous transaction
+        with no ``await`` inside, so of two taps only one can ever win."""
+        button = self.get_integration_button(token)
+        if button is None:
+            return None
+        self._db.execute(
+            "DELETE FROM integration_buttons WHERE chat_id = ? AND message_id = ?",
+            (button.chat_id, button.message_id),
+        )
+        self._db.commit()
+        return button
 
     def close(self) -> None:
         self._db.close()

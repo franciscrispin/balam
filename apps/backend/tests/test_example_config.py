@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 from balam.config import Config
-from balam.contexts import ContextConfig, ContextsConfig
+from balam.contexts import ContextConfig, ContextsConfig, IntegrationConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
@@ -66,3 +66,9 @@ def test_the_shipped_example_actually_loads() -> None:
     raw = yaml.safe_load(CONFIG_EXAMPLE.read_text())
     parsed = ContextsConfig.model_validate(raw)
     assert parsed.default_context in parsed.contexts
+
+
+def test_config_example_documents_every_integration_field() -> None:
+    documented = _documented_yaml_keys(CONFIG_EXAMPLE.read_text())
+    missing = sorted(f for f in IntegrationConfig.model_fields if f not in documented)
+    assert not missing, f"add these to config.example.yaml: {missing}"
