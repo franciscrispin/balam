@@ -946,6 +946,31 @@ silently not run five months a year — `last` is the honest spelling of "end of
 the month". The day of the month is stored in the existing `schedules.days`
 column (`-1` for last), which that kind otherwise leaves empty, so no migration.
 
+### Amendment (2026-11-09): a schedule can name its topics
+
+A scheduled topic was named the way a General message names one, through the
+context's `topic_title` template, so its "summary" was the whole prompt. A daily
+food-log check opened a topic called `charlie: Food log. Read yesterday's log
+(SGT), then reply in two lines…` every morning, and seven of those can't be told
+apart in the topic list. `/schedule title <id> <title>` stores a template in
+`schedules.title` (schema v6), and each run names its topic from that instead.
+`/schedule title <id> clear` goes back to the prompt-based name.
+
+The template has two placeholders: `{context}`, and `{date}`, which is the
+occurrence's due time in `BALAM_TIMEZONE`. A bare `{date}` reads `Mon, 9 Nov`,
+and `{date:<strftime>}` takes any strftime codes. A late run uses the date it
+was **due**, not when it caught up, so a run caught up after midnight isn't
+labelled with the next day. The template is checked when it is saved (only bare
+known fields, no `{date.year}`-style reaching into the object, and it must not
+render blank), so a typo comes back as a reply and never as a failed run at 7am.
+The rendered name is cut to Telegram's 128-character limit, and the topic is
+marked auto-named so the first turn doesn't rename it.
+
+**Rejected alternative.** A `{date}` placeholder in the context's `topic_title`
+would be smaller, but it applies to every topic in that context. A topic opened
+by a message in General shouldn't carry a date because a schedule in the same
+context wanted one.
+
 ---
 
 ## ADR-0017: A held turn stays answerable, and holds are bounded by count

@@ -388,9 +388,9 @@ def test_mark_schedule_run_stamps_the_row() -> None:
     assert store.get_schedule(schedule_id).last_run_at == 1_700_000_123_000  # type: ignore[union-attr]
 
 
-def test_fresh_db_lands_on_schema_version_5() -> None:
+def test_fresh_db_lands_on_schema_version_6() -> None:
     store = fresh_store()
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_migrates_v2_database_to_schedules(tmp_path) -> None:
@@ -412,7 +412,7 @@ def test_migrates_v2_database_to_schedules(tmp_path) -> None:
     db.close()
 
     store = SessionStore(path)
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 6
     assert store.list_topics(100) == [(5, "Old", "balam")]
     assert store.all_schedules() == []
     schedule_id = _add(store)
@@ -444,7 +444,7 @@ def test_migrates_v3_schedules_to_modes(tmp_path) -> None:
     db.close()
 
     store = SessionStore(path)
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 6
     row = store.get_schedule(1)
     assert row is not None
     assert (row.prompt, row.mode) == ("brief", "topic")
@@ -482,7 +482,48 @@ def test_migrates_v4_database_to_integrations(tmp_path) -> None:
     db.close()
 
     store = SessionStore(path)
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 6
     store.set_integration_topic(100, "Payments", 7)
     assert store.integration_topic(100, "Payments") == 7
     assert store.claim_integration_button("missing") is None
+
+
+def test_migrates_v5_schedules_to_titles(tmp_path) -> None:
+    # The live DB before schedule titles: a schedules table with no title column.
+    # Its rows survive untitled, so their topics keep the prompt-based name.
+    path = str(tmp_path / "v5.db")
+    db = sqlite3.connect(path)
+    db.execute(
+        """
+        CREATE TABLE schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            context TEXT NOT NULL, prompt TEXT NOT NULL, kind TEXT NOT NULL,
+            hour INTEGER NOT NULL, minute INTEGER NOT NULL, days TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+            last_run_at INTEGER, mode TEXT NOT NULL DEFAULT 'topic'
+        )
+        """
+    )
+    db.execute(
+        "INSERT INTO schedules (chat_id, context, prompt, kind, hour, minute, created_at)"
+        " VALUES (100, 'charlie', 'Food log.', 'daily', 7, 0, 1)"
+    )
+    db.execute("PRAGMA user_version = 5")
+    db.commit()
+    db.close()
+
+    store = SessionStore(path)
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 6
+    row = store.get_schedule(1)
+    assert row is not None
+    assert (row.prompt, row.mode, row.title) == ("Food log.", "topic", None)
+
+
+def test_set_schedule_title_sets_and_clears() -> None:
+    store = fresh_store()
+    schedule_id = _add(store)
+    assert store.set_schedule_title(schedule_id, "Food log, {date}")
+    assert store.get_schedule(schedule_id).title == "Food log, {date}"  # type: ignore[union-attr]
+    assert store.set_schedule_title(schedule_id, None)
+    assert store.get_schedule(schedule_id).title is None  # type: ignore[union-attr]
+    assert store.set_schedule_title(999, "x") is False

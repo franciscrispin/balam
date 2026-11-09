@@ -204,7 +204,13 @@ class TopicOpenError(Exception):
 
 
 async def open_topic_in_context(
-    bot: Any, router: Router, chat_id: int, name: str, *, prompt: str = ""
+    bot: Any,
+    router: Router,
+    chat_id: int,
+    name: str,
+    *,
+    prompt: str = "",
+    title: str | None = None,
 ) -> tuple[int, str]:
     """Create a fresh forum topic bound to context ``name``, start its session,
     and greet inside it. Returns ``(thread_id, topic_name)``; raises
@@ -229,14 +235,20 @@ async def open_topic_in_context(
     A ``respond_to: mentions`` topic is marked auto-named too:
     it is a place people talk, so it keeps the name it was given — the first
     message that happens to tag the bot is not its subject.
+
+    An explicit ``title`` wins over both: a schedule with its own title template
+    (ADR-0016 amendment) passes the rendered name, and the topic is marked
+    auto-named so the first turn keeps it.
     """
     ctx = router.contexts.contexts[name]
     mention_only = ctx.respond_to == "mentions"
-    title = (
-        topic_name(name, prompt, template=router.contexts.topic_title_template(name))
-        if prompt
-        else name
-    )
+    explicit_title = title is not None
+    if title is None:
+        title = (
+            topic_name(name, prompt, template=router.contexts.topic_title_template(name))
+            if prompt
+            else name
+        )
     try:
         topic = await bot.create_forum_topic(chat_id=chat_id, name=title)
     except Exception as exc:
@@ -250,7 +262,11 @@ async def open_topic_in_context(
     new_thread_id = topic.message_thread_id
     try:
         await router.create_topic_session(
-            chat_id, new_thread_id, title, name, auto_named=bool(prompt) or mention_only
+            chat_id,
+            new_thread_id,
+            title,
+            name,
+            auto_named=bool(prompt) or explicit_title or mention_only,
         )
     except Exception as exc:
         logger.exception("failed to start session for new topic")

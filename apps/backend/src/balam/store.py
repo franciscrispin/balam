@@ -44,6 +44,9 @@ class ScheduleRow(NamedTuple):
     #: ``"topic"`` (a fresh forum topic per run) or ``"headless"`` (no topic; the
     #: chat hears about a run only on a failure or an alert). ADR-0016 amendment.
     mode: str = "topic"
+    #: Template for the topic each run opens (``{date}`` / ``{context}``), or
+    #: ``None`` to name it after the prompt like any other topic. ADR-0016 amendment.
+    title: str | None = None
 
 
 _SCHEDULE_COLUMNS = ", ".join(ScheduleRow._fields)
@@ -154,7 +157,8 @@ class SessionStore:
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 created_at  INTEGER NOT NULL,
                 last_run_at INTEGER,
-                mode        TEXT    NOT NULL DEFAULT 'topic'
+                mode        TEXT    NOT NULL DEFAULT 'topic',
+                title       TEXT
             );
             """
         )
@@ -211,6 +215,7 @@ class SessionStore:
         self._migrate_schedules()
         self._migrate_schedule_mode()
         self._migrate_integrations()
+        self._migrate_schedule_title()
         self._db.commit()
 
     def _migrate_auto_named(self) -> None:
@@ -280,6 +285,16 @@ class SessionStore:
         if self._db.execute("PRAGMA user_version").fetchone()[0] >= 5:
             return
         self._db.execute("PRAGMA user_version = 5")
+
+    def _migrate_schedule_title(self) -> None:
+        """Add ``schedules.title`` (v6) to a table that predates titled runs.
+        Existing schedules keep naming their topic after the prompt (``NULL``)."""
+        if self._db.execute("PRAGMA user_version").fetchone()[0] >= 6:
+            return
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(schedules)").fetchall()}
+        if "title" not in columns:
+            self._db.execute("ALTER TABLE schedules ADD COLUMN title TEXT")
+        self._db.execute("PRAGMA user_version = 6")
 
     @staticmethod
     def thread_key(thread_id: int | None) -> int:
@@ -570,6 +585,15 @@ class SessionStore:
         cursor = self._db.execute(
             "UPDATE schedules SET hour = ?, minute = ? WHERE id = ?",
             (hour, minute, schedule_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def set_schedule_title(self, schedule_id: int, title: str | None) -> bool:
+        """Set (or, with ``None``, clear) the topic-name template a schedule's
+        runs use; ``False`` if unknown."""
+        cursor = self._db.execute(
+            "UPDATE schedules SET title = ? WHERE id = ?", (title, schedule_id)
         )
         self._db.commit()
         return cursor.rowcount > 0

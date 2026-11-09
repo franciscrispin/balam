@@ -45,7 +45,10 @@ logger = logging.getLogger(__name__)
 #: Words that lead a ``/schedule`` sub-command rather than a recurrence. A create
 #: always starts with a when-token (``daily`` / ``weekdays`` / a weekday /
 #: ``monthly``), so the two can never be confused.
-_SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off", "headless", "topic", "retime")
+_SCHEDULE_SUBCOMMANDS = ("cancel", "run", "on", "off", "headless", "topic", "retime", "title")
+
+#: The argument to ``/schedule title <id>`` that drops a schedule's title.
+_CLEAR_TITLE = "clear"
 
 #: Optional token between the time and the context that makes a schedule run
 #: with no topic: ``/schedule daily 07:30 headless <context> <prompt>``.
@@ -61,6 +64,8 @@ _SCHEDULE_USAGE = (
     "/schedule cancel — pick schedules to remove\n"
     "/schedule run <id> — fire one now\n"
     "/schedule retime <id> <HH:MM> — change the time\n"
+    "/schedule title <id> <title> — name its topics, e.g. Food log, {date} "
+    "(clear to undo)\n"
     "/schedule off <id> · /schedule on <id> — pause / resume\n"
     "/schedule headless <id> · /schedule topic <id> — run without / with a topic"
 )
@@ -81,6 +86,8 @@ def _format_schedule(schedule: schedules.Schedule, tz: ZoneInfo) -> str:
         f"#{schedule.id} · {describe(schedule.when)} · {schedule.context}{state}",
         f"   {schedules.summarize(schedule.prompt, 120)}",
     ]
+    if schedule.title:
+        lines.append(f"   topic title: {schedule.title}")
     if schedule.last_run_at is not None:
         last = datetime.fromtimestamp(schedule.last_run_at / 1000, tz)
         lines.append(f"   last run {last:%Y-%m-%d %H:%M}")
@@ -119,6 +126,9 @@ async def handle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if head == "retime":
         await _schedule_retime(message, context, args[1:])
+        return
+    if head == "title":
+        await _schedule_title(message, context, args[1:])
         return
     await _schedule_create(message, context, args)
 
@@ -322,6 +332,65 @@ async def _schedule_retime(
     paused = "" if schedule.enabled else " (still ⏸ paused)"
     await message.reply_text(
         f"🗓 Schedule #{schedule_id} retimed — {describe(schedule.when)} ({tz.key}){paused}."
+    )
+
+
+async def _schedule_title(
+    message: Any, context: ContextTypes.DEFAULT_TYPE, rest: list[str]
+) -> None:
+    """``/schedule title <id> <title>`` — name the topic each run opens.
+
+    ``{date}`` is the run's due date (``Mon, 9 Nov``, or strftime codes like
+    ``{date:%d/%m}``) and ``{context}`` the context's name. ``clear`` goes back to
+    naming the topic after the prompt. No timer to touch: the title is read from
+    the row each time the schedule fires.
+    """
+    store: SessionStore = context.application.bot_data["store"]
+    usage = (
+        "Usage: /schedule title <id> <title>, e.g. /schedule title 2 Food log, {date}\n"
+        "{date} is the run's date (Mon, 9 Nov, or strftime codes like {date:%d/%m}); "
+        f"{{context}} is the context. /schedule title <id> {_CLEAR_TITLE} removes it."
+    )
+    if len(rest) < 2:
+        await message.reply_text(usage)
+        return
+    try:
+        schedule_id = int(rest[0].lstrip("#"))
+    except ValueError:
+        await message.reply_text(f"{rest[0]!r} isn't a schedule id.\n\n{usage}")
+        return
+    row = store.get_schedule(schedule_id)
+    if row is None or row.chat_id != message.chat_id:
+        await message.reply_text(f"No schedule #{schedule_id} here.")
+        return
+
+    # From the raw text, not context.args, so the title's own spacing survives.
+    raw = command_remainder(message.text or "", args_consumed=2)
+    if raw.lower() == _CLEAR_TITLE:
+        store.set_schedule_title(schedule_id, None)
+        await message.reply_text(
+            f"Schedule #{schedule_id} will name its topics after the prompt again."
+        )
+        return
+    try:
+        template = schedules.validate_title(raw)
+    except schedules.ScheduleError as exc:
+        await message.reply_text(str(exc))
+        return
+
+    store.set_schedule_title(schedule_id, template)
+    schedule = schedules.Schedule.from_row(row)
+    preview = schedules.render_title(
+        template, schedule.context, datetime.now(_schedule_timezone(context))
+    )
+    note = (
+        "\nIt's headless, so it opens no topic — the title applies if you switch it "
+        f"back with /schedule topic {schedule_id}."
+        if schedule.headless
+        else ""
+    )
+    await message.reply_text(
+        f"🏷 Schedule #{schedule_id} will name its topics like: {preview}{note}"
     )
 
 
