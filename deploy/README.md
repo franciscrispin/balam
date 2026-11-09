@@ -20,6 +20,11 @@ each section says which check exists.
 The frontend is **not** a runtime service: `bun run build` produces `apps/frontend/dist`,
 which FastAPI serves. OpenCode (`:4096`) and any VNC ports are **never** tunneled.
 
+`balam.service` (and each `balam@.service`) is capped at `MemoryMax=75%` of host RAM
+with `OOMPolicy=continue`. In `claude_sdk` mode each running turn is a `claude` child
+of the unit, so when the cap is hit the kernel kills the largest one — one turn is
+lost, the bot keeps running. `journalctl -u balam | grep -i oom` shows when it fired.
+
 This is one bot on one Claude account. To run a second bot on a **second Claude
 account** on the same VM, see [A second instance, on a second Claude
 account](#a-second-instance-on-a-second-claude-account) below.
