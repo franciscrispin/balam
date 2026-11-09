@@ -3701,3 +3701,79 @@ async def test_status_reports_the_reply_policy() -> None:
     await router.create_topic_session(SUPERGROUP, 5, "team", "team")
     await handle_status(update, context)
     assert "Replies to: mentions" in message.replies[-1]
+
+
+def _add_food_log(store, **overrides) -> None:
+    base = dict(
+        chat_id=SUPERGROUP,
+        context="chaska",
+        prompt="Food log.",
+        kind="daily",
+        hour=7,
+        minute=0,
+        days=None,
+        created_at=1,
+    )
+    base.update(overrides)
+    store.add_schedule(**base)
+
+
+async def test_schedule_title_saves_the_template_and_previews_it() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule title 1 Food log,  {date}")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["title", "1", "Food", "log,", "{date}"]
+    )
+    _add_food_log(store)
+
+    await handle_schedule(update, context)
+
+    # Taken from the raw text, so the owner's spacing survives.
+    assert store.get_schedule(1).title == "Food log,  {date}"
+    assert "will name its topics like: Food log,  " in message.replies[-1]
+
+
+async def test_schedule_title_rejects_an_unknown_placeholder_without_saving() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule title 1 Food log, {day}")
+    update, context, store, _bot, _turns = _schedule_env(
+        message, ["title", "1", "Food", "log,", "{day}"]
+    )
+    _add_food_log(store)
+
+    await handle_schedule(update, context)
+
+    assert store.get_schedule(1).title is None
+    assert "Unknown placeholder {day}" in message.replies[-1]
+
+
+async def test_schedule_title_clear_goes_back_to_the_prompt() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule title 1 clear")
+    update, context, store, _bot, _turns = _schedule_env(message, ["title", "1", "clear"])
+    _add_food_log(store)
+    store.set_schedule_title(1, "Food log, {date}")
+
+    await handle_schedule(update, context)
+
+    assert store.get_schedule(1).title is None
+    assert "after the prompt again" in message.replies[-1]
+
+
+async def test_schedule_title_without_a_title_shows_usage() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule title 1")
+    update, context, store, _bot, _turns = _schedule_env(message, ["title", "1"])
+    _add_food_log(store)
+
+    await handle_schedule(update, context)
+
+    assert store.get_schedule(1).title is None
+    assert message.replies[-1].startswith("Usage: /schedule title")
+
+
+async def test_schedule_list_shows_a_title() -> None:
+    message = _FakeMessage(SUPERGROUP, 5, text="/schedule")
+    update, context, store, _bot, _turns = _schedule_env(message, [])
+    _add_food_log(store)
+    store.set_schedule_title(1, "Food log, {date}")
+
+    await handle_schedule(update, context)
+
+    assert "topic title: Food log, {date}" in message.replies[-1]

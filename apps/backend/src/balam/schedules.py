@@ -38,6 +38,7 @@ import asyncio
 import calendar
 import datetime as dt
 import logging
+import string
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ from zoneinfo import ZoneInfo
 
 from balam.headless import HeadlessResult, run_headless
 from balam.store import ScheduleRow, SessionStore
-from balam.topics import TopicOpenError, open_topic_in_context
+from balam.topics import TOPIC_NAME_MAX, TopicOpenError, open_topic_in_context
 from balam.turns import start_prompt
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,14 @@ WHEN_EXAMPLES = (
 )
 
 
+#: The placeholders a schedule ``title`` may use (ADR-0016 amendment).
+TITLE_FIELDS = ("date", "context")
+
+#: What a bare ``{date}`` renders as: ``Mon, 9 Nov``. Built by hand rather than
+#: with ``%-d``, which is a glibc extension and not portable strftime.
+DEFAULT_TITLE_DATE = "%a, {day} %b"
+
+
 class ScheduleError(ValueError):
     """A ``/schedule`` argument the owner has to fix. The message is owner-facing."""
 
@@ -168,6 +177,7 @@ class Schedule:
     last_run_at: int | None
     mode: str = MODE_TOPIC
     month_day: int | None = None
+    title: str | None = None
 
     @property
     def headless(self) -> bool:
@@ -194,6 +204,7 @@ class Schedule:
             last_run_at=row.last_run_at,
             mode=row.mode,
             month_day=month_day,
+            title=row.title,
         )
 
     @property
@@ -307,6 +318,64 @@ def describe(when: When) -> str:
         return f"monthly on the {day} at {when.at}"
     names = ", ".join(_WEEKDAY_NAMES[d] for d in when.days)
     return f"every {names} at {when.at}"
+
+
+# --- Topic titles --------------------------------------------------------------
+
+
+class _TitleDate:
+    """The ``{date}`` a title template sees: a run's due time that formats with
+    strftime codes (``{date:%d/%m}``), or as :data:`DEFAULT_TITLE_DATE` when it
+    is given none. ``%-d``-style codes work too, on the Linux host Balam runs on."""
+
+    def __init__(self, moment: dt.datetime) -> None:
+        self._moment = moment
+
+    def __format__(self, spec: str) -> str:
+        if not spec:
+            spec = DEFAULT_TITLE_DATE.replace("{day}", str(self._moment.day))
+        return self._moment.strftime(spec)
+
+
+def validate_title(template: str) -> str:
+    """Check a schedule title template when it is saved, so a typo is a reply to
+    the owner and never a failed run at 7am. Returns it stripped.
+
+    Only bare ``{date}`` / ``{context}`` fields are allowed — no ``{date.year}``
+    or ``{date[0]}`` reaching into the object behind the placeholder.
+    """
+    template = template.strip()
+    if not template:
+        raise ScheduleError("A title can't be blank — Telegram rejects an empty topic name.")
+    try:
+        fields = [
+            field for _, field, _, _ in string.Formatter().parse(template) if field is not None
+        ]
+    except ValueError as exc:
+        raise ScheduleError(
+            f"{template!r} isn't a valid title ({exc}). Write a literal brace as {{{{ or }}}}."
+        ) from None
+    allowed = ", ".join("{" + name + "}" for name in TITLE_FIELDS)
+    for field in fields:
+        if field not in TITLE_FIELDS:
+            shown = "{" + field + "}" if field else "{}"
+            raise ScheduleError(f"Unknown placeholder {shown} in the title. Use {allowed}.")
+    try:
+        sample = render_title(template, "context", dt.datetime(2026, 1, 1, 7, 0))
+    except (ValueError, TypeError) as exc:
+        raise ScheduleError(f"{template!r} doesn't render as a title ({exc}).") from None
+    if not sample.strip():
+        raise ScheduleError("That title renders blank — Telegram rejects an empty topic name.")
+    return template
+
+
+def render_title(template: str, context_name: str, moment: dt.datetime) -> str:
+    """Fill a validated title template for a run due at ``moment`` (in the
+    schedule's timezone), cut to Telegram's topic-name limit."""
+    name = template.format(date=_TitleDate(moment), context=context_name).strip()
+    if len(name) > TOPIC_NAME_MAX:
+        name = name[: TOPIC_NAME_MAX - 3] + "..."
+    return name
 
 
 # --- JobQueue registration -----------------------------------------------------
@@ -510,9 +579,23 @@ async def run_schedule(
             context, schedule, late_for=late_for, report_thread=report_thread, announce=announce
         )
 
+    # A late run is still the run that was due, so its title carries that date —
+    # a catch-up just after midnight must not be named for the day after.
+    topic_title = (
+        render_title(
+            schedule.title, schedule.context, late_for or dt.datetime.now(_timezone(context))
+        )
+        if schedule.title
+        else None
+    )
     try:
         thread_id, title = await open_topic_in_context(
-            context.bot, router, schedule.chat_id, schedule.context, prompt=schedule.prompt
+            context.bot,
+            router,
+            schedule.chat_id,
+            schedule.context,
+            prompt=schedule.prompt,
+            title=topic_title,
         )
     except TopicOpenError as exc:
         logger.exception("schedule %s could not open its topic", schedule.id)

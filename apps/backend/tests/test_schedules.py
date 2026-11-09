@@ -7,6 +7,7 @@ the missed-run catch-up window.
 
 import asyncio
 import datetime as dt
+import re
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -686,3 +687,80 @@ def test_headless_report_marks_a_late_run_and_trims_a_long_answer() -> None:
     )
     assert "late run, due 07:30" in text
     assert len(text) < 1200
+
+
+# --- topic titles (ADR-0016 amendment) -----------------------------------------
+
+
+def test_bare_date_renders_as_weekday_day_month() -> None:
+    moment = _at(2026, 11, 9, 7, 0)
+    assert S.render_title("Food log, {date}", "charlie", moment) == "Food log, Mon, 9 Nov"
+
+
+def test_date_takes_strftime_codes_and_context_fills_in() -> None:
+    moment = _at(2026, 11, 9, 7, 0)
+    assert S.render_title("{context} {date:%d/%m}", "charlie", moment) == "charlie 09/11"
+
+
+def test_rendered_title_fits_telegrams_limit() -> None:
+    name = S.render_title("x" * 200, "charlie", _at(2026, 11, 9, 7, 0))
+    assert len(name) == 128
+    assert name.endswith("...")
+
+
+@pytest.mark.parametrize(
+    ("template", "problem"),
+    [
+        ("", "blank"),
+        ("   ", "blank"),
+        ("Food log, {day}", "Unknown placeholder {day}"),
+        ("Food log, {}", "Unknown placeholder {}"),
+        ("Food log, {date.year}", "Unknown placeholder {date.year}"),
+        ("Food log, {date", "isn't a valid title"),
+        ("{date:}", None),
+    ],
+)
+def test_validate_title(template: str, problem: str | None) -> None:
+    if problem is None:
+        assert S.validate_title(template) == template
+        return
+    with pytest.raises(S.ScheduleError, match=re.escape(problem)):
+        S.validate_title(template)
+
+
+def test_validate_title_strips_and_keeps_literal_braces() -> None:
+    assert S.validate_title("  {{log}} {date}  ") == "{{log}} {date}"
+    assert S.render_title("{{log}} {date}", "c", _at(2026, 11, 9, 7, 0)) == "{log} Mon, 9 Nov"
+
+
+async def test_a_titled_schedule_names_its_topic_from_the_template(monkeypatch) -> None:
+    async def fake_stream_reply(**_: object) -> None:
+        return None
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+    monkeypatch.setattr(S, "_timezone", lambda _context: SGT)
+    context, store, bot, turns = _fire_env()
+    store.set_schedule_title(1, "Plan, {date:%Y}")
+    await S.run_schedule(context, S.Schedule.from_row(store.get_schedule(1)))
+    await turns.get(SUPERGROUP, 555).task  # type: ignore[union-attr]
+
+    year = dt.datetime.now(SGT).year
+    assert bot.created_topics == [(SUPERGROUP, f"Plan, {year}")]
+    # Marked auto-named, so the first turn doesn't rename it after the prompt.
+    assert store.is_auto_named(SUPERGROUP, 555)
+
+
+async def test_a_late_titled_run_carries_the_date_it_was_due(monkeypatch) -> None:
+    async def fake_stream_reply(**_: object) -> None:
+        return None
+
+    monkeypatch.setattr("balam.turns.stream_reply", fake_stream_reply)
+    context, store, bot, turns = _fire_env()
+    store.set_schedule_title(1, "Food log, {date}")
+    await S.run_schedule(
+        context,
+        S.Schedule.from_row(store.get_schedule(1)),
+        late_for=_at(2026, 11, 9, 23, 30),
+    )
+    await turns.get(SUPERGROUP, 555).task  # type: ignore[union-attr]
+    assert bot.created_topics == [(SUPERGROUP, "Food log, Mon, 9 Nov")]
