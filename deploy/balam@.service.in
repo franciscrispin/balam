@@ -68,6 +68,17 @@ Environment=GOPATH=@GOPATH@
 ExecStart=@UV@ run balam
 Restart=on-failure
 RestartSec=5s
+# Memory backstop. In claude_sdk mode every running turn is a `claude` child of
+# THIS unit (~200-500 MB each, more with subagents), and only held turns are
+# capped (_MAX_HELD_TURNS). So bound the whole unit: past MemoryMax the kernel
+# OOM-kills inside this cgroup only, and it picks the largest process, which is
+# a `claude` turn, not the ~100 MB bot. One turn is lost; the bot and the rest
+# of the VM are not. A percentage is of the host's RAM, so the unit fits any VM.
+# OOMPolicy=continue matters as much as the cap: the default (stop) would stop
+# the whole unit after any OOM kill inside it, taking the bot down with the turn.
+# If the bot itself is killed, Restart=on-failure brings it back.
+MemoryMax=75%
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
