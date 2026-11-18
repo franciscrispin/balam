@@ -108,7 +108,7 @@ full map; the load-bearing ones:
   `startup_checks.py` (boot-time Telegram warnings: privacy mode, unreachable chat).
 - **Telegram surface:** `bot.py` is *only* the plain-message path plus the
   registrar — it builds the PTB app, fills `bot_data`, and wires handlers.
-  Handlers live in `commands/` (`session.py`, `views.py`, `delete.py`,
+  Handlers live in `commands/` (`session.py`, `views.py`, `delete.py`, `prune.py`,
   `schedule.py`, `tasks.py`), `callbacks.py` (approval/question taps), `pickers.py` (the
   paged multi-select shared by `/delete` and `/schedule cancel`), `topics.py`
   (naming/opening/linking topics), `message_text.py` (forward/reply/quote
@@ -138,7 +138,7 @@ full map; the load-bearing ones:
 
 Slash commands (registered in `bot.py`'s `BOT_COMMANDS`, handled in `commands/`):
 `/new` `/rename` `/status` `/model` `/effort` `/cancel` `/reset` `/tasks` `/context`
-`/diff` `/browser` `/artifacts` `/delete` `/schedule`. Anything *not* in that list falls
+`/diff` `/browser` `/artifacts` `/delete` `/prune` `/schedule`. Anything *not* in that list falls
 through a catch-all handler and is forwarded verbatim to the agent, so a Claude
 slash command like `/goal` reaches it instead of being dropped.
 
