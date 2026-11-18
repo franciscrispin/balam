@@ -82,6 +82,7 @@ from balam.commands.session import (
     handle_model,
     handle_new,
     handle_rename,
+    handle_reset,
     handle_status,
 )
 from balam.commands.tasks import handle_tasks
@@ -287,6 +288,7 @@ BOT_COMMANDS = [
     BotCommand("model", "Show or set this topic's model override"),
     BotCommand("effort", "Show or set this topic's effort override"),
     BotCommand("cancel", "Abort the turn currently running in this topic"),
+    BotCommand("reset", "Start this topic's conversation over, keeping the topic"),
     BotCommand("tasks", "List the background work running in this topic"),
     BotCommand("context", "List contexts, or /context <name> [first message] to open a topic"),
     BotCommand("diff", "Open the Mini App git diff viewer for this topic's context"),
@@ -386,6 +388,7 @@ def build_application(
     app.add_handler(CommandHandler("model", handle_model, filters=allowed))
     app.add_handler(CommandHandler("effort", handle_effort, filters=allowed))
     app.add_handler(CommandHandler("cancel", handle_cancel, filters=allowed))
+    app.add_handler(CommandHandler("reset", handle_reset, filters=allowed))
     app.add_handler(CommandHandler("tasks", handle_tasks, filters=allowed))
     app.add_handler(CommandHandler("context", handle_context, filters=allowed))
     app.add_handler(CommandHandler("diff", handle_diff, filters=allowed))
