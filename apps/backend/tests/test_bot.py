@@ -42,6 +42,7 @@ from balam.commands.session import (
     handle_model,
     handle_new,
     handle_rename,
+    handle_reset,
     handle_status,
 )
 from balam.commands.tasks import handle_tasks
@@ -1086,6 +1087,54 @@ async def test_cancel_with_no_running_turn() -> None:
     await handle_cancel(update, context)
 
     assert any("No running turn" in r for r in message.replies)
+
+
+async def test_reset_swaps_the_session_and_keeps_the_topic() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, _opencode, _turns = _session_cmd_env(message)
+    ref = TopicRef(SUPERGROUP, 5, "Invoices")
+    old = (await router.resolve(ref)).session_id
+    router.set_topic_title(SUPERGROUP, 5, "Invoices")
+
+    await handle_reset(update, context)
+
+    new = router.current_session_id(ref)
+    assert new is not None and new != old
+    assert router.current_context_name(ref) == "balam"
+    assert router.list_topics(SUPERGROUP) == [(5, "Invoices", "balam")]
+    assert any("Fresh start" in r for r in message.replies)
+
+
+async def test_reset_on_a_topic_with_no_session_is_a_no_op() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, opencode, _turns = _session_cmd_env(message)
+
+    await handle_reset(update, context)
+
+    assert router.current_session_id(TopicRef(SUPERGROUP, 5, "t")) is None
+    assert any("already fresh" in r for r in message.replies)
+
+
+async def test_reset_is_refused_while_a_turn_runs() -> None:
+    message = _FakeMessage(SUPERGROUP, thread_id=5)
+    update, context, router, _opencode, turns = _session_cmd_env(message)
+    ref = TopicRef(SUPERGROUP, 5, "t")
+    old = (await router.resolve(ref)).session_id
+    task = _sleeping_turn(turns, SUPERGROUP, 5, old)
+
+    await handle_reset(update, context)
+
+    assert router.current_session_id(ref) == old
+    assert any("/cancel" in r for r in message.replies)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def test_reset_is_a_registered_command() -> None:
+    from balam.bot import BOT_COMMANDS
+
+    assert "reset" in {c.command for c in BOT_COMMANDS}
 
 
 async def test_cancel_aborts_running_turn() -> None:

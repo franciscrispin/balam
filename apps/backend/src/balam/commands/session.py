@@ -4,7 +4,8 @@
 one context per topic for life (ADR-0012), so a topic's session always remembers
 its own history. The rest read or adjust the session bound to the topic they are
 sent in: ``/status`` reports it, ``/model`` and ``/effort`` override it per
-topic, ``/rename`` retitles it, and ``/cancel`` aborts the turn running in it.
+topic, ``/rename`` retitles it, ``/cancel`` aborts the turn running in it, and
+``/reset`` swaps it for a fresh session in the same topic.
 """
 
 from __future__ import annotations
@@ -348,6 +349,47 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text(f"🛑 Cancelled. Also cleared {dropped} queued message(s).")
     else:
         await message.reply_text("🛑 Cancelled.")
+
+
+async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/reset``: start this topic's session over, in the same topic.
+
+    A topic people come back to for weeks (an invoicing workflow, say) grows its
+    session toward the model's context window, and a long session is slower and
+    follows its instructions less closely. ``/new`` starts fresh but in another
+    topic; ``/reset`` keeps the topic, its context and its name, and only swaps
+    the session behind it (:meth:`Router.reset_topic_session`).
+
+    Refused while a turn is running or queued here: the running turn would write
+    its session id back over the reset, and queued messages were written for the
+    old conversation. ``/cancel`` first, or wait.
+    """
+    message = update.message
+    if message is None:
+        return
+
+    router: Router = context.application.bot_data["router"]
+    turns: TurnRegistry = context.application.bot_data["turns"]
+    chat_id, thread_id = message.chat_id, message.message_thread_id
+
+    if turns.get(chat_id, thread_id) is not None or turns.queue_len(chat_id, thread_id):
+        await message.reply_text(
+            "Something is still running in this topic. Wait for it to finish, "
+            "or /cancel it, then /reset."
+        )
+        return
+
+    ref = TopicRef(chat_id=chat_id, thread_id=thread_id, title=topic_title(message, thread_id))
+    previous = await router.reset_topic_session(ref)
+    if previous is None:
+        await message.reply_text("This topic has no conversation yet, so it is already fresh.")
+        return
+    logger.info("reset topic %s/%s, leaving session %s", chat_id, thread_id, previous)
+    await message.reply_text(
+        "🔄 Fresh start. This topic's conversation is cleared and your next message "
+        "begins a new one, with the same setup. Anything from before that still "
+        "matters, say it again."
+    )
 
 
 #: Per approval choice: ``(inline note appended to the prompt — already

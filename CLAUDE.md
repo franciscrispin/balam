@@ -137,7 +137,7 @@ full map; the load-bearing ones:
   ADR-0006), `agent_tools.py` (agent-facing `send_file`).
 
 Slash commands (registered in `bot.py`'s `BOT_COMMANDS`, handled in `commands/`):
-`/new` `/rename` `/status` `/model` `/effort` `/cancel` `/tasks` `/context`
+`/new` `/rename` `/status` `/model` `/effort` `/cancel` `/reset` `/tasks` `/context`
 `/diff` `/browser` `/artifacts` `/delete` `/schedule`. Anything *not* in that list falls
 through a catch-all handler and is forwarded verbatim to the agent, so a Claude
 slash command like `/goal` reaches it instead of being dropped.

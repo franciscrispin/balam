@@ -239,6 +239,40 @@ class Router:
             self._store.mark_auto_named(chat_id, thread_id)
         return session_id
 
+    async def reset_topic_session(self, ref: TopicRef) -> str | None:
+        """Give an existing topic a fresh session, keeping its context, title and
+        name, and return the id of the session it leaves behind (``None`` when it
+        had none).
+
+        This is ``/reset``: a long-lived topic whose session has grown close to
+        the model's context window starts over in place, so the people using it
+        keep the topic they know. The old session is not deleted, only
+        unmapped, so its transcript stays on disk. The SDK gets the empty
+        placeholder and mints the new session on the next turn; OpenCode gets one
+        now, set up exactly as a new topic's would be.
+        """
+        row = self._store.get_row(ref.chat_id, ref.thread_id)
+        previous = (row[0] or None) if row else None
+        if previous is None:
+            return None
+        name = self._contexts.resolve_name(row[1] if row else None)
+        ctx = self._contexts.get(name)
+        if self._eager:
+            assert self._opencode is not None
+            mcp, permission, _ = self._session_setup(
+                ctx.mcp, build_ruleset(ctx), ref.chat_id, ref.thread_id
+            )
+            session_id = await self._opencode.create_session(
+                ref.title, directory=ctx.directory, permission=permission, mcp=mcp
+            )
+        else:
+            session_id = ""
+        # No ``title``: the stored one (kept in step with Telegram renames) stays.
+        self._store.set(
+            ref.chat_id, ref.thread_id, session_id, int(time.time() * 1000), context=name
+        )
+        return previous
+
     async def resolve(self, ref: TopicRef) -> ResolvedSession:
         """Resolve the session for a topic, creating or recreating as needed,
         and return it together with its context's directory and model/effort."""

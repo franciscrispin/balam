@@ -383,3 +383,45 @@ async def test_unknown_bound_context_falls_back_to_default() -> None:
 
     assert resolved.directory == "/work/balam"
     assert store.get_row(1, 5) == (resolved.session_id, "balam")
+
+
+async def test_reset_topic_session_swaps_session_and_keeps_binding() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+    old = await router.create_topic_session(1, 9, "scratch", "scratch")
+    router.set_topic_title(1, 9, "Renamed")
+    other = await router.resolve(TopicRef(chat_id=1, thread_id=5, title="t"))
+
+    previous = await router.reset_topic_session(TopicRef(1, 9, "scratch"))
+
+    assert previous == old
+    new, context = store.get_row(1, 9)
+    assert new != old and context == "scratch"
+    assert (new, "/work/scratch") in oc.created
+    assert (9, "Renamed", "scratch") in router.list_topics(1)
+    # Other topics keep their sessions.
+    assert store.get_row(1, 5) == (other.session_id, "balam")
+
+
+async def test_reset_topic_session_with_sdk_leaves_a_placeholder() -> None:
+    store = _store()
+    router = Router(store, None, _contexts())
+    await router.create_topic_session(1, 9, "scratch", "scratch")
+    router.persist_session(1, 9, "sdk-session-1")
+
+    previous = await router.reset_topic_session(TopicRef(1, 9, "scratch"))
+
+    assert previous == "sdk-session-1"
+    assert store.get_row(1, 9) == ("", "scratch")
+    resolved = await router.resolve(TopicRef(1, 9, "scratch"))
+    assert resolved.session_id is None
+    assert resolved.directory == "/work/scratch"
+
+
+async def test_reset_topic_session_without_a_session_changes_nothing() -> None:
+    store, oc = _store(), FakeOpenCode()
+    router = Router(store, oc, _contexts())
+
+    assert await router.reset_topic_session(TopicRef(1, 9, "t")) is None
+    assert store.get_row(1, 9) is None
+    assert oc.created == []

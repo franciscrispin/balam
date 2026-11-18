@@ -19,7 +19,8 @@ The design and the reasons behind it live in
 - **Mini App viewers** — `/diff` opens a git diff viewer, and the agent can share
   files into a markdown viewer with its `send_file` tool.
 - **Topic management** — `/new` (optionally `/new <context> <first message>` to
-  open a topic and start working in it at once), `/rename`, `/status`, `/cancel`.
+  open a topic and start working in it at once), `/rename`, `/status`, `/cancel`,
+  `/reset` (start a long-running topic's conversation over, in the same topic).
 - **Scheduled prompts** — `/schedule daily 07:30 <context> <prompt>` opens a fresh
   topic and runs that prompt on a timer, in your timezone (`BALAM_TIMEZONE`) —
   daily, weekdays, one weekday, or monthly (`monthly 1 09:00`, or `last`). A
