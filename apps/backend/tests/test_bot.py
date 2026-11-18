@@ -1102,7 +1102,7 @@ async def test_reset_swaps_the_session_and_keeps_the_topic() -> None:
     assert new is not None and new != old
     assert router.current_context_name(ref) == "balam"
     assert router.list_topics(SUPERGROUP) == [(5, "Invoices", "balam")]
-    assert any("Fresh start" in r for r in message.replies)
+    assert any("conversation is cleared" in r for r in message.replies)
 
 
 async def test_reset_on_a_topic_with_no_session_is_a_no_op() -> None:

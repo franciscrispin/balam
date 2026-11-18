@@ -386,9 +386,7 @@ async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     logger.info("reset topic %s/%s, leaving session %s", chat_id, thread_id, previous)
     await message.reply_text(
-        "🔄 Fresh start. This topic's conversation is cleared and your next message "
-        "begins a new one, with the same setup. Anything from before that still "
-        "matters, say it again."
+        "🔄 Topic conversation is cleared. Your next message begins a new conversation."
     )
 
 
