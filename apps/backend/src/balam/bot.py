@@ -68,6 +68,7 @@ from balam.commands.delete import (
     handle_delete_page_callback,
     handle_delete_toggle_callback,
 )
+from balam.commands.prune import handle_prune
 from balam.commands.schedule import (
     handle_schedule,
     handle_schedule_confirm_callback,
@@ -295,6 +296,7 @@ BOT_COMMANDS = [
     BotCommand("browser", "Watch the agent's live browser (Mini App)"),
     BotCommand("artifacts", "List your published claude.ai artifacts (/artifacts [shared|all])"),
     BotCommand("delete", "Delete topics — pick which ones to remove"),
+    BotCommand("prune", "Forget topics that were deleted by hand in Telegram"),
     BotCommand("schedule", "Run a prompt on a schedule: /schedule daily 07:30 <context> <prompt>"),
 ]
 
@@ -395,6 +397,7 @@ def build_application(
     app.add_handler(CommandHandler("browser", handle_browser, filters=allowed))
     app.add_handler(CommandHandler("artifacts", handle_artifacts, filters=allowed))
     app.add_handler(CommandHandler("delete", handle_delete, filters=allowed))
+    app.add_handler(CommandHandler("prune", handle_prune, filters=allowed))
     app.add_handler(CommandHandler("schedule", handle_schedule, filters=allowed))
     # ``ATTACHMENT`` is every kind Telegram models as an attachment, not just the
     # photo/document pair Balam used to accept — voice notes, video, audio, video
