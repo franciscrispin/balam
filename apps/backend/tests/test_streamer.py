@@ -2068,6 +2068,37 @@ async def test_stream_reply_finalizes_each_step_on_turn_step_finished() -> None:
     assert bot.messages == ["first answer", "thinking about second", "second answer"]
 
 
+async def test_stream_reply_show_progress_false_sends_only_the_answer() -> None:
+    # A context with show_progress: false keeps thinking and the earlier step's
+    # narration (demoted to progress) out of the topic; the answer still lands.
+    from balam.agent.events import (
+        ReasoningUpdated,
+        SessionStarted,
+        TextUpdated,
+        TurnFinished,
+    )
+
+    events = [
+        SessionStarted(SID),
+        ReasoningUpdated(part_id="m1:0", text="pondering", message_id="m1"),
+        TextUpdated(part_id="m1:1", text="Let me check.", message_id="m1"),
+        TextUpdated(part_id="m2:0", text="final answer", message_id="m2"),
+        TurnFinished(),
+    ]
+    bot = FakeBot()
+    await stream_reply(
+        bot=bot,
+        backend=_ScriptedBackend(events),
+        session_id=SID,
+        chat_id=1,
+        thread_id=99,
+        prompt="hello",
+        draft_interval=0.01,
+        show_progress=False,
+    )
+    assert bot.messages == ["final answer"]
+
+
 async def test_stream_reply_reports_background_tasks_left_running() -> None:
     # A dev server started mid-turn dies with the turn's agent process, so the
     # reply has to say what was still running instead of letting it vanish.

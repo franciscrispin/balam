@@ -168,6 +168,12 @@ class ContextConfig(BaseModel):
     #: filled in; ``"{summary}"`` drops the context prefix entirely. ``None``
     #: means "use the file-level default".
     topic_title: str | None = None
+    #: Whether this context's topics show the progress message — thinking, tool
+    #: lines, and interim narration — alongside the answer, overriding the
+    #: file-level ``show_progress``. ``False`` leaves only the answer (plus the
+    #: to-do checklist and any approval/question prompts). ``None`` means "use
+    #: the file-level default".
+    show_progress: bool | None = None
 
     @field_validator("topic_title")
     @classmethod
@@ -289,6 +295,8 @@ class ContextsConfig(BaseModel):
     contexts: dict[str, ContextConfig]
     #: Default topic-name template for every context that doesn't set its own.
     topic_title: str = DEFAULT_TOPIC_TITLE
+    #: Default for every context that doesn't set its own ``show_progress``.
+    show_progress: bool = True
     #: Local services that post buttons through Balam (ADR-0018), keyed by name.
     integrations: dict[str, IntegrationConfig] = Field(default_factory=dict)
 
@@ -362,6 +370,12 @@ class ContextsConfig(BaseModel):
         if it sets one, else the file-level default. Unknown names resolve the
         way :meth:`get` does — through ``default_context``."""
         return self.get(name).topic_title or self.topic_title
+
+    def shows_progress(self, name: str | None) -> bool:
+        """Whether context ``name``'s turns show the progress message: its own
+        ``show_progress`` if it sets one, else the file-level default."""
+        own = self.get(name).show_progress
+        return self.show_progress if own is None else own
 
     def resolve_name(self, name: str | None) -> str:
         """The context name :meth:`get` would use — for persisting the binding."""

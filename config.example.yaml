@@ -15,6 +15,11 @@ default_context: balam
 # context; a context can override it with its own `topic_title` below.
 # topic_title: "{context}: {summary}"
 
+# Whether turns show the progress message (thinking, tool lines, and the
+# agent's narration between steps) above the answer. This is the default for
+# every context; a context can override it with its own `show_progress` below.
+# show_progress: true
+
 contexts:
   balam:
     directory: /home/ubuntu/projects/balam
@@ -44,6 +49,10 @@ contexts:
     #                                    # the agent answers only when @mentioned,
     #                                    # replied to, or sent a slash command.
     #                                    # Only allowlisted users are heard either way.
+    # show_progress: false               # optional: hide this context's progress
+    #                                    # message so only the answer shows. The
+    #                                    # to-do checklist and approval prompts
+    #                                    # still appear. Overrides the default above.
     # mcp:                               # optional per-context MCP servers
     #   # Local (stdio) server — OpenCode spawns the command:
     #   my-db:

@@ -63,6 +63,9 @@ class ResolvedSession:
     #: already applied these at session creation and ignores them per turn.
     allowed_tools: list[str]
     mcp: dict[str, Any]
+    #: Whether the turn shows its progress message or only the answer
+    #: (:meth:`balam.contexts.ContextsConfig.shows_progress`).
+    show_progress: bool = True
 
 
 class Router:
@@ -307,6 +310,7 @@ class Router:
             additional_directories=list(ctx.additional_directories),
             allowed_tools=list(ctx.allowed_tools),
             mcp=dict(ctx.mcp),
+            show_progress=self._contexts.shows_progress(context_name),
         )
 
     async def resolve_headless(self, chat_id: int, name: str, title: str) -> ResolvedSession:
@@ -339,6 +343,7 @@ class Router:
             additional_directories=list(ctx.additional_directories),
             allowed_tools=list(ctx.allowed_tools),
             mcp=dict(ctx.mcp),
+            show_progress=self._contexts.shows_progress(name),
         )
 
     async def _resolve_opencode(
