@@ -84,6 +84,9 @@ class TurnJob:
     allowed_tools: list[str] = field(default_factory=list)
     additional_directories: list[str] = field(default_factory=list)
     mcp: dict[str, Any] = field(default_factory=dict)
+    #: ``False`` streams only the answer — no progress message (the context's
+    #: ``show_progress``).
+    show_progress: bool = True
     #: Nobody is watching this turn — a scheduled run (ADR-0016). Approval and
     #: question keyboards are refused rather than awaited, since neither has a
     #: timeout and an unanswered one would hold the topic's running slot forever.
@@ -361,6 +364,7 @@ async def resolve_turn_job(
         allowed_tools=resolved.allowed_tools,
         additional_directories=resolved.additional_directories,
         mcp=resolved.mcp,
+        show_progress=resolved.show_progress,
         unattended=unattended,
     )
 
@@ -443,6 +447,7 @@ def start_turn(
                 on_session_started=lambda sid: router.persist_session(chat_id, thread_id, sid),
                 follow_ups=follow_ups,
                 tool_stream=config.tool_stream if config is not None else "collapsed",
+                show_progress=job.show_progress,
                 unattended=job.unattended,
             )
         except asyncio.CancelledError:

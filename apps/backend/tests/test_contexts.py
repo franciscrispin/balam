@@ -299,3 +299,26 @@ def test_topic_title_blank_rejected(tmp_path) -> None:
 def test_topic_title_malformed_format_string_rejected(tmp_path) -> None:
     with pytest.raises(ContextsConfigError, match="topic_title"):
         load_contexts(_write(tmp_path, CONFIG + JAMBO_CONTEXT + '    topic_title: "{summary"\n'))
+
+
+def test_show_progress_defaults_to_true(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG))
+    assert cfg.get("balam").show_progress is None
+    assert cfg.shows_progress("balam") is True
+
+
+def test_show_progress_per_context_override(tmp_path) -> None:
+    cfg = load_contexts(_write(tmp_path, CONFIG + JAMBO_CONTEXT + "    show_progress: false\n"))
+    assert cfg.shows_progress("jambo") is False
+    assert cfg.shows_progress("balam") is True
+
+
+def test_show_progress_file_default_with_per_context_override(tmp_path) -> None:
+    cfg = load_contexts(
+        _write(
+            tmp_path,
+            "show_progress: false\n" + CONFIG + JAMBO_CONTEXT + "    show_progress: true\n",
+        )
+    )
+    assert cfg.shows_progress("balam") is False
+    assert cfg.shows_progress("jambo") is True

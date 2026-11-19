@@ -428,6 +428,7 @@ async def stream_reply(
     follow_ups: FollowUpChannel | None = None,
     draft_interval: float = DRAFT_INTERVAL_S,
     tool_stream: str = "collapsed",
+    show_progress: bool = True,
     unattended: bool = False,
 ) -> None:
     """Run one turn through ``backend`` and stream its reply into the topic.
@@ -464,6 +465,12 @@ async def stream_reply(
     calls into one summary line with the per-call detail in an expandable
     blockquote (see :func:`_render_tool_group`); ``"full"`` keeps the legacy
     one-line-per-call stream.
+
+    ``show_progress=False`` (a context's ``show_progress: false``) keeps that
+    whole progress stream — thinking, tool lines, demoted narration — off the
+    topic: it is still accumulated, just never sent, so only the answer shows.
+    The to-do checklist and approval/question prompts are their own messages
+    and still appear.
 
     ``unattended`` marks a turn nobody started by hand — a scheduled run
     (ADR-0016). Approval keyboards and question keyboards both await a tap that
@@ -522,7 +529,8 @@ async def stream_reply(
             # it always streams at the bottom rather than above an intervening
             # question/approval prompt.
             async with render_lock:
-                await reasoning_draft.flush_draft()
+                if show_progress:
+                    await reasoning_draft.flush_draft()
                 await answer_draft.flush_draft(latest_message_id=last_sent_id)
 
     flush_task = asyncio.create_task(flush_loop())
@@ -868,9 +876,9 @@ async def stream_reply(
             group_calls.clear()
             group_entries.clear()
             call_group.clear()
-            if reasoning_draft.text.strip():
+            if show_progress and reasoning_draft.text.strip():
                 await reasoning_draft.finalize()
-                reasoning_draft.reset()
+            reasoning_draft.reset()
             if answer_draft.text.strip():
                 await answer_draft.finalize(latest_message_id=last_sent_id)
                 answer_draft.reset()
@@ -1089,7 +1097,8 @@ async def stream_reply(
     # the turn produced nothing visible at all. The reasoning stream keeps its
     # position; the answer must end the turn, so its finalize gets the last sent
     # id and re-sends at the bottom if anything landed below its bubble.
-    if reasoning_draft.text.strip():
+    progress_shown = show_progress and bool(reasoning_draft.text.strip())
+    if progress_shown:
         await reasoning_draft.finalize()
-    if answer_draft.text.strip() or not reasoning_draft.text.strip():
+    if answer_draft.text.strip() or not progress_shown:
         await answer_draft.finalize(latest_message_id=last_sent_id)
