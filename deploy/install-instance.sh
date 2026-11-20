@@ -338,6 +338,8 @@ else
   echo "    that URL instead of an in-Telegram button (see deploy/README.md)."
 fi
 
+# Makes time-sync.target in the unit mean "the clock is right" (see balam@.service.in).
+sudo systemctl enable --quiet systemd-time-wait-sync.service
 sudo systemctl daemon-reload
 
 echo "==> Enabling + (re)starting instance '$NAME'"
