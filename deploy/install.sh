@@ -274,6 +274,11 @@ else
   fi
 fi
 
+# Makes time-sync.target in balam.service mean "the clock is right". A system
+# service, so only in system scope; a user manager cannot order against it.
+if [ "$BALAM_SYSTEMD_SCOPE" = system ]; then
+  sudo systemctl enable --quiet systemd-time-wait-sync.service
+fi
 balam_systemctl daemon-reload
 
 echo "==> Building the Mini App (served by FastAPI from dist/)"

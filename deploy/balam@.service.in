@@ -12,8 +12,13 @@
 
 [Unit]
 Description=Balam bot + Mini App server, instance %i (ADR-0011/0013/0014)
-After=network-online.target
-Wants=network-online.target
+# time-sync.target: wait for NTP before starting. The Pi has no RTC, so it boots
+# on the last saved time; if Balam starts before the clock is corrected, the
+# JobQueue arms its timers against the stale clock and /schedule runs fire late
+# by the size of the jump, then get dropped as misfires. Only effective with
+# systemd-time-wait-sync.service enabled (the installer enables it).
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
